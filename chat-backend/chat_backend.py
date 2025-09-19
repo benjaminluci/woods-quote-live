@@ -1,4 +1,4 @@
-import os, json, re, requests, logging
+import os, json, re, requests, logging, time
 from typing import Any, Dict, Tuple
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
@@ -307,24 +307,33 @@ def call_openai_for_plan(user_message: str) -> dict:
     except Exception as e:
         return {"action": "ask", "reply": f"I couldn’t parse that. Please rephrase. ({e})", "params": {}}
 
-import time
 
-def (params: dict) -> Tuple[dict, int, str]:
+def call_quote_api(path: str, params: dict, retries: int = 1, timeout: int = 60) -> Tuple[dict, int, str]:
+    """
+    Call the upstream Quote API with optional retry (helps on cold starts).
+    Returns: (json_or_fallback_dict, status_code, final_url)
+    """
     if not QUOTE_API_BASE:
         return ({"error": "QUOTE_API_BASE not configured"}, 500, "")
-    url = f"{QUOTE_API_BASE}/quote"
+
+    base = QUOTE_API_BASE.rstrip("/")
+    url = f"{base}/{path.lstrip('/')}"
     last_exc = None
-    for attempt in range(2):  # 1 retry
+
+    for attempt in range(retries + 1):
         try:
-            r = requests.get(url, params=params, timeout=60)
+            r = requests.get(url, params=params, timeout=timeout)
             try:
-                return r.json(), r.status_code, r.url
+                data = r.json()
             except Exception:
-                return {"raw_text": r.text}, r.status_code, r.url
+                data = {"raw_text": r.text}
+            return (data, r.status_code, r.url)
         except Exception as e:
             last_exc = e
-            time.sleep(1.2)
-    return ({"error": f"Upstream error: {last_exc}"}, 502, url)
+            if attempt < retries:
+                time.sleep(1.2)
+                continue
+            return ({"error": f"Upstream error: {last_exc}"}, 502, url)
 
 
 def call_dealer_discount(dealer_number: str) -> dict:
@@ -448,7 +457,7 @@ def chat():
             sess.pop("pending_question", None)
             sess.pop("in_progress_params", None)
 
-            quote_json, status, used_url = call_quote_api(params)
+            quote_json, status, used_url = call_quote_api("/quote", params)
 
             if status == 200 and quote_json.get("mode") == "questions":
                 rd = quote_json.get("response_data", quote_json)
@@ -488,7 +497,7 @@ def chat():
         parsed = extract_params_from_text(user_message)  # model/family/width/shielding/driveline/etc.
         if parsed:
             params = {**parsed, "dealer_number": dn}
-            quote_json, status, used_url = call_quote_api(params)
+            quote_json, status, used_url = call_quote_api("/quote", params)
             if status == 200 and quote_json.get("mode") == "questions":
                 rd = quote_json.get("response_data", quote_json)
                 rq = rd.get("required_questions", [])
@@ -558,7 +567,7 @@ def chat():
     if action == "quote":
         if not params.get("dealer_number"):
             return jsonify({"reply": "Please provide your dealer number to begin (e.g., dealer #178200)."})
-        quote_json, status, used_url = call_quote_api(params)
+        quote_json, status, used_url = call_quote_api("/quote", params)
         if status == 200 and quote_json.get("mode") == "questions":
             rd = quote_json.get("response_data", quote_json)
             rq = rd.get("required_questions", [])
@@ -595,7 +604,7 @@ def chat():
         if dn and "dealer" in reply.lower():
             # Try a minimal /quote with free text so API can ask the next required question.
             fallback = {"dealer_number": dn, "q": user_message}
-            qj, st, used = call_quote_api(fallback)
+            qj, st, used = call_quote_api("/quote", fallback)
             if st == 200 and qj.get("mode") == "questions":
                 rd = qj.get("response_data", qj); rq = rd.get("required_questions", [])
                 if rq:
