@@ -19,11 +19,14 @@ app = Flask(__name__)
 CORS(
     app,
     resources={r"/*": {"origins": ALLOWED_ORIGINS}},
-    allow_headers=["Content-Type", "X-Session-Id"]
+    allow_headers=["Content-Type", "X-Session-Id"],
+    methods=["GET", "POST", "OPTIONS"],
+    supports_credentials=False,   # keep your current cookie stance
+    max_age=86400,
 )
 
 # In-memory sessions keyed by client-provided ID
-SESSIONS: Dict[str, Dict[str, Any]] = {}  # { dealer_number, dealer_discount, dealer_name, pending_question, in_progress_params }
+SESSIONS: Dict[str, Dict[str, Any]] = {}  # { dealer_number, dealer_discount, dealer_name, pending_question, in_progress_params, params }
 
 DEALER_REGEX = re.compile(r"dealer\s*#?\s*(\d{3,})", re.I)
 
@@ -120,7 +123,6 @@ Common params (subset):
 - family (see list above)
 - width_ft (e.g., "12", "15", "20")
 - bw_driveline: "540" or "1000"
-- bb_duty: "Standard Duty (.30)" | "Standard Plus (.40)" | "Heavy Duty (.50)" | "Extreme Duty (.60)"
 - bb_shielding: "Belt" | "Chain" | "Single Row" | "Double Row"
 - tire_id / tire_qty when API requires tires
 - accessory/accessory_id/accessory_ids for add-ons
@@ -171,8 +173,6 @@ MODEL_RE = re.compile(r"\b((?:BB|BW|MDS|DS|TBW|RB|BS|GS|LRS|DHS|DHM|PD|DB|RT|RTR
 WIDTH_FT_RE = re.compile(r"\b(\d{1,2})\s*(?:ft|foot|feet)\b", re.I)
 WIDTH_IN_RE = re.compile(r"\b(\d{2,3})\s*(?:in|inch|inches|\"|”)\b", re.I)
 DRIVELINE_RE = re.compile(r"\b(540|1000|1k)\b", re.I)
-
-
 
 def norm_model(s: str) -> str:
     return s.upper().replace(" ", "")
@@ -258,7 +258,7 @@ def extract_params_from_text(text: str) -> Dict[str, Any]:
     return params
 
 # =========================
-# Other helpers
+# Other helpers (robust Q&A)
 # =========================
 def extract_dealer_number(text: str) -> str | None:
     if not text:
@@ -266,28 +266,31 @@ def extract_dealer_number(text: str) -> str | None:
     m = DEALER_REGEX.search(text)
     return m.group(1) if m else None
 
-def letter_or_number_choice_to_value(msg: str, choices: list[str]) -> str | None:
-    """Map 'A'/'B'/... or '1'/'2'/... to the underlying choice string."""
-    if not choices:
+def letter_or_number_choice_to_index(msg: str, count: int) -> int | None:
+    s = (msg or "").strip().lower()
+    if not s or count <= 0:
         return None
-    s = (msg or "").strip()
-    if not s:
-        return None
-    # Letter mapping
     if len(s) == 1 and s.isalpha():
-        idx = ord(s.lower()) - ord('a')
-        if 0 <= idx < len(choices):
-            return choices[idx]
-    # Number mapping
+        idx = ord(s) - ord('a')
+        return idx if 0 <= idx < count else None
     if s.isdigit():
         idx = int(s) - 1
-        if 0 <= idx < len(choices):
-            return choices[idx]
-    # Exact text match fallback
-    for c in choices:
-        if s.lower() == str(c).lower():
-            return c
+        return idx if 0 <= idx < count else None
     return None
+
+def _choice_index(msg: str, count: int) -> int | None:
+    return letter_or_number_choice_to_index(msg, count)
+
+def format_question(q: Dict[str, Any]) -> str:
+    title = q.get("question") or "Please choose:"
+    labels = [str(c.get("label", "")).strip() for c in q.get("choices_with_ids", [])]
+    if not labels and q.get("choices"):
+        labels = [str(c).strip() for c in q.get("choices", [])]
+    if not labels:
+        return title
+    abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    opts = [f"{abc[i]}. {labels[i]}" for i in range(len(labels))]
+    return f"{title}\n\n" + "\n".join(opts)
 
 # =========================
 # OpenAI + API helpers
@@ -309,19 +312,12 @@ def call_openai_for_plan(user_message: str) -> dict:
     except Exception as e:
         return {"action": "ask", "reply": f"I couldn’t parse that. Please rephrase. ({e})", "params": {}}
 
-
 def call_quote_api(path: str, params: dict, retries: int = 1, timeout: int = 60) -> Tuple[dict, int, str]:
-    """
-    Call the upstream Quote API with optional retry (helps on cold starts).
-    Returns: (json_or_fallback_dict, status_code, final_url)
-    """
     if not QUOTE_API_BASE:
         return ({"error": "QUOTE_API_BASE not configured"}, 500, "")
-
     base = QUOTE_API_BASE.rstrip("/")
     url = f"{base}/{path.lstrip('/')}"
     last_exc = None
-
     for attempt in range(retries + 1):
         try:
             r = requests.get(url, params=params, timeout=timeout)
@@ -336,7 +332,6 @@ def call_quote_api(path: str, params: dict, retries: int = 1, timeout: int = 60)
                 time.sleep(1.2)
                 continue
             return ({"error": f"Upstream error: {last_exc}"}, 502, url)
-
 
 def call_dealer_discount(dealer_number: str) -> dict:
     url = f"{QUOTE_API_BASE}/dealer-discount"
@@ -389,23 +384,21 @@ def format_quote_output(dealer_name, dealer_number, resp, forced_rate=None):
     return "\n".join(lines)
 
 # =========================
-# NEW: save context with each question
+# Save context with each question
 # =========================
-
 def set_pending_question(sess: Dict[str, Any], base_params: Dict[str, Any], q: Dict[str, Any]):
-    """
-    Save the current context and the next question so we can merge the user's answer
-    with the previously provided params (e.g., keep model/family/width).
-    """
     ctx = {k: v for k, v in (base_params or {}).items() if k != "dealer_number"}
     sess["in_progress_params"] = ctx
     sess["pending_question"] = {
         "name": q.get("name", ""),
         "choices": q.get("choices", []),
-        "choices_with_ids": q.get("choices_with_ids", []),   # ← add this line
+        "choices_with_ids": q.get("choices_with_ids", []),
         "question": q.get("question", "Please choose:")
     }
 
+# =========================
+# Core quoting helper (drive from API required_questions)
+# =========================
 def do_quote(sess: Dict[str, Any], extra_params: Dict[str, Any]):
     dn = sess.get("dealer_number")
     if not dn:
@@ -448,11 +441,9 @@ def do_quote(sess: Dict[str, Any], extra_params: Dict[str, Any]):
 
     return jsonify({"reply": "There was a system error while retrieving data. Please try again shortly. If the issue persists, escalate to Benjamin Luci at 615-516-8802."})
 
-
 # =========================
 # Routes
 # =========================
-
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
@@ -493,6 +484,12 @@ def chat():
                  request.cookies.get("dealer_number"),
                  sess.get("dealer_number"))
 
+    # 0) Shortcuts: help/knowledge
+    if user_message.lower() in {"help", "knowledge", "instructions", "how do i quote", "tips"}:
+        kb = KNOWLEDGE.strip() if KNOWLEDGE else "No internal knowledge is configured yet."
+        return jsonify({"reply": kb})
+
+    # 1) Dealer-only message → always update dealer (even if one is already set)
     only_dn = extract_dealer_number(user_message)
     if only_dn and not intent_from_text(user_message):
         info = call_dealer_discount(only_dn)
@@ -505,96 +502,66 @@ def chat():
             resp.set_cookie("dealer_number", only_dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
             return resp
 
-    # 1) If user is answering last multiple-choice (A/B/1/2), handle locally
+    # 2) If user is answering last multiple-choice, resolve using IDs/labels and keep context
     pending = sess.get("pending_question")
     if pending and dn:
-        chosen = letter_or_number_choice_to_value(user_message, pending.get("choices", []))
-        if chosen:
-            base = sess.get("in_progress_params", {})  # previously saved context
-            params = {**base, pending.get("name",""): chosen, "dealer_number": dn}
-            # clear AFTER building params
-            sess.pop("pending_question", None)
-            sess.pop("in_progress_params", None)
+        cwids = pending.get("choices_with_ids") or []
+        labels = [str(c.get("label", "")).strip() for c in cwids] if cwids else [str(c).strip() for c in (pending.get("choices") or [])]
 
-            quote_json, status, used_url = call_quote_api("/quote", params)
+        if not labels:
+            return jsonify({"reply": pending.get("question", "Please choose:")})
 
-            if status == 200 and quote_json.get("mode") == "questions":
-                rd = quote_json.get("response_data", quote_json)
-                rq = rd.get("required_questions", [])
-                if rq:
-                    q = rq[0]
-                    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                    if q.get("choices"):
-                        opts = "\n".join(f"{letters[i]}. {c}" for i, c in enumerate(q["choices"]))
-                        qtext = f"{q.get('question','Please choose:')}\n\n{opts}"
-                    else:
-                        qtext = q.get("question", "Please provide the required detail to continue.")
-                    set_pending_question(sess, params, q)  # persist context for next step
-                    resp = make_response(jsonify({
-                        "reply": qtext,
-                        "debug": {"quote_api_url": used_url, "status": status, "params_sent": params}
-                    }))
-                    resp.set_cookie("dealer_number", dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
-                    return resp
+        idx = _choice_index(user_message, len(labels))
+        if idx is None:
+            low = user_message.strip().lower()
+            # exact label
+            for i, lab in enumerate(labels):
+                if lab.lower() == low:
+                    idx = i; break
+            # substring label
+            if idx is None:
+                for i, lab in enumerate(labels):
+                    if low in lab.lower():
+                        idx = i; break
+            # exact ID
+            if idx is None and cwids:
+                ids = [str(c.get("id", "")).strip().lower() for c in cwids]
+                for i, _id in enumerate(ids):
+                    if _id and _id == low:
+                        idx = i; break
 
-            if status == 200 and quote_json.get("mode") == "quote":
-                dealer_name = sess.get("dealer_name", "")
-                dealer_rate = float(sess.get("dealer_discount",
-                                  quote_json.get("response_data", {}).get("summary", {}).get("dealer_discount_rate", 0.0)))
-                out = format_quote_output(dealer_name, dn, quote_json, forced_rate=dealer_rate)
-                resp = make_response(jsonify({
-                    "reply": out,
-                    "debug": {"quote_api_url": used_url, "status": status, "params_sent": params}
-                }))
-                resp.set_cookie("dealer_number", dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
-                return resp
+        if idx is None:
+            letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            opts = "\n".join(f"{letters[i]}. {labels[i]}" for i in range(len(labels)))
+            return jsonify({"reply": f"{pending.get('question','Please choose:')}\n\n{opts}"})
 
-            return jsonify({"reply": "There was a system error while retrieving data. Please try again shortly. If the issue persists, escalate to Benjamin Luci at 615-516-8802."})
+        # Prefer IDs when available
+        value = cwids[idx].get("id") if cwids else (pending.get("choices") or [None])[idx]
+        name = pending.get("name", "")
+        if isinstance(value, str) and value.isdigit() and name.endswith("_qty"):
+            value = int(value)
 
-    # 2) FAST-PATH: if we HAVE dealer number, try to parse and call /quote directly (no GPT)
+        merged = {}
+        merged.update(sess.get("in_progress_params", {}) or {})
+        merged.update(sess.get("params", {}) or {})
+        merged[name] = value
+
+        # clear pending/context and stale params
+        sess.pop("pending_question", None)
+        sess.pop("in_progress_params", None)
+        sess["params"] = {}
+
+        return do_quote(sess, merged)
+
+    # 3) With a dealer number: always drive from the Quote API using merged context
     if dn:
-        parsed = extract_params_from_text(user_message)  # model/family/width/shielding/driveline/etc.
-        if parsed:
-            params = {**parsed, "dealer_number": dn}
-            quote_json, status, used_url = call_quote_api("/quote", params)
-            if status == 200 and quote_json.get("mode") == "questions":
-                rd = quote_json.get("response_data", quote_json)
-                rq = rd.get("required_questions", [])
-                if rq:
-                    q = rq[0]
-                    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                    if q.get("choices"):
-                        opts = "\n".join(f"{letters[i]}. {c}" for i, c in enumerate(q["choices"]))
-                        qtext = f"{q.get('question','Please choose:')}\n\n{opts}"
-                    else:
-                        qtext = q.get("question", "Please provide the required detail to continue.")
-                    set_pending_question(sess, params, q)  # keep context!
-                    resp = make_response(jsonify({
-                        "reply": qtext,
-                        "debug": {"quote_api_url": used_url, "status": status, "params_sent": params}
-                    }))
-                    resp.set_cookie("dealer_number", dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
-                    return resp
-            if status == 200 and quote_json.get("mode") == "quote":
-                dealer_name = sess.get("dealer_name", "")
-                dealer_rate = float(sess.get("dealer_discount",
-                                  quote_json.get("response_data", {}).get("summary", {}).get("dealer_discount_rate", 0.0)))
-                out = format_quote_output(dealer_name, dn, quote_json, forced_rate=dealer_rate)
-                resp = make_response(jsonify({
-                    "reply": out,
-                    "debug": {"quote_api_url": used_url, "status": status, "params_sent": params}
-                }))
-                resp.set_cookie("dealer_number", dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
-                return resp
-            # If /quote said "not enough info", fall through to GPT to ask a single crisp question.
+        parsed = extract_params_from_text(user_message)
+        extra = parsed if parsed else {"q": user_message}
+        return do_quote(sess, extra)
 
-    # 4) Planner fallback (now that we tried the fast paths)
+    # 4) Planner fallback — only when we still don't have a dealer
     plan = call_openai_for_plan(user_message)
     action, reply, params = plan.get("action"), plan.get("reply") or "", plan.get("params", {})
-
-    # always carry known dealer number into params
-    if dn and not params.get("dealer_number"):
-        params["dealer_number"] = dn
 
     if action == "dealer_lookup":
         if not params.get("dealer_number"):
@@ -613,63 +580,11 @@ def chat():
     if action == "quote":
         if not params.get("dealer_number"):
             return jsonify({"reply": "Please provide your dealer number to begin (e.g., dealer #178200)."})
-        quote_json, status, used_url = call_quote_api("/quote", params)
-        if status == 200 and quote_json.get("mode") == "questions":
-            rd = quote_json.get("response_data", quote_json)
-            rq = rd.get("required_questions", [])
-            if rq:
-                q = rq[0]
-                letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                if q.get("choices"):
-                    opts = "\n".join(f"{letters[i]}. {c}" for i, c in enumerate(q["choices"]))
-                    qtext = f"{q.get('question','Please choose:')}\n\n{opts}"
-                else:
-                    qtext = q.get("question", "Please provide the required detail to continue.")
-                set_pending_question(sess, params, q)
-                resp = make_response(jsonify({
-                    "reply": qtext,
-                    "debug": {"plan": plan, "quote_api_url": used_url, "status": status, "params_sent": params}
-                }))
-                resp.set_cookie("dealer_number", params["dealer_number"], max_age=60*60*24*30, httponly=False, samesite="Lax")
-                return resp
-        if status == 200 and quote_json.get("mode") == "quote":
-            dealer_name = sess.get("dealer_name", "")
-            dealer_rate = float(sess.get("dealer_discount",
-                              quote_json.get("response_data", {}).get("summary", {}).get("dealer_discount_rate", 0.0)))
-            out = format_quote_output(dealer_name, params["dealer_number"], quote_json, forced_rate=dealer_rate)
-            resp = make_response(jsonify({
-                "reply": out,
-                "debug": {"plan": plan, "quote_api_url": used_url, "status": status, "params_sent": params}
-            }))
-            resp.set_cookie("dealer_number", params["dealer_number"], max_age=60*60*24*30, httponly=False, samesite="Lax")
-            return resp
-        return jsonify({"reply": "There was a system error while retrieving data. Please try again shortly. If the issue persists, escalate to Benjamin Luci at 615-516-8802."})
+        # hand off to the same helper to keep behavior consistent
+        sess["dealer_number"] = params["dealer_number"]
+        return do_quote(sess, params)
 
     if action == "ask":
-        # If the planner asked for dealer but we already have one, DON'T re-confirm forever.
-        if dn and "dealer" in reply.lower():
-            # Try a minimal /quote with free text so API can ask the next required question.
-            fallback = {"dealer_number": dn, "q": user_message}
-            qj, st, used = call_quote_api("/quote", fallback)
-            if st == 200 and qj.get("mode") == "questions":
-                rd = qj.get("response_data", qj); rq = rd.get("required_questions", [])
-                if rq:
-                    q = rq[0]
-                    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                    if q.get("choices"):
-                        opts = "\n".join(f"{letters[i]}. {c}" for i, c in enumerate(q["choices"]))
-                        qtext = f"{q.get('question','Please choose:')}\n\n{opts}"
-                    else:
-                        qtext = q.get("question", "Please provide the required detail to continue.")
-                    set_pending_question(sess, {"q": user_message}, q)
-                    resp = make_response(jsonify({
-                        "reply": qtext,
-                        "debug": {"plan": plan, "quote_api_url": used, "status": st, "params_sent": {"q": user_message}}
-                    }))
-                    resp.set_cookie("dealer_number", dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
-                    return resp
-            # Otherwise, ask a neutral follow-up (not dealer again)
-            return jsonify({"reply": "What would you like me to quote? (e.g., BB60.30 or 12 ft Batwing 540 RPM)"})
         return jsonify({"reply": reply or "What would you like to quote?"})
 
     # default smalltalk
