@@ -16,7 +16,11 @@ ALLOWED_ORIGINS = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS") or "*").spli
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
+CORS(
+    app,
+    resources={r"/*": {"origins": ALLOWED_ORIGINS}},
+    allow_headers=["Content-Type", "X-Session-Id"]
+)
 
 # In-memory sessions keyed by client-provided ID
 SESSIONS: Dict[str, Dict[str, Any]] = {}  # { dealer_number, dealer_discount, dealer_name, pending_question, in_progress_params }
@@ -303,15 +307,25 @@ def call_openai_for_plan(user_message: str) -> dict:
     except Exception as e:
         return {"action": "ask", "reply": f"I couldn’t parse that. Please rephrase. ({e})", "params": {}}
 
+import time
+
 def call_quote_api(params: dict) -> Tuple[dict, int, str]:
     if not QUOTE_API_BASE:
         return ({"error": "QUOTE_API_BASE not configured"}, 500, "")
     url = f"{QUOTE_API_BASE}/quote"
-    r = requests.get(url, params=params, timeout=60)
-    try:
-        return r.json(), r.status_code, r.url
-    except Exception:
-        return {"raw_text": r.text}, r.status_code, r.url
+    last_exc = None
+    for attempt in range(2):  # 1 retry
+        try:
+            r = requests.get(url, params=params, timeout=60)
+            try:
+                return r.json(), r.status_code, r.url
+            except Exception:
+                return {"raw_text": r.text}, r.status_code, r.url
+        except Exception as e:
+            last_exc = e
+            time.sleep(1.2)
+    return ({"error": f"Upstream error: {last_exc}"}, 502, url)
+
 
 def call_dealer_discount(dealer_number: str) -> dict:
     url = f"{QUOTE_API_BASE}/dealer-discount"
@@ -382,6 +396,15 @@ def set_pending_question(sess: Dict[str, Any], base_params: Dict[str, Any], q: D
 # =========================
 # Routes
 # =========================
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "ok": True,
+        "quote_api_base": QUOTE_API_BASE,
+        "allowed_origins": ALLOWED_ORIGINS
+    })
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "quote_api_base": QUOTE_API_BASE})
