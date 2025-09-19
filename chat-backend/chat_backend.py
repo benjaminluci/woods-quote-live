@@ -895,7 +895,12 @@ def chat():
             sess["dealer_discount"] = float(rd["discount"])
             sess["dealer_name"] = rd.get("dealer_name", "")
             sess["dealer_number"] = only_dn
-            resp = make_response(jsonify({"reply": f"Using {sess['dealer_name']} (Dealer #{only_dn}) with a {int(sess['dealer_discount']*100)}% dealer discount for this session. ✅
+            resp = reply_msg = (
+                                                               f"Using {sess['dealer_name']} (Dealer #{only_dn}) with a "
+                                                               f"{int(sess['dealer_discount']*100)}% dealer discount for this session. ✅\n\n"
+                                                               "What would you like me to quote?"
+                                                    )
+                   resp = make_response(jsonify({"reply": reply_msg}))
 
 What would you like me to quote?"}))
             resp.set_cookie("dealer_number", only_dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
@@ -983,7 +988,13 @@ What would you like me to quote?"}))
             sess["dealer_discount"] = float(rd["discount"])
             sess["dealer_name"] = rd.get("dealer_name", "")
             sess["dealer_number"] = params["dealer_number"]
-            resp = make_response(jsonify({"reply": f"Using {sess['dealer_name']} (Dealer #{sess['dealer_number']}) with a {int(sess['dealer_discount']*100)}% dealer discount for this session. ✅
+            resp = reply_msg = (
+                                                               f"Using {sess['dealer_name']} (Dealer #{sess['dealer_number']}) with a "
+                                                               f"{int(sess['dealer_discount']*100)}% dealer discount for this session. ✅\n\n"
+                                                               "What would you like me to quote?"
+                                                    )
+                   resp = make_response(jsonify({"reply": reply_msg}))
+
 
 What would you like me to quote?"}))
             resp.set_cookie("dealer_number", sess["dealer_number"], max_age=60*60*24*30, httponly=False, samesite="Lax")
