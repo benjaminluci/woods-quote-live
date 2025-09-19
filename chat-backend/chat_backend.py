@@ -428,6 +428,52 @@ def health():
         "allowed_origins": ALLOWED_ORIGINS
     })
 
+# =========================
+# Core quoting helper (no quick-capture; rely on API required_questions)
+# =========================
+def do_quote(sess: Dict[str, Any], extra_params: Dict[str, Any]):
+    dn = sess.get("dealer_number")
+    if not dn:
+        return jsonify({"reply": "Please provide your dealer number to begin (e.g., dealer #178200)."})
+
+    # Merge context → params
+    params: Dict[str, Any] = {}
+    params.update(sess.get("in_progress_params", {}) or {})
+    params.update(sess.get("params", {}) or {})
+    params.update(extra_params or {})
+    params["dealer_number"] = dn
+
+    quote_json, status, used_url = call_quote_api("/quote", params)
+
+    if status == 200 and quote_json.get("mode") == "questions":
+        rd = quote_json.get("response_data", quote_json)
+        rq = rd.get("required_questions", [])
+        if rq:
+            q = rq[0]
+            set_pending_question(sess, params, q)
+            qtext = format_question(q)
+            resp = make_response(jsonify({
+                "reply": qtext,
+                "debug": {"quote_api_url": used_url, "status": status, "params_sent": params}
+            }))
+            resp.set_cookie("dealer_number", dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
+            return resp
+
+    if status == 200 and quote_json.get("mode") == "quote":
+        dealer_name = sess.get("dealer_name", "")
+        dealer_rate = float(sess.get("dealer_discount",
+                          quote_json.get("response_data", {}).get("summary", {}).get("dealer_discount_rate", 0.0)))
+        out = format_quote_output(dealer_name, dn, quote_json, forced_rate=dealer_rate)
+        resp = make_response(jsonify({
+            "reply": out,
+            "debug": {"quote_api_url": used_url, "status": status, "params_sent": params}
+        }))
+        resp.set_cookie("dealer_number", dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
+        return resp
+
+    # Non-200 or unknown mode → friendly error
+    return jsonify({"reply": "There was a system error while retrieving data. Please try again shortly. If the issue persists, escalate to Benjamin Luci at 615-516-8802."})
+
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -519,37 +565,13 @@ def chat():
         # proceed to quote with accumulated params
         return do_quote(sess, {})
 
-    # 2) FAST-PATH: if we HAVE dealer number, try to parse and call /quote directly (no GPT)
+    # 2) With a dealer number: **always** drive from the Quote API.
     if dn:
-        parsed = extract_params_from_text(user_message)  # model/family/width/shielding/driveline/etc.
-        if parsed:
-            params = {**parsed, "dealer_number": dn}
-            quote_json, status, used_url = call_quote_api("/quote", params)
-            if status == 200 and quote_json.get("mode") == "questions":
-                rd = quote_json.get("response_data", quote_json)
-                rq = rd.get("required_questions", [])
-                if rq:
-                    q = rq[0]
-                    set_pending_question(sess, params, q)  # keep context!
-                    qtext = format_question(q)
-                    resp = make_response(jsonify({
-                        "reply": qtext,
-                        "debug": {"quote_api_url": used_url, "status": status, "params_sent": params}
-                    }))
-                    resp.set_cookie("dealer_number", dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
-                    return resp
-            if status == 200 and quote_json.get("mode") == "quote":
-                dealer_name = sess.get("dealer_name", "")
-                dealer_rate = float(sess.get("dealer_discount",
-                                  quote_json.get("response_data", {}).get("summary", {}).get("dealer_discount_rate", 0.0)))
-                out = format_quote_output(dealer_name, dn, quote_json, forced_rate=dealer_rate)
-                resp = make_response(jsonify({
-                    "reply": out,
-                    "debug": {"quote_api_url": used_url, "status": status, "params_sent": params}
-                }))
-                resp.set_cookie("dealer_number", dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
-                return resp
-            # If /quote said "not enough info", fall through to GPT to ask a single crisp question.
+        parsed = extract_params_from_text(user_message)
+        # If we couldn't parse any structured fields, pass free text to the API so it returns required_questions
+        extra = parsed if parsed else {"q": user_message}
+        return do_quote(sess, extra)
+
 
     # 3) If no dealer yet and user sent just a dealer number, lookup & confirm
     only_dn = extract_dealer_number(user_message)
@@ -645,3 +667,4 @@ def chat():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=True)
+
