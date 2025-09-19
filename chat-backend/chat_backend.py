@@ -21,7 +21,7 @@ CORS(
     resources={r"/*": {"origins": ALLOWED_ORIGINS}},
     allow_headers=["Content-Type", "X-Session-Id"],
     methods=["GET", "POST", "OPTIONS"],
-    supports_credentials=False,   # keep your current cookie stance
+    supports_credentials=False,
     max_age=86400,
 )
 
@@ -174,6 +174,7 @@ WIDTH_FT_RE = re.compile(r"\b(\d{1,2})\s*(?:ft|foot|feet)\b", re.I)
 WIDTH_IN_RE = re.compile(r"\b(\d{2,3})\s*(?:in|inch|inches|\"|”)\b", re.I)
 DRIVELINE_RE = re.compile(r"\b(540|1000|1k)\b", re.I)
 
+
 def norm_model(s: str) -> str:
     return s.upper().replace(" ", "")
 
@@ -258,13 +259,15 @@ def extract_params_from_text(text: str) -> Dict[str, Any]:
     return params
 
 # =========================
-# Other helpers (robust Q&A)
+# Other helpers (NEW for robust Q&A)
 # =========================
+
 def extract_dealer_number(text: str) -> str | None:
     if not text:
         return None
     m = DEALER_REGEX.search(text)
     return m.group(1) if m else None
+
 
 def letter_or_number_choice_to_index(msg: str, count: int) -> int | None:
     s = (msg or "").strip().lower()
@@ -278,11 +281,10 @@ def letter_or_number_choice_to_index(msg: str, count: int) -> int | None:
         return idx if 0 <= idx < count else None
     return None
 
-def _choice_index(msg: str, count: int) -> int | None:
-    return letter_or_number_choice_to_index(msg, count)
 
 def format_question(q: Dict[str, Any]) -> str:
     title = q.get("question") or "Please choose:"
+    # Prefer labels from choices_with_ids; fall back to choices
     labels = [str(c.get("label", "")).strip() for c in q.get("choices_with_ids", [])]
     if not labels and q.get("choices"):
         labels = [str(c).strip() for c in q.get("choices", [])]
@@ -292,9 +294,11 @@ def format_question(q: Dict[str, Any]) -> str:
     opts = [f"{abc[i]}. {labels[i]}" for i in range(len(labels))]
     return f"{title}\n\n" + "\n".join(opts)
 
+
 # =========================
 # OpenAI + API helpers
 # =========================
+
 def call_openai_for_plan(user_message: str) -> dict:
     if not client:
         return {"action": "smalltalk", "reply": "Server missing OPENAI_API_KEY.", "params": {}}
@@ -312,12 +316,19 @@ def call_openai_for_plan(user_message: str) -> dict:
     except Exception as e:
         return {"action": "ask", "reply": f"I couldn’t parse that. Please rephrase. ({e})", "params": {}}
 
+
 def call_quote_api(path: str, params: dict, retries: int = 1, timeout: int = 60) -> Tuple[dict, int, str]:
+    """
+    Call the upstream Quote API with optional retry (helps on cold starts).
+    Returns: (json_or_fallback_dict, status_code, final_url)
+    """
     if not QUOTE_API_BASE:
         return ({"error": "QUOTE_API_BASE not configured"}, 500, "")
+
     base = QUOTE_API_BASE.rstrip("/")
     url = f"{base}/{path.lstrip('/')}"
     last_exc = None
+
     for attempt in range(retries + 1):
         try:
             r = requests.get(url, params=params, timeout=timeout)
@@ -333,6 +344,7 @@ def call_quote_api(path: str, params: dict, retries: int = 1, timeout: int = 60)
                 continue
             return ({"error": f"Upstream error: {last_exc}"}, 502, url)
 
+
 def call_dealer_discount(dealer_number: str) -> dict:
     url = f"{QUOTE_API_BASE}/dealer-discount"
     r = requests.get(url, params={"dealer_number": dealer_number}, timeout=30)
@@ -340,6 +352,7 @@ def call_dealer_discount(dealer_number: str) -> dict:
         return r.json()
     except Exception:
         return {"error": r.text}
+
 
 def apply_discounts_from_summary(summary: dict, dealer_discount_rate: float, items: list):
     subtotal = float(summary.get("subtotal_list", 0.0)) or sum(float(i.get("subtotal", 0)) for i in items)
@@ -354,6 +367,7 @@ def apply_discounts_from_summary(summary: dict, dealer_discount_rate: float, ite
         final_net = round(after_dealer - cash_amt, 2)
         cash_line = f"Cash Discount (12%): -${cash_amt:,.2f}"
     return subtotal, dealer_amt, after_dealer, cash_amt, final_net, cash_line
+
 
 def format_quote_output(dealer_name, dealer_number, resp, forced_rate=None):
     rd = resp.get("response_data", resp)
@@ -384,9 +398,14 @@ def format_quote_output(dealer_name, dealer_number, resp, forced_rate=None):
     return "\n".join(lines)
 
 # =========================
-# Save context with each question
+# NEW: save context with each question
 # =========================
+
 def set_pending_question(sess: Dict[str, Any], base_params: Dict[str, Any], q: Dict[str, Any]):
+    """
+    Save the current context and the next question so we can merge the user's answer
+    with the previously provided params (e.g., keep model/family/width).
+    """
     ctx = {k: v for k, v in (base_params or {}).items() if k != "dealer_number"}
     sess["in_progress_params"] = ctx
     sess["pending_question"] = {
@@ -396,9 +415,352 @@ def set_pending_question(sess: Dict[str, Any], base_params: Dict[str, Any], q: D
         "question": q.get("question", "Please choose:")
     }
 
+
 # =========================
-# Core quoting helper (drive from API required_questions)
+# Local family trees (mimic GPT action logic)
 # =========================
+# Each family defines an ordered list of questions. Each question has:
+# - name: field name to send to Quote API
+# - question: human text
+# - choices_with_ids: list of {id,label} the backend will accept
+#
+# You can extend or edit these safely without touching the rest of the code.
+
+FAMILY_TREES: Dict[str, list] = {
+    # BrushFighter (BF): API usually lists exact configs (bf_choice_id); no fixed local choices here.
+
+    # BrushBull rotary cutters (BBxx.xx)
+    "brushbull": [
+        {
+            "name": "bb_duty",
+            "question": "Which duty class for BrushBull?",
+            "choices_with_ids": [
+                {"id": ".30", "label": "Standard Duty (.30)"},
+                {"id": ".40", "label": "Standard Plus (.40)"},
+                {"id": ".50", "label": "Heavy Duty (.50)"},
+                {"id": ".60", "label": "Extreme Duty (.60)"},
+            ],
+        },
+        {
+            "name": "bb_shielding",
+            "question": "Belt or Chain shielding for BrushBull?",
+            "choices_with_ids": [
+                {"id": "Belt", "label": "Belt"},
+                {"id": "Chain", "label": "Chain"},
+            ],
+        },
+        {
+            "name": "bb_tailwheel",
+            "question": "Single or Dual tailwheel?",
+            "choices_with_ids": [
+                {"id": "Single", "label": "Single"},
+                {"id": "Dual", "label": "Dual"},
+            ],
+        },
+        # API will finalize (bb_choice_id) if needed
+    ],
+
+    # Dual-spindle cutters (DS / MDS)
+    "dual_spindle": [
+        {
+            "name": "ds_mount",
+            "question": "Mounted (MDS) or Pull-type (DS)?",
+            "choices_with_ids": [
+                {"id": "MDS", "label": "Mounted (MDS)"},
+                {"id": "DS", "label": "Pull-type (DS)"},
+            ],
+        },
+        {
+            "name": "ds_shielding",
+            "question": "Belt or Chain shielding?",
+            "choices_with_ids": [
+                {"id": "Belt", "label": "Belt"},
+                {"id": "Chain", "label": "Chain"},
+            ],
+        },
+        {
+            "name": "ds_driveline",
+            "question": "What driveline speed do you need?",
+            "choices_with_ids": [
+                {"id": "540", "label": "540 RPM"},
+                {"id": "1000", "label": "1000 RPM"},
+            ],
+        },
+        # API completes with ds choice ids if applicable
+    ],
+
+    # Batwing (BWxx.xx) – tires/qty are API-driven after driveline
+    "batwing": [
+        {
+            "name": "bw_driveline",
+            "question": "Which driveline do you want?",
+            "choices_with_ids": [
+                {"id": "540", "label": "540"},
+                {"id": "1000", "label": "1000"},
+            ],
+        },
+        # API will ask tire_id and bw_tire_qty
+    ],
+
+    # Turf Batwing (TBW): mirror of Batwing, but API will drive series/options
+    "turf_batwing": [
+        {
+            "name": "tbw_duty",
+            "question": "Which Turf Batwing series/duty?",
+            "choices_with_ids": [
+                {"id": "TBW12", "label": "12 ft Turf Batwing"},
+                {"id": "TBW15", "label": "15 ft Turf Batwing"},
+                {"id": "TBW17", "label": "17 ft Turf Batwing"},
+            ],
+        },
+        # API will refine and pick exact model/options thereafter
+    ],
+
+    # Rear finish mowers
+    "rear_finish": [
+        {
+            "name": "finish_choice",
+            "question": "Which rear-finish configuration do you need?",
+            "choices_with_ids": [
+                {"id": "rear_discharge", "label": "Rear discharge"},
+                {"id": "side_discharge", "label": "Side discharge"},
+            ],
+        },
+        # API will ask width/model specifics
+    ],
+
+    # Box Scraper (BS) – widths are inches
+    "box_scraper": [
+        {
+            "name": "bs_width_in",
+            "question": "Choose a box scraper width:",
+            "choices_with_ids": [
+                {"id": "48", "label": "48 in (4 ft)"},
+                {"id": "60", "label": "60 in (5 ft)"},
+                {"id": "72", "label": "72 in (6 ft)"},
+                {"id": "84", "label": "84 in (7 ft)"},
+            ],
+        },
+        {
+            "name": "bs_duty",
+            "question": "Which duty class for the box scraper?",
+            "choices_with_ids": [
+                {"id": "standard", "label": "Standard"},
+                {"id": "heavy", "label": "Heavy Duty"},
+            ],
+        },
+        # API returns bs_choice_id to finalize
+    ],
+
+    # Grading Scraper (GS)
+    "grading_scraper": [
+        {
+            "name": "gs_width_in",
+            "question": "Choose a grading scraper width:",
+            "choices_with_ids": [
+                {"id": "60", "label": "60 in (5 ft)"},
+                {"id": "72", "label": "72 in (6 ft)"},
+                {"id": "84", "label": "84 in (7 ft)"},
+            ],
+        },
+        # API returns gs_choice_id
+    ],
+
+    # Landscape Rake (LRS)
+    "landscape_rake": [
+        {
+            "name": "lrs_width_in",
+            "question": "Choose a rake width:",
+            "choices_with_ids": [
+                {"id": "60", "label": "60 in (5 ft)"},
+                {"id": "72", "label": "72 in (6 ft)"},
+                {"id": "84", "label": "84 in (7 ft)"},
+            ],
+        },
+        {
+            "name": "lrs_grade",
+            "question": "Standard or Premium grade?",
+            "choices_with_ids": [
+                {"id": "standard", "label": "Standard"},
+                {"id": "P", "label": "Premium (P)"},
+            ],
+        },
+        # API returns lrs_choice_id
+    ],
+
+    # Rear Blade (RB)
+    "rear_blade": [
+        {
+            "name": "rb_width_in",
+            "question": "Choose a rear blade width:",
+            "choices_with_ids": [
+                {"id": "72", "label": "72 in (6 ft)"},
+                {"id": "84", "label": "84 in (7 ft)"},
+                {"id": "96", "label": "96 in (8 ft)"},
+            ],
+        },
+        {
+            "name": "rb_duty",
+            "question": "Which duty class for the rear blade?",
+            "choices_with_ids": [
+                {"id": "standard", "label": "Standard"},
+                {"id": "medium", "label": "Medium"},
+                {"id": "heavy", "label": "Heavy Duty"},
+            ],
+        },
+        # API returns rb_choice_id
+    ],
+
+    # Disc Harrow (DH)
+    "disc_harrow": [
+        {
+            "name": "dh_width_in",
+            "question": "What working width do you want?",
+            "choices_with_ids": [
+                {"id": "48", "label": "48 in (4 ft)"},
+                {"id": "64", "label": "64 in (5 ft)"},
+                {"id": "80", "label": "80 in (6 ft)"},
+                {"id": "96", "label": "96 in (8 ft)"},
+            ],
+        },
+        {
+            "name": "dh_duty",
+            "question": "Which duty class?",
+            "choices_with_ids": [
+                {"id": "standard", "label": "Standard"},
+                {"id": "heavy", "label": "Heavy Duty"},
+            ],
+        },
+        {
+            "name": "dh_blade",
+            "question": "Blade style?",
+            "choices_with_ids": [
+                {"id": "notched", "label": "Notched"},
+                {"id": "smooth", "label": "Smooth"},
+                {"id": "combo", "label": "Notched/Smooth Combo"},
+            ],
+        },
+        # API will ask dh_spacing_id as needed (we will forward that)
+    ],
+
+    # Post Hole Digger (PD)
+    "post_hole_digger": [
+        {
+            "name": "pd_model",
+            "question": "Which PD model?",
+            "choices_with_ids": [
+                {"id": "PD25.21", "label": "PD25.21"},
+                {"id": "PD35.31", "label": "PD35.31"},
+                {"id": "PD95.51", "label": "PD95.51"},
+            ],
+        },
+        # API will return auger options; we’ll answer with auger_id
+    ],
+
+    # Tiller (DB/RT/RTR)
+    "tiller": [
+        {
+            "name": "tiller_series",
+            "question": "Which tiller series?",
+            "choices_with_ids": [
+                {"id": "DB", "label": "DB (Light Duty Dirt Breaker)"},
+                {"id": "RT", "label": "RT (Commercial Duty)"},
+            ],
+        },
+        {
+            "name": "tiller_width_in",
+            "question": "Tiller width?",
+            "choices_with_ids": [
+                {"id": "60", "label": "60 in (5 ft)"},
+                {"id": "72", "label": "72 in (6 ft)"},
+                {"id": "84", "label": "84 in (7 ft)"},
+            ],
+        },
+        {
+            "name": "tiller_rotation",
+            "question": "Rotation (RT only)?",
+            "choices_with_ids": [
+                {"id": "forward", "label": "Forward (RT)"},
+                {"id": "reverse", "label": "Reverse (RTR)"},
+            ],
+        },
+        # API returns tiller_choice_id for exact unit
+    ],
+
+    # Bale Spear
+    "bale_spear": [
+        # API will list bspear_choice_id; no stable, local choices to hard-code.
+    ],
+
+    # Pallet Fork
+    "pallet_fork": [
+        # API will list pf_choice_id
+    ],
+
+    # Quick Hitch
+    "quick_hitch": [
+        # API will ask to pick TQH1 (Cat 1) or TQH2 (Cat 2) via qh_choice_id; we can optionally seed:
+        {
+            "name": "qh_choice_id",
+            "question": "Which quick hitch category?",
+            "choices_with_ids": [
+                {"id": "TQH1", "label": "TQH1 (Category 1)"},
+                {"id": "TQH2", "label": "TQH2 (Category 2)"},
+            ],
+        }
+    ],
+
+    # Stump Grinder
+    "stump_grinder": [
+        {
+            "name": "hydraulics_id",
+            "question": "Hydraulic option?",
+            "choices_with_ids": [
+                {"id": "standard", "label": "Standard flow"},
+                {"id": "high_flow", "label": "High flow"},
+            ],
+        },
+        # API finalizes exact model/part
+    ],
+}
+
+
+def infer_family_from_model_or_text(params: Dict[str, Any], user_text: str = "") -> str | None:
+    # explicit family wins
+    fam = params.get("family")
+    if fam:
+        return fam
+    # infer from model code
+    m = (params.get("model") or "").upper()
+    if m.startswith("BB"): return "brushbull"
+    if m.startswith("BW"): return "batwing"
+    if m.startswith("DS") or m.startswith("MDS"): return "dual_spindle"
+    # infer from free text via parse_family
+    pf = parse_family(user_text)
+    return pf
+
+
+def next_family_tree_question(params: Dict[str, Any], user_text: str = "") -> Dict[str, Any] | None:
+    fam = infer_family_from_model_or_text(params, user_text)
+    if not fam: return None
+    tree = FAMILY_TREES.get(fam)
+    if not tree: return None
+    answered = set(k for k, v in (params or {}).items() if v not in (None, "", []))
+    for q in tree:
+        if q["name"] not in answered:
+            # Return a copy so callers can mutate safely
+            return {
+                "name": q["name"],
+                "question": q["question"],
+                "choices_with_ids": list(q.get("choices_with_ids", []))
+            }
+    return None
+
+
+# =========================
+# Core quoting helper (drive from API required_questions) + family-tree fallback
+# =========================
+
 def do_quote(sess: Dict[str, Any], extra_params: Dict[str, Any]):
     dn = sess.get("dealer_number")
     if not dn:
@@ -413,6 +775,7 @@ def do_quote(sess: Dict[str, Any], extra_params: Dict[str, Any]):
 
     quote_json, status, used_url = call_quote_api("/quote", params)
 
+    # 1) Upstream asks for more info
     if status == 200 and quote_json.get("mode") == "questions":
         rd = quote_json.get("response_data", quote_json)
         rq = rd.get("required_questions", [])
@@ -420,13 +783,25 @@ def do_quote(sess: Dict[str, Any], extra_params: Dict[str, Any]):
             q = rq[0]
             set_pending_question(sess, params, q)
             qtext = format_question(q)
+            # attach UI block so frontend can render real buttons
+            choices_struct = q.get("choices_with_ids") or [
+                {"id": str(c), "label": str(c)} for c in (q.get("choices") or [])
+            ]
             resp = make_response(jsonify({
                 "reply": qtext,
+                "ui": {
+                    "type": "choices",
+                    "name": q.get("name"),
+                    "question": q.get("question"),
+                    "choices": choices_struct,
+                },
+                "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")},
                 "debug": {"quote_api_url": used_url, "status": status, "params_sent": params}
             }))
             resp.set_cookie("dealer_number", dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
             return resp
 
+    # 2) Upstream returned a quote
     if status == 200 and quote_json.get("mode") == "quote":
         dealer_name = sess.get("dealer_name", "")
         dealer_rate = float(sess.get("dealer_discount",
@@ -439,11 +814,32 @@ def do_quote(sess: Dict[str, Any], extra_params: Dict[str, Any]):
         resp.set_cookie("dealer_number", dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
         return resp
 
+    # 3) Family-tree fallback: if API didn’t guide us, ask the next local question
+    lf_q = next_family_tree_question(params, user_text=(extra_params.get("q") or ""))
+    if lf_q:
+        set_pending_question(sess, params, lf_q)
+        qtext = format_question(lf_q)
+        resp = make_response(jsonify({
+            "reply": qtext,
+            "ui": {
+                "type": "choices",
+                "name": lf_q.get("name"),
+                "question": lf_q.get("question"),
+                "choices": lf_q.get("choices_with_ids"),
+            },
+            "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")},
+            "debug": {"note": "family_tree_fallback", "params_sent": params}
+        }))
+        resp.set_cookie("dealer_number", dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
+        return resp
+
     return jsonify({"reply": "There was a system error while retrieving data. Please try again shortly. If the issue persists, escalate to Benjamin Luci at 615-516-8802."})
+
 
 # =========================
 # Routes
 # =========================
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
@@ -451,6 +847,7 @@ def health():
         "quote_api_base": QUOTE_API_BASE,
         "allowed_origins": ALLOWED_ORIGINS
     })
+
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -498,7 +895,9 @@ def chat():
             sess["dealer_discount"] = float(rd["discount"])
             sess["dealer_name"] = rd.get("dealer_name", "")
             sess["dealer_number"] = only_dn
-            resp = make_response(jsonify({"reply": f"Using {sess['dealer_name']} (Dealer #{only_dn}) with a {int(sess['dealer_discount']*100)}% dealer discount for this session. ✅\n\nWhat would you like me to quote?"}))
+            resp = make_response(jsonify({"reply": f"Using {sess['dealer_name']} (Dealer #{only_dn}) with a {int(sess['dealer_discount']*100)}% dealer discount for this session. ✅
+
+What would you like me to quote?"}))
             resp.set_cookie("dealer_number", only_dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
             return resp
 
@@ -511,7 +910,7 @@ def chat():
         if not labels:
             return jsonify({"reply": pending.get("question", "Please choose:")})
 
-        idx = _choice_index(user_message, len(labels))
+        idx = letter_or_number_choice_to_index(user_message, len(labels))
         if idx is None:
             low = user_message.strip().lower()
             # exact label
@@ -532,8 +931,20 @@ def chat():
 
         if idx is None:
             letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            opts = "\n".join(f"{letters[i]}. {labels[i]}" for i in range(len(labels)))
-            return jsonify({"reply": f"{pending.get('question','Please choose:')}\n\n{opts}"})
+            opts = "
+".join(f"{letters[i]}. {labels[i]}" for i in range(len(labels)))
+            return jsonify({
+                "reply": f"{pending.get('question','Please choose:')}
+
+{opts}",
+                "ui": {
+                    "type": "choices",
+                    "name": pending.get("name"),
+                    "question": pending.get("question"),
+                    "choices": cwids or [{"id": str(c), "label": str(c)} for c in (pending.get("choices") or [])]
+                },
+                "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")}
+            })
 
         # Prefer IDs when available
         value = cwids[idx].get("id") if cwids else (pending.get("choices") or [None])[idx]
@@ -553,7 +964,7 @@ def chat():
 
         return do_quote(sess, merged)
 
-    # 3) With a dealer number: always drive from the Quote API using merged context
+    # 3) With a dealer number: always drive from the Quote API using merged context (or family tree)
     if dn:
         parsed = extract_params_from_text(user_message)
         extra = parsed if parsed else {"q": user_message}
@@ -572,7 +983,9 @@ def chat():
             sess["dealer_discount"] = float(rd["discount"])
             sess["dealer_name"] = rd.get("dealer_name", "")
             sess["dealer_number"] = params["dealer_number"]
-            resp = make_response(jsonify({"reply": f"Using {sess['dealer_name']} (Dealer #{sess['dealer_number']}) with a {int(sess['dealer_discount']*100)}% dealer discount for this session. ✅\n\nWhat would you like me to quote?"}))
+            resp = make_response(jsonify({"reply": f"Using {sess['dealer_name']} (Dealer #{sess['dealer_number']}) with a {int(sess['dealer_discount']*100)}% dealer discount for this session. ✅
+
+What would you like me to quote?"}))
             resp.set_cookie("dealer_number", sess["dealer_number"], max_age=60*60*24*30, httponly=False, samesite="Lax")
             return resp
         return jsonify({"reply": "Could not retrieve dealer discount. Please try again shortly."})
@@ -580,7 +993,7 @@ def chat():
     if action == "quote":
         if not params.get("dealer_number"):
             return jsonify({"reply": "Please provide your dealer number to begin (e.g., dealer #178200)."})
-        # hand off to the same helper to keep behavior consistent
+        # Keep behavior consistent: route through do_quote (lets family tree help too)
         sess["dealer_number"] = params["dealer_number"]
         return do_quote(sess, params)
 
@@ -589,6 +1002,7 @@ def chat():
 
     # default smalltalk
     return jsonify({"reply": reply or "How can I help with your Woods quote today?"})
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
