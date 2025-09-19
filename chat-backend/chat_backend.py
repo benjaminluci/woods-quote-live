@@ -309,7 +309,7 @@ def call_openai_for_plan(user_message: str) -> dict:
 
 import time
 
-def call_quote_api(params: dict) -> Tuple[dict, int, str]:
+def (params: dict) -> Tuple[dict, int, str]:
     if not QUOTE_API_BASE:
         return ({"error": "QUOTE_API_BASE not configured"}, 500, "")
     url = f"{QUOTE_API_BASE}/quote"
@@ -404,10 +404,6 @@ def health():
         "quote_api_base": QUOTE_API_BASE,
         "allowed_origins": ALLOWED_ORIGINS
     })
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"ok": True, "quote_api_base": QUOTE_API_BASE})
 
 @app.route("/chat", methods=["POST"])
 def chat():
