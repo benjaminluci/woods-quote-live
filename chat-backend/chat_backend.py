@@ -886,6 +886,8 @@ def chat():
             resp.set_cookie("dealer_number", only_dn, max_age=60 * 60 * 24 * 30, httponly=False, samesite="Lax")
             return resp
 
+
+
     # 2) Multiple choice resolution
     pending = sess.get("pending_question")
     if pending and dn:
@@ -945,6 +947,7 @@ def chat():
         merged.update(sess.get("in_progress_params", {}) or {})
         merged.update(sess.get("params", {}) or {})
         merged[name] = value
+        merged["dealer_number"] = dn
 
         # clear pending/context and stale params
         sess.pop("pending_question", None)
