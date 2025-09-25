@@ -166,6 +166,7 @@ DRIVELINE_NAMES = {"driveline", "bw_driveline", "ds_driveline"}  # lowercase mat
 DEFAULT_DRIVELINE_CHOICES = [
     {"id": "540", "label": "540 RPM"},
     {"id": "1000", "label": "1000 RPM"},
+]
 
 
 def norm_model(s: str) -> str:
