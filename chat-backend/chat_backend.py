@@ -398,6 +398,43 @@ def infer_field_from_question(question: str, family: Optional[str]) -> Optional[
         return "bb_shielding"
     return None
 
+def _try_local_adjustment_reply(message: str, sess: Dict[str, Any]) -> Optional[str]:
+    """
+    If the user asks for setup or markup, compute against the last quote totals
+    without calling the Quote API or planner. Returns a reply string or None.
+    """
+    if not message:
+        return None
+    last = sess.get("last_quote")
+    if not last:
+        return None
+
+    msg = message.lower()
+    m_setup = re.search(r"(?:setup|set\s*up)\s*\$?\s*([0-9]+(?:\.[0-9]{1,2})?)", msg)
+    m_markup = re.search(r"(?:mark\s*up|markup|margin)\s*([0-9]+(?:\.[0-9]{1,2})?)\s*%", msg)
+
+    if not (m_setup or m_markup):
+        return None
+
+    base = float(last.get("final_net") or last.get("summary", {}).get("total") or 0.0)
+    if base <= 0:
+        return None
+
+    setup_fee = float(m_setup.group(1)) if m_setup else 0.0
+    markup_pct = float(m_markup.group(1)) if m_markup else 0.0
+
+    marked = base * (1.0 + markup_pct / 100.0) if markup_pct else base
+    total = marked + setup_fee
+
+    lines = [f"Starting from your last quote’s Final Dealer Net: ${base:,.2f}"]
+    if markup_pct:
+        lines.append(f"Markup ({markup_pct:.0f}%): +${(marked - base):,.2f} → ${marked:,.2f}")
+    if setup_fee:
+        lines.append(f"Setup Fee: +${setup_fee:,.2f} → ${total:,.2f}")
+    lines.append(f"✅ Adjusted Total: ${total:,.2f}")
+    return "\n".join(lines)
+
+
 # =========================
 # OpenAI + Quote API
 # =========================
@@ -989,11 +1026,14 @@ def chat():
                 f"{int(sess['dealer_discount'] * 100)}% dealer discount for this session. ✅\n\n"
                 "What would you like me to quote?"
             )
-            resp = make_response(jsonify({"reply": reply_msg, "state": {"dealer_number": only_dn, "dealer_name": sess["dealer_name"]}}))
+            resp = make_response(jsonify({
+                "reply": reply_msg,
+                "state": {"dealer_number": only_dn, "dealer_name": sess["dealer_name"]},
+            }))
             resp.set_cookie("dealer_number", only_dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
             return resp
 
-    # New-quote detection to allow multiple quotes in one session
+    # New-quote detection to allow multiple quotes in one session (keep dealer)
     def _reset_quote_state(s):
         s.pop("pending_question", None)
         s.pop("in_progress_params", None)
@@ -1007,9 +1047,17 @@ def chat():
     if sess.get("pending_question") and started_new_quote:
         _reset_quote_state(sess)
 
-    # 1) If we already know the dealer, decide whether this is a quote turn or an AI/planner turn
+    # If we know the dealer, we can operate in quote OR AI modes
     if dn:
-        # 1a) Resolve pending multiple-choice answers
+        # Try local adjustments FIRST (AI-like math without planner or Quote API)
+        adj_reply = _try_local_adjustment_reply(user_message, sess)
+        if adj_reply:
+            return jsonify({
+                "reply": adj_reply,
+                "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")},
+            })
+
+        # Resolve pending multiple-choice answers
         pending = sess.get("pending_question")
         if pending and not started_new_quote:
             cwids = pending.get("choices_with_ids") or []
@@ -1030,24 +1078,24 @@ def chat():
                                "choices": list(DEFAULT_DRIVELINE_CHOICES)},
                         "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")},
                     })
-                return jsonify({"reply": pending.get("question", "Please choose:"), "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")}})
+                return jsonify({
+                    "reply": pending.get("question", "Please choose:"),
+                    "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")},
+                })
 
             idx = letter_or_number_choice_to_index(user_message, len(labels))
 
             if idx is None:
                 low = user_message.strip().lower()
-                # exact label
                 for i, lab in enumerate(labels):
                     if lab.lower() == low:
                         idx = i
                         break
-                # contains
                 if idx is None:
                     for i, lab in enumerate(labels):
                         if low in lab.lower():
                             idx = i
                             break
-                # exact id match
                 if idx is None and cwids:
                     ids = [str(c.get("id", "")).strip().lower() for c in cwids]
                     for i, _id in enumerate(ids):
@@ -1065,7 +1113,6 @@ def chat():
                     "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")},
                 })
 
-            # Build merged params with both provided and canonical names
             value = cwids[idx].get("id") if cwids else (pending.get("choices") or [None])[idx]
             name = (pending.get("name") or "").strip()
             lname = name.lower() if name else ""
@@ -1085,17 +1132,15 @@ def chat():
             if canonical and canonical != lname:
                 merged[canonical] = _maybe_int(canonical, value)
 
-            # Always include dealer on answer turns
             merged["dealer_number"] = dn
 
-            # clear pending/context and continue
             sess.pop("pending_question", None)
             sess.pop("in_progress_params", None)
             sess["params"] = {}
 
             return do_quote(sess, merged)
 
-        # 1b) No pending question → decide intent
+        # No pending question → decide intent
         intent = intent_from_text(user_message)
         if intent == "quote":
             parsed = extract_params_from_text(user_message)
@@ -1104,7 +1149,7 @@ def chat():
             extra = parsed if parsed else {"q": user_message}
             return do_quote(sess, extra)
 
-        # Not a quote intent → let the planner talk (AI feel)
+        # Not a quote → use planner (AI chatter)
         plan = call_openai_for_plan(user_message)
         action = plan.get("action")
         reply = plan.get("reply") or ""
@@ -1122,7 +1167,10 @@ def chat():
                     f"{int(sess['dealer_discount'] * 100)}% dealer discount for this session. ✅\n\n"
                     "What would you like me to quote?"
                 )
-                return jsonify({"reply": msg, "state": {"dealer_number": sess["dealer_number"], "dealer_name": sess["dealer_name"]}})
+                return jsonify({
+                    "reply": msg,
+                    "state": {"dealer_number": sess["dealer_number"], "dealer_name": sess["dealer_name"]},
+                })
 
         if action == "quote":
             if not params.get("dealer_number"):
@@ -1131,10 +1179,19 @@ def chat():
                 sess["family"] = params["family"]
             return do_quote(sess, params)
 
-        # smalltalk / ask
-        return jsonify({"reply": reply or "How can I help with your Woods quote today?", "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")}})
+        return jsonify({
+            "reply": reply or "How can I help with your Woods quote today?",
+            "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")},
+        })
 
-    # 2) No dealer yet → try planner to request it nicely
+    # No dealer known yet -----------------------------------------------
+
+    # If the user asked for adjustments and we still have last_quote in this session, answer anyway
+    adj_reply = _try_local_adjustment_reply(user_message, sess)
+    if adj_reply:
+        return jsonify({"reply": adj_reply})
+
+    # Planner to request dealer nicely or handle smalltalk
     plan = call_openai_for_plan(user_message)
     action = plan.get("action")
     reply = plan.get("reply") or ""
@@ -1154,20 +1211,23 @@ def chat():
                 f"{int(sess['dealer_discount'] * 100)}% dealer discount for this session. ✅\n\n"
                 "What would you like me to quote?"
             )
-            return jsonify({"reply": msg, "state": {"dealer_number": sess["dealer_number"], "dealer_name": sess["dealer_name"]}})
+            return jsonify({
+                "reply": msg,
+                "state": {"dealer_number": sess["dealer_number"], "dealer_name": sess["dealer_name"]},
+            })
 
     if action == "quote":
         if not params.get("dealer_number"):
-            return jsonify({"reply": "Please provide your dealer number to begin (e.g., dealer #178200)."})
+            return jsonify({"reply": "Please provide your dealer number to begin (e.g., dealer #XXXXXX)."})
         sess["dealer_number"] = params["dealer_number"]
         if params.get("family"):
             sess["family"] = params["family"]
         return do_quote(sess, params)
 
     if action == "ask":
-        return jsonify({"reply": reply or "Please provide your dealer number to begin (e.g., dealer #178200)."})
+        return jsonify({"reply": reply or "Please provide your dealer number to begin (e.g., dealer #XXXXXX)."})
 
-    return jsonify({"reply": reply or "Please provide your dealer number to begin (e.g., dealer #178200)."})
+    return jsonify({"reply": reply or "Please provide your dealer number to begin (e.g., dealer #XXXXXX)."})
 
 # =========================
 # Entrypoint
