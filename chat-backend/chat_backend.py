@@ -467,39 +467,6 @@ def _try_local_adjustment_reply(message: str, sess: Dict[str, Any]) -> Optional[
 # =========================
 # OpenAI + Quote API
 # =========================
-
-def call_openai_for_plan(user_message: str, sess: Dict[str, Any]) -> dict:
-    if not client:
-        # Fallback: if no key, let backend drive. Use simple heuristics here if desired.
-        return {"action": "smalltalk", "reply": "Okay.", "params": {}}
-
-    # Small, stable snapshot for better decisions
-    state = {
-        "dealer_number": sess.get("dealer_number"),
-        "dealer_name": sess.get("dealer_name"),
-        "pending_question": (sess.get("pending_question") or {}).get("name"),
-        "family": sess.get("family"),
-        "last_quote": {
-            "final_net": (sess.get("last_quote") or {}).get("final_net"),
-            "summary_total": (sess.get("last_quote") or {}).get("summary", {}).get("total"),
-        },
-    }
-
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.2,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "system", "content": "SESSION_STATE:\n" + json.dumps(state)},
-            {"role": "user", "content": user_message},
-        ],
-        response_format={"type": "json_object"},
-    )
-    try:
-        return json.loads(completion.choices[0].message.content)
-    except Exception as e:
-        return {"action": "ask", "reply": f"I couldn’t parse that. Please rephrase. ({e})", "params": {}}
-
 def call_quote_api(path: str, params: dict, retries: int = 1, timeout: int = 60) -> Tuple[dict, int, str]:
     if not QUOTE_API_BASE:
         return ({"error": "QUOTE_API_BASE not configured"}, 500, "")
@@ -1017,7 +984,10 @@ def do_quote(sess: Dict[str, Any], extra_params: Dict[str, Any]):
         resp.set_cookie("dealer_number", dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
         return resp
 
-    # 4) Generic failure
+    # 4) Generic failure (also covers upstream HTML/error bodies)
+    raw = quote_json.get("raw_text", "")
+    if isinstance(raw, str) and "<!doctype" in raw.lower():
+        logging.error("Upstream returned non-JSON HTML at %s", used_url)
     return jsonify({
         "reply": "There was a system error while retrieving your quote. Please try again. If the issue persists, contact support.",
         "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")},
@@ -1037,253 +1007,298 @@ def health():
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    data = request.get_json(force=True, silent=True) or {}
-    user_message = (data.get("message") or "").strip()
-    if not user_message:
-        return jsonify({"error": "Missing message"}), 400
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        user_message = (data.get("message") or "").strip()
+        if not user_message:
+            return jsonify({"error": "Missing message"}), 400
 
-    # Session id
-    body_sid = data.get("session_id")
-    header_sid = request.headers.get("X-Session-Id")
-    session_id = header_sid or body_sid or f"anon-{int(time.time()*1000)}"
-    sess = SESSIONS.setdefault(session_id, {})
+        # Session id
+        body_sid = data.get("session_id")
+        header_sid = request.headers.get("X-Session-Id")
+        session_id = header_sid or body_sid or f"anon-{int(time.time()*1000)}"
+        sess = SESSIONS.setdefault(session_id, {})
 
-    # Dealer: JSON body → header → text (dealer #123456 OR bare 123456) → session → cookie
-    dn = None
-    if data.get("dealer_number"):
-        dn = str(data["dealer_number"]).strip()
-    if not dn:
-        hdr_dn = request.headers.get("X-Dealer-Number")
-        if hdr_dn:
-            dn = str(hdr_dn).strip()
-    if not dn:
-        dn = extract_dealer_number(user_message)
-    if not dn:
-        dn = sess.get("dealer_number")
-    if not dn:
-        dn = request.cookies.get("dealer_number")
-    if dn:
-        sess["dealer_number"] = dn
-
-    # Dealer-only message (no quote intent)
-    only_dn = extract_dealer_number(user_message)
-    if only_dn and not intent_from_text(user_message):
-        info = call_dealer_discount(only_dn)
-        rd = info if isinstance(info, dict) else {}
-        if "discount" in rd:
-            sess["dealer_discount"] = float(rd["discount"])
-            sess["dealer_name"] = rd.get("dealer_name", "")
-            sess["dealer_number"] = only_dn
-            reply_msg = (
-                f"Using {sess['dealer_name']} (Dealer #{only_dn}) with a "
-                f"{int(sess['dealer_discount'] * 100)}% dealer discount for this session. ✅\n\n"
-                "What would you like me to quote?"
-            )
-            resp = make_response(jsonify({
-                "reply": reply_msg,
-                "state": {"dealer_number": only_dn, "dealer_name": sess["dealer_name"]},
-            }))
-            resp.set_cookie("dealer_number", only_dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
-            return resp
-
-    # Allow multiple quotes in one session (reset quote-scoped state but keep dealer)
-    def _reset_quote_state(s):
-        s.pop("pending_question", None)
-        s.pop("in_progress_params", None)
-        s["params"] = {}
-        s.pop("family", None)
-        s.pop("post_quote", None)
-
-    model_in_text = bool(MODEL_RE.search(user_message or ""))
-    fam_in_text = parse_family(user_message) or fuzzy_family(user_message)
-    started_new_quote = bool(model_in_text or fam_in_text)
-    if sess.get("pending_question") and started_new_quote:
-        _reset_quote_state(sess)
-
-    # ---- Local AI-like adjustments FIRST (works with/without dealer; won’t hijack accessories) ----
-    def _try_local_adjustment_reply(message: str, sess: Dict[str, Any]) -> Optional[str]:
-        """
-        Triggers ONLY when the message mentions setup/set up OR markup/mark it up/margin
-        along with a number. Uses an explicit base in the message if present; otherwise
-        uses last quote's Final Net if available.
-        """
-        if not message:
-            return None
-        msg = message.lower()
-
-        # Keyword gates (avoid intercepting "add dual hub kit")
-        mentions_setup = bool(re.search(r"\b(set\s*up|setup|setup\s*fee)\b", msg))
-        mentions_markup = bool(re.search(r"\b(mark(?:\s*it)?\s*up|markup|margin)\b", msg))
-        if not (mentions_setup or mentions_markup):
-            # Follow-up: "what's the total?" after a prior adjustment
-            if re.search(r"\b(total|out\s*the\s*door|all\s*in)\b", msg) and sess.get("last_adjustment"):
-                last_adj = sess["last_adjustment"]
-                return f"✅ Adjusted Total: ${float(last_adj.get('total', 0.0)):,.2f}"
-            return None
-
-        # tolerant numbers
-        NUM = r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)"
-
-        setup_re = (
-            re.search(rf"(?:set\s*up|setup|setup\s*fee)\D{{0,12}}{NUM}", msg)
-            or re.search(rf"{NUM}\D{{0,6}}(?:set\s*up|setup|setup\s*fee)", msg)
-        )
-        markup_re = (
-            re.search(rf"(?:mark(?:\s*it)?\s*up|markup|margin)\D{{0,12}}{NUM}\s*%?", msg)
-            or re.search(rf"{NUM}\s*%?\s*(?:mark(?:\s*it)?\s*up|markup|margin)", msg)
-        )
-
-        if not (setup_re or markup_re):
-            return None
-
-        # Optional explicit base in message
-        base_re = (
-            re.search(rf"(?:take|base|start(?:ing)?\s*from|on\s*that|that)\D{{0,12}}\$?\s*{NUM}", msg)
-            or re.search(rf"\$?\s*{NUM}\D{{0,8}}(?:total|all\s*in|out\s*the\s*door)", msg)
-        )
-
-        def _num(s: str) -> float:
-            return float(s.replace(",", ""))
-
-        # Resolve base: explicit in message → last quote final_net/summary
-        base_amt: float = 0.0
-        if base_re:
-            base_amt = _num(base_re.group(1))
-        if base_amt <= 0:
-            last = sess.get("last_quote") or {}
-            base_amt = float(last.get("final_net") or last.get("summary", {}).get("total") or 0.0)
-        if base_amt <= 0:
-            return None
-
-        setup_fee = _num(setup_re.group(1)) if setup_re else 0.0
-        markup_pct = float((markup_re and markup_re.group(1)) or 0.0)
-
-        marked = base_amt * (1.0 + markup_pct / 100.0) if markup_pct else base_amt
-        total = marked + setup_fee
-
-        sess["last_adjustment"] = {"base": base_amt, "setup_fee": setup_fee, "markup_pct": markup_pct, "total": total}
-
-        lines = [f"Starting from ${base_amt:,.2f}"]
-        if markup_pct:
-            lines.append(f"Markup ({markup_pct:.0f}%): +${(marked - base_amt):,.2f} → ${marked:,.2f}")
-        if setup_fee:
-            lines.append(f"Setup Fee: +${setup_fee:,.2f} → ${total:,.2f}")
-        lines.append(f"✅ Adjusted Total: ${total:,.2f}")
-        return "\n".join(lines)
-
-    adj_reply = _try_local_adjustment_reply(user_message, sess)
-    if adj_reply:
+        # Dealer: JSON body → header → text (dealer #123456 OR bare 123456) → session → cookie
+        dn = None
+        if data.get("dealer_number"):
+            dn = str(data["dealer_number"]).strip()
+        if not dn:
+            hdr_dn = request.headers.get("X-Dealer-Number")
+            if hdr_dn:
+                dn = str(hdr_dn).strip()
+        if not dn:
+            dn = extract_dealer_number(user_message)
+        if not dn:
+            dn = sess.get("dealer_number")
+        if not dn:
+            dn = request.cookies.get("dealer_number")
         if dn:
-            return jsonify({"reply": adj_reply, "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")}})
-        return jsonify({"reply": adj_reply})
+            sess["dealer_number"] = dn
 
-    # ---- Resolve pending multiple-choice answers ----
-    pending = sess.get("pending_question")
-    if pending and not started_new_quote:
-        cwids = pending.get("choices_with_ids") or []
-        labels = (
-            [str(c.get("label", "")).strip() for c in cwids]
-            if cwids else
-            [str(c).strip() for c in (pending.get("choices") or [])]
-        )
+        # Dealer-only message (no quote intent)
+        only_dn = extract_dealer_number(user_message)
+        if only_dn and not intent_from_text(user_message):
+            info = call_dealer_discount(only_dn)
+            rd = info if isinstance(info, dict) else {}
+            if "discount" in rd:
+                sess["dealer_discount"] = float(rd["discount"])
+                sess["dealer_name"] = rd.get("dealer_name", "")
+                sess["dealer_number"] = only_dn
+                reply_msg = (
+                    f"Using {sess['dealer_name']} (Dealer #{only_dn}) with a "
+                    f"{int(sess['dealer_discount'] * 100)}% dealer discount for this session. ✅\n\n"
+                    "What would you like me to quote?"
+                )
+                resp = make_response(jsonify({
+                    "reply": reply_msg,
+                    "state": {"dealer_number": only_dn, "dealer_name": sess["dealer_name"]},
+                }))
+                resp.set_cookie("dealer_number", only_dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
+                return resp
 
-        if not labels:
-            # Driveline: present defaults
-            pname = (pending.get("name") or "").strip().lower()
-            if pname in {"driveline", "bw_driveline", "ds_driveline"}:
+        # Allow multiple quotes in one session (reset quote-scoped state but keep dealer)
+        def _reset_quote_state(s):
+            s.pop("pending_question", None)
+            s.pop("in_progress_params", None)
+            s["params"] = {}
+            s.pop("family", None)
+            s.pop("post_quote", None)
+
+        model_in_text = bool(MODEL_RE.search(user_message or ""))
+        fam_in_text = parse_family(user_message) or fuzzy_family(user_message)
+        started_new_quote = bool(model_in_text or fam_in_text)
+        if sess.get("pending_question") and started_new_quote:
+            _reset_quote_state(sess)
+
+        # ---- Local AI-like adjustments FIRST (forgiving; won’t hijack accessories) ----
+        def _try_local_adjustment_reply(message: str, sess: Dict[str, Any]) -> Optional[str]:
+            """
+            Triggers ONLY when the message mentions setup/set up OR markup/mark it up/margin
+            along with a number. Uses explicit $-based base if present; otherwise the last quote.
+            Avoids misreading the '12' from '12% margin' as the base.
+            """
+            if not message:
+                return None
+            msg = message.lower()
+
+            # Keyword gates (avoid intercepting "add dual hub kit")
+            mentions_setup = bool(re.search(r"\b(set\s*up|setup|setup\s*fee)\b", msg))
+            mentions_markup = bool(re.search(r"\b(mark(?:\s*it)?\s*up|markup|margin)\b", msg))
+            if not (mentions_setup or mentions_markup):
+                # Follow-up: "what's the total?" after a prior adjustment
+                if re.search(r"\b(total|out\s*the\s*door|all\s*in)\b", msg) and sess.get("last_adjustment"):
+                    last_adj = sess["last_adjustment"]
+                    return f"✅ Adjusted Total: ${float(last_adj.get('total', 0.0)):,.2f}"
+                return None
+
+            # tolerant numbers
+            NUM = r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)"
+
+            setup_re = (
+                re.search(rf"(?:set\s*up|setup|setup\s*fee)\D{{0,12}}{NUM}", msg)
+                or re.search(rf"{NUM}\D{{0,6}}(?:set\s*up|setup|setup\s*fee)", msg)
+            )
+            markup_re = (
+                re.search(rf"(?:mark(?:\s*it)?\s*up|markup|margin)\D{{0,12}}{NUM}\s*%?", msg)
+                or re.search(rf"{NUM}\s*%?\s*(?:mark(?:\s*it)?\s*up|markup|margin)", msg)
+            )
+
+            if not (setup_re or markup_re):
+                return None
+
+            def _num(s: str) -> float:
+                return float(s.replace(",", ""))
+
+            # Base detection:
+            # 1) Prefer last quote if available.
+            base_amt = 0.0
+            last = sess.get("last_quote") or {}
+            if last:
+                base_amt = float(last.get("final_net") or last.get("summary", {}).get("total") or 0.0)
+
+            # 2) If the message includes a $-amount (explicit base), use it.
+            # Require a literal $ to avoid grabbing the '12' in '12% margin'.
+            base_dollar = re.search(rf"\$\s*{NUM}", msg)
+            if base_dollar:
+                base_amt = _num(base_dollar.group(1))
+
+            if base_amt <= 0:
+                return None  # no trustworthy base
+
+            setup_fee = _num(setup_re.group(1)) if setup_re else 0.0
+            markup_pct = float((markup_re and markup_re.group(1)) or 0.0)
+
+            marked = base_amt * (1.0 + markup_pct / 100.0) if markup_pct else base_amt
+            total = marked + setup_fee
+
+            sess["last_adjustment"] = {"base": base_amt, "setup_fee": setup_fee, "markup_pct": markup_pct, "total": total}
+
+            lines = [f"Starting from ${base_amt:,.2f}"]
+            if markup_pct:
+                lines.append(f"Markup ({markup_pct:.0f}%): +${(marked - base_amt):,.2f} → ${marked:,.2f}")
+            if setup_fee:
+                lines.append(f"Setup Fee: +${setup_fee:,.2f} → ${total:,.2f}")
+            lines.append(f"✅ Adjusted Total: ${total:,.2f}")
+            return "\n".join(lines)
+
+        adj_reply = _try_local_adjustment_reply(user_message, sess)
+        if adj_reply:
+            if dn:
+                return jsonify({"reply": adj_reply, "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")}})
+            return jsonify({"reply": adj_reply})
+
+        # ---- Resolve pending multiple-choice answers ----
+        pending = sess.get("pending_question")
+        if pending and not started_new_quote:
+            cwids = pending.get("choices_with_ids") or []
+            labels = (
+                [str(c.get("label", "")).strip() for c in cwids]
+                if cwids else
+                [str(c).strip() for c in (pending.get("choices") or [])]
+            )
+
+            if not labels:
+                # Driveline: present defaults
+                pname = (pending.get("name") or "").strip().lower()
+                if pname in {"driveline", "bw_driveline", "ds_driveline"}:
+                    return jsonify({
+                        "reply": pending.get("question", "Which driveline do you want?"),
+                        "ui": {"type": "choices", "name": pending.get("name") or "driveline",
+                               "question": pending.get("question") or "Which driveline do you want?",
+                               "choices": [
+                                   {"id": "540", "label": "540 RPM"},
+                                   {"id": "1000", "label": "1000 RPM"},
+                               ]},
+                        "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")},
+                    })
                 return jsonify({
-                    "reply": pending.get("question", "Which driveline do you want?"),
-                    "ui": {"type": "choices", "name": pending.get("name") or "driveline",
-                           "question": pending.get("question") or "Which driveline do you want?",
-                           "choices": [
-                               {"id": "540", "label": "540 RPM"},
-                               {"id": "1000", "label": "1000 RPM"},
-                           ]},
+                    "reply": pending.get("question", "Please choose:"),
                     "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")},
                 })
-            return jsonify({
-                "reply": pending.get("question", "Please choose:"),
-                "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")},
-            })
 
-        idx = letter_or_number_choice_to_index(user_message, len(labels))
+            idx = letter_or_number_choice_to_index(user_message, len(labels))
 
-        if idx is None:
-            low = user_message.strip().lower()
-            # exact label
-            for i, lab in enumerate(labels):
-                if lab.lower() == low:
-                    idx = i
-                    break
-            # contains
             if idx is None:
+                low = user_message.strip().lower()
+                # exact label
                 for i, lab in enumerate(labels):
-                    if low in lab.lower():
+                    if lab.lower() == low:
                         idx = i
                         break
-            # exact id match
-            if idx is None and cwids:
-                ids = [str(c.get("id", "")).strip().lower() for c in cwids]
-                for i, _id in enumerate(ids):
-                    if _id and _id == low:
-                        idx = i
-                        break
+                # contains
+                if idx is None:
+                    for i, lab in enumerate(labels):
+                        if low in lab.lower():
+                            idx = i
+                            break
+                # exact id match
+                if idx is None and cwids:
+                    ids = [str(c.get("id", "")).strip().lower() for c in cwids]
+                    for i, _id in enumerate(ids):
+                        if _id and _id == low:
+                            idx = i
+                            break
 
-        if idx is None:
-            letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            opts = "\n".join(f"{letters[i]}. {labels[i]}" for i in range(len(labels)))
+            if idx is None:
+                letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                opts = "\n".join(f"{letters[i]}. {labels[i]}" for i in range(len(labels)))
+                return jsonify({
+                    "reply": f"{pending.get('question', 'Please choose:')}\n\n{opts}",
+                    "ui": {"type": "choices", "name": pending.get("name"), "question": pending.get("question"),
+                           "choices": cwids or [{"id": str(c), "label": str(c)} for c in (pending.get("choices") or [])]},
+                    "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")},
+                })
+
+            # Build merged params with both provided and canonical names
+            value = cwids[idx].get("id") if cwids else (pending.get("choices") or [None])[idx]
+            name = (pending.get("name") or "").strip()
+            lname = name.lower() if name else ""
+            canonical = infer_field_from_question(pending.get("question"), sess.get("family"))
+
+            merged: Dict[str, Any] = {}
+            merged.update(sess.get("in_progress_params", {}) or {})
+            merged.update(sess.get("params", {}) or {})
+
+            def _maybe_int(k: str, v: Any) -> Any:
+                if isinstance(v, str) and k and k.endswith("_qty") and v.isdigit():
+                    return int(v)
+                return v
+
+            if lname:
+                merged[lname] = _maybe_int(lname, value)
+            if canonical and canonical != lname:
+                merged[canonical] = _maybe_int(canonical, value)
+
+            merged["dealer_number"] = dn  # always send dealer on answer turns
+
+            sess.pop("pending_question", None)
+            sess.pop("in_progress_params", None)
+            sess["params"] = {}
+
+            return do_quote(sess, merged)
+
+        # ---- No pending question ----
+        if dn:
+            # Decide if this is a new quote
+            if model_in_text or fam_in_text:
+                parsed = extract_params_from_text(user_message)
+                if parsed.get("family"):
+                    sess["family"] = parsed["family"]
+                extra = parsed if parsed else {"q": user_message}
+                return do_quote(sess, extra)
+
+            # Otherwise, let the planner talk (AI feel)
+            plan = call_openai_for_plan(user_message)
+            action = plan.get("action")
+            reply = plan.get("reply") or ""
+            params = plan.get("params", {})
+
+            if action == "dealer_lookup" and params.get("dealer_number"):
+                info = call_dealer_discount(params["dealer_number"])
+                rd = info if isinstance(info, dict) else {}
+                if "discount" in rd:
+                    sess["dealer_discount"] = float(rd["discount"])
+                    sess["dealer_name"] = rd.get("dealer_name", "")
+                    sess["dealer_number"] = params["dealer_number"]
+                    msg = (
+                        f"Using {sess['dealer_name']} (Dealer #{sess['dealer_number']}) with a "
+                        f"{int(sess['dealer_discount'] * 100)}% dealer discount for this session. ✅\n\n"
+                        "What would you like me to quote?"
+                    )
+                    return jsonify({
+                        "reply": msg,
+                        "state": {"dealer_number": sess["dealer_number"], "dealer_name": sess["dealer_name"]},
+                    })
+
+            if action == "quote":
+                if not params.get("dealer_number"):
+                    params["dealer_number"] = dn
+                if params.get("family"):
+                    sess["family"] = params["family"]
+                return do_quote(sess, params)
+
+            # smalltalk / ask
             return jsonify({
-                "reply": f"{pending.get('question', 'Please choose:')}\n\n{opts}",
-                "ui": {"type": "choices", "name": pending.get("name"), "question": pending.get("question"),
-                       "choices": cwids or [{"id": str(c), "label": str(c)} for c in (pending.get("choices") or [])]},
+                "reply": reply or "How can I help with your Woods quote today?",
                 "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")},
             })
 
-        # Build merged params with both provided and canonical names
-        value = cwids[idx].get("id") if cwids else (pending.get("choices") or [None])[idx]
-        name = (pending.get("name") or "").strip()
-        lname = name.lower() if name else ""
-        canonical = infer_field_from_question(pending.get("question"), sess.get("family"))
+        # ---- No dealer known yet ----
+        # Still allow follow-up totals after a prior adjustment (no dealer required)
+        if re.search(r"\b(total|out\s*the\s*door|all\s*in)\b", user_message.lower()) and sess.get("last_adjustment"):
+            last_adj = sess["last_adjustment"]
+            return jsonify({"reply": f"✅ Adjusted Total: ${float(last_adj.get('total', 0.0)):,.2f}"})
 
-        merged: Dict[str, Any] = {}
-        merged.update(sess.get("in_progress_params", {}) or {})
-        merged.update(sess.get("params", {}) or {})
-
-        def _maybe_int(k: str, v: Any) -> Any:
-            if isinstance(v, str) and k and k.endswith("_qty") and v.isdigit():
-                return int(v)
-            return v
-
-        if lname:
-            merged[lname] = _maybe_int(lname, value)
-        if canonical and canonical != lname:
-            merged[canonical] = _maybe_int(canonical, value)
-
-        merged["dealer_number"] = dn  # always send dealer on answer turns
-
-        sess.pop("pending_question", None)
-        sess.pop("in_progress_params", None)
-        sess["params"] = {}
-
-        return do_quote(sess, merged)
-
-    # ---- No pending question ----
-    if dn:
-        # Decide if this is a new quote
-        if model_in_text or fam_in_text:
-            parsed = extract_params_from_text(user_message)
-            if parsed.get("family"):
-                sess["family"] = parsed["family"]
-            extra = parsed if parsed else {"q": user_message}
-            return do_quote(sess, extra)
-
-        # Otherwise, let the planner talk (AI feel)
-        plan = call_openai_for_plan(user_message)  # keep your existing signature
+        # Planner to request dealer nicely or handle smalltalk
+        plan = call_openai_for_plan(user_message)
         action = plan.get("action")
         reply = plan.get("reply") or ""
         params = plan.get("params", {})
 
-        if action == "dealer_lookup" and params.get("dealer_number"):
+        if action == "dealer_lookup":
+            if not params.get("dealer_number"):
+                return jsonify({"reply": "Please provide your dealer number (e.g., dealer #178200)."})
             info = call_dealer_discount(params["dealer_number"])
             rd = info if isinstance(info, dict) else {}
             if "discount" in rd:
@@ -1302,58 +1317,24 @@ def chat():
 
         if action == "quote":
             if not params.get("dealer_number"):
-                params["dealer_number"] = dn
+                return jsonify({"reply": "Please provide your dealer number to begin (e.g., dealer #178200)."})
+            sess["dealer_number"] = params["dealer_number"]
             if params.get("family"):
                 sess["family"] = params["family"]
             return do_quote(sess, params)
 
-        # smalltalk / ask
-        return jsonify({"reply": reply or "How can I help with your Woods quote today?",
-                        "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")}})
+        if action == "ask":
+            return jsonify({"reply": reply or "Please provide your dealer number to begin (e.g., dealer #178200)."})
 
-    # ---- No dealer known yet ----
-    # Still allow follow-up totals after a prior adjustment (no dealer required)
-    if re.search(r"\b(total|out\s*the\s*door|all\s*in)\b", user_message.lower()) and sess.get("last_adjustment"):
-        last_adj = sess["last_adjustment"]
-        return jsonify({"reply": f"✅ Adjusted Total: ${float(last_adj.get('total', 0.0)):,.2f}"})
+        return jsonify({"reply": reply or "Please provide your dealer number to begin (e.g., dealer #178200)."})
 
-    # Planner to request dealer nicely or handle smalltalk
-    plan = call_openai_for_plan(user_message)
-    action = plan.get("action")
-    reply = plan.get("reply") or ""
-    params = plan.get("params", {})
-
-    if action == "dealer_lookup":
-        if not params.get("dealer_number"):
-            return jsonify({"reply": "Please provide your dealer number (e.g., dealer #178200)."})
-        info = call_dealer_discount(params["dealer_number"])
-        rd = info if isinstance(info, dict) else {}
-        if "discount" in rd:
-            sess["dealer_discount"] = float(rd["discount"])
-            sess["dealer_name"] = rd.get("dealer_name", "")
-            sess["dealer_number"] = params["dealer_number"]
-            msg = (
-                f"Using {sess['dealer_name']} (Dealer #{sess['dealer_number']}) with a "
-                f"{int(sess['dealer_discount'] * 100)}% dealer discount for this session. ✅\n\n"
-                "What would you like me to quote?"
-            )
-            return jsonify({
-                "reply": msg,
-                "state": {"dealer_number": sess["dealer_number"], "dealer_name": sess["dealer_name"]},
-            })
-
-    if action == "quote":
-        if not params.get("dealer_number"):
-            return jsonify({"reply": "Please provide your dealer number to begin (e.g., dealer #XXXXXX)."})
-        sess["dealer_number"] = params["dealer_number"]
-        if params.get("family"):
-            sess["family"] = params["family"]
-        return do_quote(sess, params)
-
-    if action == "ask":
-        return jsonify({"reply": reply or "Please provide your dealer number to begin (e.g., dealer #XXXXX)."})
-
-    return jsonify({"reply": reply or "Please provide your dealer number to begin (e.g., dealer #XXXXXX)."})
+    except Exception as e:
+        logging.exception("Unhandled error in /chat")
+        # Always return JSON so the frontend never sees an HTML error page
+        return jsonify({
+            "reply": "There was a system error while handling your request. Please try again.",
+            "error": str(e),
+        })
 
 # =========================
 # Entrypoint
