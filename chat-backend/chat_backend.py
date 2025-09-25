@@ -417,48 +417,100 @@ def infer_field_from_question(question: str, family: Optional[str]) -> Optional[
 
 def _try_local_adjustment_reply(message: str, sess: Dict[str, Any]) -> Optional[str]:
     """
-    Post-quote adjustments with forgiving parsing. Triggers ONLY when the user mentions
-    setup/set up OR markup/mark it up/margin alongside a number (with or without $ or %).
-    This avoids intercepting accessory requests like "add dual hub kit".
+    Post-quote (or ad-hoc) adjustments with robust parsing.
+
+    Triggers when the user mentions:
+      • setup / set up / setup fee  (with a number), OR
+      • markup / mark it up / margin (with a number), OR
+      • "add $X to the price/total/net/quote" (treat as setup)
+
+    Base amount selection:
+      • Default = last quote's Final Dealer Net (or summary total).
+      • Only treat a $-amount in the message as the BASE if paired with
+        "take/use/base/starting from/on that/that (total/net/price)" keywords.
+      • Never treat the setup dollar as the base.
+
+    Won’t hijack accessory requests (e.g., “add dual hub kit”).
     """
     if not message:
         return None
-    last = sess.get("last_quote")
-    if not last:
-        return None
-
     msg = message.lower()
 
-    # ---- Parse setup fee (number can appear before or after the keyword; $ optional) ----
-    setup_re1 = re.search(r"(?:setup|set\s*up|setup\s*fee)\D{0,12}([0-9][0-9,]*(?:\.[0-9]{1,2})?)", msg)
-    setup_re2 = re.search(r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)\D{0,6}(?:setup|set\s*up|setup\s*fee)", msg)
-    setup_match = setup_re1 or setup_re2
+    # Gates to avoid hijacking accessories
+    mentions_setup = bool(re.search(r"\b(set\s*up|setup|setup\s*fee)\b", msg))
+    mentions_markup = bool(re.search(r"\b(mark(?:\s*it)?\s*up|markup|margin)\b", msg))
+    # "add $300 to the price/total/net/quote"
+    add_price_setup = bool(re.search(
+        r"\badd\b.*\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?.*\b(price|total|net|quote|final)\b", msg
+    ))
 
-    # ---- Parse markup/margin (number can be before/after; % optional) ----
-    markup_re1 = re.search(r"(?:mark(?:\s*it)?\s*up|markup|margin)\D{0,12}([0-9]+(?:\.[0-9]{1,2})?)\s*%?", msg)
-    markup_re2 = re.search(r"([0-9]+(?:\.[0-9]{1,2})?)\s*%?\s*(?:mark(?:\s*it)?\s*up|markup|margin)", msg)
-    markup_match = markup_re1 or markup_re2
-
-    # If neither of the adjustment keywords is present with a number, do NOT handle here
-    if not (setup_match or markup_match):
+    # Allow quick follow-up: "what's the total" after an adjustment
+    if not (mentions_setup or mentions_markup or add_price_setup):
+        if re.search(r"\b(total|out\s*the\s*door|all\s*in)\b", msg) and sess.get("last_adjustment"):
+            last_adj = sess["last_adjustment"]
+            return f"✅ Adjusted Total: ${float(last_adj.get('total', 0.0)):,.2f}"
         return None
 
-    base = float(last.get("final_net") or last.get("summary", {}).get("total") or 0.0)
-    if base <= 0:
-        return None
-
+    NUM = r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)"
     def _num(s: str) -> float:
         return float(s.replace(",", ""))
 
-    setup_fee = _num(setup_match.group(1)) if setup_match else 0.0
-    markup_pct = float(markup_match.group(1)) if markup_match else 0.0
+    # Parse setup amount (if any). Accept number before/after keyword OR "add $X to the price..."
+    setup_re = (
+        re.search(rf"(?:set\s*up|setup|setup\s*fee)\D{{0,12}}{NUM}", msg)
+        or re.search(rf"{NUM}\D{{0,6}}(?:set\s*up|setup|setup\s*fee)", msg)
+    )
+    if not setup_re and add_price_setup:
+        setup_re = re.search(rf"\badd\b.*\$\s*{NUM}", msg)
 
-    marked = base * (1.0 + markup_pct / 100.0) if markup_pct else base
+    # Parse markup/margin % (number before/after; % optional)
+    markup_re = (
+        re.search(rf"(?:mark(?:\s*it)?\s*up|markup|margin)\D{{0,12}}{NUM}\s*%?", msg)
+        or re.search(rf"{NUM}\s*%?\s*(?:mark(?:\s*it)?\s*up|markup|margin)", msg)
+    )
+
+    if not (setup_re or markup_re):
+        return None
+
+    # -------- Determine BASE amount safely --------
+    # Start with last quote
+    base_amt = 0.0
+    last = sess.get("last_quote") or {}
+    if last:
+        base_amt = float(last.get("final_net") or last.get("summary", {}).get("total") or 0.0)
+
+    # Candidate explicit base (only when paired with base words)
+    BASE_WORDS = r"(?:take|use|base|starting\s*from|on\s*that|that(?:\s+(?:total|price|net|quote))?)"
+    base_kw_before = re.search(rf"{BASE_WORDS}\D{{0,12}}\$\s*{NUM}", msg)
+    base_kw_after  = re.search(rf"\$\s*{NUM}\D{{0,12}}(?:as\s*base|to\s*use|to\s*start)", msg)
+    base_match = base_kw_before or base_kw_after
+
+    # Extract setup amount (to avoid mistaking it for base)
+    setup_amt = _num(setup_re.group(1)) if setup_re else 0.0
+
+    if base_match:
+        cand = _num(base_match.group(1))
+        # If the candidate equals the setup value and we have a last quote, keep last-quote base
+        if not (abs(cand - setup_amt) < 1e-6 and base_amt > 0):
+            base_amt = cand
+
+    # If still no base, we can't compute
+    if base_amt <= 0:
+        return None
+
+    # -------- Compute --------
+    markup_pct = float(markup_re.group(1)) if markup_re else 0.0
+    setup_fee = setup_amt
+
+    marked = base_amt * (1.0 + markup_pct / 100.0) if markup_pct else base_amt
     total = marked + setup_fee
 
-    lines = [f"Starting from your last quote’s Final Dealer Net: ${base:,.2f}"]
+    # Save for "what's the total?" follow-ups
+    sess["last_adjustment"] = {"base": base_amt, "setup_fee": setup_fee, "markup_pct": markup_pct, "total": total}
+
+    lines = [f"Starting from ${base_amt:,.2f}"]
     if markup_pct:
-        lines.append(f"Markup ({markup_pct:.0f}%): +${(marked - base):,.2f} → ${marked:,.2f}")
+        lines.append(f"Markup ({markup_pct:.0f}%): +${(marked - base_amt):,.2f} → ${marked:,.2f}")
     if setup_fee:
         lines.append(f"Setup Fee: +${setup_fee:,.2f} → ${total:,.2f}")
     lines.append(f"✅ Adjusted Total: ${total:,.2f}")
