@@ -298,6 +298,37 @@ def format_question(q: Dict[str, Any]) -> str:
     opts = [f"{abc[i]}. {labels[i]}" for i in range(len(labels))]
     return f"{title}\n\n" + "\n".join(opts)
 
+def infer_field_from_question(question: str, family: Optional[str]) -> Optional[str]:
+    qt = (question or "").lower()
+    fam = (family or "").lower()
+    # Batwing
+    if "what size" in qt and "batwing" in qt:
+        return "bw_size_ft"
+    if "duty" in qt and "batwing" in qt:
+        return "bw_duty"
+    if "driveline" in qt:
+        return "bw_driveline" if "batwing" in fam else ("ds_driveline" if "dual" in fam else "driveline")
+    if "how many" in qt and "tire" in qt:
+        return "bw_tire_qty" if "batwing" in fam else "tire_qty"
+    if "tire option" in qt:
+        return "tire_id"
+    # Disc Harrow
+    if ("working width" in qt or "what width" in qt) and "disc" in qt:
+        return "dh_width_in"
+    if "duty" in qt and "disc" in qt:
+        return "dh_duty"
+    if "blade style" in qt:
+        return "dh_blade"
+    if "disc spacing" in qt:
+        return "dh_spacing_id"
+    # BrushBull
+    if "what size" in qt and "brushbull" in qt:
+        return "bb_size_ft"
+    if "shield" in qt and "brushbull" in qt:
+        return "bb_shielding"
+    return None
+
+
 # =========================
 # OpenAI + API helpers
 # =========================
