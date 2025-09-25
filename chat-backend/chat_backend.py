@@ -678,24 +678,39 @@ def next_family_tree_question(params: Dict[str, Any], user_text: str = "") -> Op
 # =========================
 
 def set_pending_question(sess: Dict[str, Any], base_params: Dict[str, Any], q: Dict[str, Any]) -> None:
-    name = (q.get("name") or "").strip()
-    question = q.get("question", "Please choose:")
-    choices = q.get("choices", [])
-    choices_with_ids = q.get("choices_with_ids", [])
+    # Infer a field name if the API omitted it (prevents empty-key params later)
+    def infer_field_name(question_text: str, family: Optional[str]) -> Optional[str]:
+        qt = (question_text or "").lower()
+        fam = (family or (sess.get("family") or "")).lower()
+        if "what size" in qt and "batwing" in qt:
+            return "bw_size_ft"
+        if "duty" in qt and "batwing" in qt:
+            return "bw_duty"
+        if "driveline" in qt:
+            if "dual" in fam:
+                return "ds_driveline"
+            if "batwing" in fam:
+                return "bw_driveline"
+            return "driveline"
+        if "how many" in qt and "tire" in qt:
+            return "bw_tire_qty" if "batwing" in fam else "tire_qty"
+        if "tire" in qt and "option" in qt:
+            return "tire_id"
+        if "shield" in qt and "brushbull" in fam:
+            return "bb_shielding"
+        return None
 
-    # If the API asked for driveline but sent no choices, inject 540/1000 defaults
-    if name.lower() in DRIVELINE_NAMES and not choices_with_ids and not choices:
-        choices_with_ids = list(DEFAULT_DRIVELINE_CHOICES)
-        if not question or question == "Please choose:":
-            question = "Which driveline do you want?"
+    name = (q.get("name") or "").strip()
+    if not name:
+        name = infer_field_name(q.get("question"), base_params.get("family"))
 
     ctx = {k: v for k, v in (base_params or {}).items() if k != "dealer_number"}
     sess["in_progress_params"] = ctx
     sess["pending_question"] = {
-        "name": name,
-        "choices": choices,
-        "choices_with_ids": choices_with_ids,
-        "question": question,
+        "name": name or "",
+        "choices": q.get("choices", []),
+        "choices_with_ids": q.get("choices_with_ids", []),
+        "question": q.get("question", "Please choose:"),
     }
 
 # =========================
