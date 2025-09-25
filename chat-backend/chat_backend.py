@@ -9,6 +9,7 @@ import requests
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from openai import OpenAI
+import difflib
 
 logging.basicConfig(level=logging.INFO)
 
@@ -32,7 +33,7 @@ CORS(
 )
 
 # In-memory sessions keyed by client-provided ID
-# { dealer_number, dealer_discount, dealer_name, pending_question, in_progress_params, params }
+# { dealer_number, dealer_discount, dealer_name, pending_question, in_progress_params, params, family }
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 DEALER_REGEX = re.compile(r"dealer\s*#?\s*(\d{3,})", re.I)
@@ -158,7 +159,10 @@ Routing rules:
 # =========================
 # Parsers
 # =========================
-MODEL_RE = re.compile(r"\b((?:BB|BW|MDS|DS|TBW|RB|BS|GS|LRS|DHS|DHM|PD|DB|RT|RTR|TSG|PF|TQH)\s*\d+(?:\.\d+)?)\b", re.I)
+MODEL_RE = re.compile(
+    r"\b((?:BB|BW|MDS|DS|TBW|RB|BS|GS|LRS|DHS|DHM|PD|DB|RT|RTR|TSG|PF|TQH)\s*\d+(?:[.\-]\d+)?|\bBF\d{1,2}\.\d{2})\b",
+    re.I,
+)
 WIDTH_FT_RE = re.compile(r"\b(\d{1,2})\s*(?:ft|foot|feet)\b", re.I)
 WIDTH_IN_RE = re.compile(r"\b(\d{2,3})\s*(?:in|inch|inches|\"|”)\b", re.I)
 DRIVELINE_RE = re.compile(r"\b(540|1000|1k)\b", re.I)
@@ -168,9 +172,51 @@ DEFAULT_DRIVELINE_CHOICES = [
     {"id": "1000", "label": "1000 RPM"},
 ]
 
+FAMILY_SYNONYMS = {
+    "box scraper": ["box blade", "boxscraper", "box-blade", "bbx", "boxscrpr"],
+    "brushbull": ["brush bull", "brushbul", "brush-bull", "bb", "brshbull"],
+    "batwing": ["bat wing", "batwimg", "batwong", "bat wimg"],
+    "dual spindle": ["dual-spindle", "dualspindle", "ds"],
+    "disc harrow": ["disc-harrow", "disk harrow", "disk-harrow", "disc", "disk"],
+    "rear blade": ["rearblade", "rear-blade", "rb"],
+    "grading scraper": ["grading-scraper", "gradingscraper", "gs"],
+    "landscape rake": ["landscape-rake", "lscape rake", "lr"],
+    "rear finish": ["rmm", "rear mower", "finish mower", "rear-finish"],
+    "turf batwing": ["turf-batwing", "turf bat wing"],
+    "post hole digger": ["post-hole digger", "phd", "post hole", "auger"],
+    "tiller": ["rototiller", "roto tiller"],
+    "quick hitch": ["quick-hitch", "qh"],
+    "stump grinder": ["stump-grinder", "sg"],
+    "bale spear": ["bale-spear", "bale fork"],
+    "pallet fork": ["pallet-fork", "forks"],
+}
+FAMILY_CANON = {
+    "box scraper": "box_scraper",
+    "brushbull": "brushbull",
+    "batwing": "batwing",
+    "dual spindle": "dual_spindle",
+    "disc harrow": "disc_harrow",
+    "rear blade": "rear_blade",
+    "grading scraper": "grading_scraper",
+    "landscape rake": "landscape_rake",
+    "rear finish": "rear_finish",
+    "turf batwing": "turf_batwing",
+    "post hole digger": "post_hole_digger",
+    "tiller": "tiller",
+    "quick hitch": "quick_hitch",
+    "stump grinder": "stump_grinder",
+    "bale spear": "bale_spear",
+    "pallet fork": "pallet_fork",
+}
 
 def norm_model(s: str) -> str:
-    return s.upper().replace(" ", "")
+    s = s.upper().replace(" ", "")
+    # normalize BW12-40 => BW12.40
+    s = s.replace("-", ".")
+    # if no dot and last two are digits, insert dot before last two
+    if "." not in s and len(s) > 2 and s[-2:].isdigit():
+        s = s[:-2] + "." + s[-2:]
+    return s
 
 def parse_shielding(text: str) -> Optional[str]:
     t = text.lower()
@@ -212,6 +258,21 @@ def parse_family(text: str) -> Optional[str]:
             return v
     return None
 
+def fuzzy_family(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    # direct alias hit
+    for base, alts in FAMILY_SYNONYMS.items():
+        if base in t or any(a in t for a in alts):
+            return FAMILY_CANON[base]
+    # fuzzy on tokens (single or two-word chunks)
+    tokens = re.findall(r"[a-z]+(?:\s[a-z]+)?", t)
+    candidates = list(FAMILY_CANON.keys())
+    for tok in tokens:
+        best = difflib.get_close_matches(tok, candidates, n=1, cutoff=0.86)
+        if best:
+            return FAMILY_CANON[best[0]]
+    return None
+
 def parse_width_ft(text: str) -> Optional[str]:
     m = WIDTH_FT_RE.search(text)
     if m:
@@ -232,7 +293,7 @@ def intent_from_text(text: str) -> Optional[str]:
         return "quote"
     if MODEL_RE.search(text):
         return "quote"
-    if parse_family(text):
+    if parse_family(text) or fuzzy_family(text):
         return "quote"
     return None
 
@@ -241,7 +302,7 @@ def extract_params_from_text(text: str) -> Dict[str, Any]:
     mm = MODEL_RE.search(text)
     if mm:
         params["model"] = norm_model(mm.group(1))
-    fam = parse_family(text)
+    fam = parse_family(text) or fuzzy_family(text)
     if fam:
         params["family"] = fam
     wft = parse_width_ft(text)
@@ -327,7 +388,6 @@ def infer_field_from_question(question: str, family: Optional[str]) -> Optional[
     if "shield" in qt and "brushbull" in qt:
         return "bb_shielding"
     return None
-
 
 # =========================
 # OpenAI + API helpers
@@ -684,7 +744,7 @@ def infer_family_from_model_or_text(params: Dict[str, Any], user_text: str = "")
         return "batwing"
     if m.startswith("DS") or m.startswith("MDS"):
         return "dual_spindle"
-    pf = parse_family(user_text)
+    pf = parse_family(user_text) or fuzzy_family(user_text)
     return pf
 
 def next_family_tree_question(params: Dict[str, Any], user_text: str = "") -> Optional[Dict[str, Any]]:
@@ -932,11 +992,23 @@ def chat():
             resp.set_cookie("dealer_number", only_dn, max_age=60 * 60 * 24 * 30, httponly=False, samesite="Lax")
             return resp
 
+    # === New-quote detection: allow multiple quotes in one session ===
+    def _reset_quote_state(s):
+        s.pop("pending_question", None)
+        s.pop("in_progress_params", None)
+        s["params"] = {}
+        s.pop("family", None)
 
+    model_in_text = bool(MODEL_RE.search(user_message))
+    fam_in_text = parse_family(user_message) or fuzzy_family(user_message)
+    started_new_quote = bool(model_in_text or fam_in_text)
+
+    if sess.get("pending_question") and started_new_quote:
+        _reset_quote_state(sess)
 
     # 2) Multiple choice resolution
     pending = sess.get("pending_question")
-    if pending and dn:
+    if pending and dn and not started_new_quote:
         cwids = pending.get("choices_with_ids") or []
         labels = (
             [str(c.get("label", "")).strip() for c in cwids]
@@ -984,15 +1056,32 @@ def chat():
                 "state": {"dealer_number": dn, "dealer_name": sess.get("dealer_name")},
             })
 
+        # === Build merged params and continue (systemic, not per-family band-aids) ===
         value = cwids[idx].get("id") if cwids else (pending.get("choices") or [None])[idx]
-        name = pending.get("name", "")
-        if isinstance(value, str) and value.isdigit() and name.endswith("_qty"):
-            value = int(value)
+        name = (pending.get("name") or "").strip()
+        lname = name.lower() if name else ""
 
         merged: Dict[str, Any] = {}
         merged.update(sess.get("in_progress_params", {}) or {})
         merged.update(sess.get("params", {}) or {})
-        merged[name] = value
+
+        # Put the answer under the API-provided name when present
+        if lname:
+            # coerce *_qty to int
+            if lname.endswith("_qty") and isinstance(value, str) and value.isdigit():
+                merged[lname] = int(value)
+            else:
+                merged[lname] = value
+
+        # Also put it under a canonical name inferred from question text + family (if different)
+        canonical = infer_field_from_question(pending.get("question"), sess.get("family"))
+        if canonical and canonical != lname:
+            if canonical.endswith("_qty") and isinstance(value, str) and value.isdigit():
+                merged[canonical] = int(value)
+            else:
+                merged[canonical] = value
+
+        # Always send dealer on answer turns
         merged["dealer_number"] = dn
 
         # clear pending/context and stale params
@@ -1002,9 +1091,12 @@ def chat():
 
         return do_quote(sess, merged)
 
-    # 3) Dealer context known — quote directly
+    # 3) Dealer context known — quote directly (supports fuzzy family + typos)
     if dn:
         parsed = extract_params_from_text(user_message)
+        # remember family for better inference later
+        if parsed.get("family"):
+            sess["family"] = parsed["family"]
         extra = parsed if parsed else {"q": user_message}
         return do_quote(sess, extra)
 
@@ -1039,6 +1131,9 @@ def chat():
         if not params.get("dealer_number"):
             return jsonify({"reply": "Please provide your dealer number to begin (e.g., dealer #178200)."})
         sess["dealer_number"] = params["dealer_number"]
+        # also remember family if present
+        if params.get("family"):
+            sess["family"] = params["family"]
         return do_quote(sess, params)
 
     if action == "ask":
@@ -1049,4 +1144,3 @@ def chat():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=True)
-
