@@ -1,7 +1,11 @@
-# app.py — AI-first Woods chatbot with tool-calling (no hard-coded quoting logic)
+# app.py — Minimal AI-first Woods chatbot
+# - Only KNOWLEDGE + FAMILY_TREE in the system prompt
+# - One tool: http_get (GET /dealer-discount, /quote, /health)
+# - Persist full tool history in session so the model remembers config steps
+# - No extra UX glue, no choice mapping, no snapshots
 
 import os, json, time, logging, traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import requests
 from flask import Flask, request, jsonify
@@ -33,7 +37,7 @@ if CORS:
 logging.basicConfig(level=logging.INFO)
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 
-# ---------------- Knowledge ----------------
+# ---------------- Knowledge (as provided) ----------------
 KNOWLEDGE = r"""
 This GPT is a quoting assistant for Woods dealership staff. It retrieves part numbers, list prices, dealer discounts, and configuration requirements exclusively from the Woods Pricing API. It never fabricates data and only asks configuration questions when required.
 
@@ -109,178 +113,114 @@ Additional Guidance
   • 1000 RPM
 """
 
-# ---------------- Family-tree (FULL) ----------------
+# ---------------- Family Tree guidance (as provided) ----------------
 FAMILY_TREE_GUIDE = r"""
-Family-tree guidance — use ONLY when the API does NOT specify the next step (i.e., when /quote does not return required_questions). Ask exactly one question at a time and wait for the answer. Use the exact parameter names shown.
+Use this family-tree guidance ONLY when /quote does not return required_questions. Ask exactly one question at a time and wait for the answer. Use the exact parameter names.
 
 BrushFighter
-  1) width_ft (5/6/7 if not implied by model)
-  2) bf_choice_id or bf_choice (exact ID or label provided by API)
-  3) Optional drive hint: drive ("Slip Clutch" | "Shear Pin") — only if ambiguous
+  1) width_ft (5/6/7)
+  2) bf_choice_id or bf_choice
+  3) Optional drive hint: drive ("Slip Clutch" | "Shear Pin")
 
 BrushBull
   1) bb_shielding ("Belt" | "Chain" | "Single Row" | "Double Row")
-  2) Optional: bb_tailwheel ("Single" | "Dual") if the API asks via required_questions
+  2) bb_tailwheel ("Single" | "Dual") if the API asks
 
 Dual Spindle (DS/MDS)
   1) ds_mount ("mounted" | "pull")
-  2) ds_shielding (e.g., "Belt" | "Chain") when asked
+  2) ds_shielding
   3) ds_driveline ("540" | "1000")
-  4) tire_id (part ID) — ask only if API doesn’t return choices automatically
+  4) tire_id (part ID) if needed
   5) tire_qty (integer)
 
 Batwing (BW)
-  1) bw_duty (series-specific; e.g., "Standard Duty (.52)" | "Heavy Duty (.72)") — ask only if needed
+  1) bw_duty (series-specific) if needed
   2) bw_driveline ("540" | "1000")
-  3) shielding_rows ("Single Row" | "Double Row") if a model supports both
-  4) deck_rings ("Yes" | "No") when model supports the R variant
-  5) tire_id (choices_with_ids from API)
-  6) bw_tire_qty (choices from API / width rules)
+  3) shielding_rows ("Single Row" | "Double Row") if supported
+  4) deck_rings ("Yes" | "No") if supported
+  5) tire_id (from choices_with_ids)
+  6) bw_tire_qty (from choices/width rules)
 
 Turf Batwing (TBW)
   1) tbw_duty ("Residential (.20)" | "Commercial (.40)")
-  2) width_ft (12/15/17 — commercial supports 12/15/17; residential 12)
-  3) front_rollers ("Yes" | "No") — if Yes, AI may set qty 3 in /quote params if required by API
+  2) width_ft (12/15/17; residential=12)
+  3) front_rollers ("Yes" | "No")
   4) chains ("Yes" | "No")
 
 Rear Discharge Finish Mower
   1) finish_choice ("tk" | "tkp" | "rd990x")
-  2) For TK/TKP: front_rollers ("Yes"/"No"), chains ("Yes"/"No") if user asks
+  2) TK/TKP: front_rollers / chains if asked
 
-Box Scraper (BS)   [Correction: valid widths 48/60/72/84 in]
-  1) bs_width_in (inches string: "48" | "60" | "72" | "84")
+Box Scraper (BS)
+  1) bs_width_in ("48" | "60" | "72" | "84")
   2) bs_duty ("Light Duty (.20)" | "Medium Duty (.30)" | "Heavy Duty (.40)") if offered
-  3) bs_choice_id (from choices_with_ids) or bs_choice (exact label) to finalize
+  3) bs_choice_id or bs_choice
 
 Grading Scraper (GS)
-  1) gs_width_in (inches string)
-  2) gs_choice_id or gs_choice (exact model choice as returned)
+  1) gs_width_in
+  2) gs_choice_id or gs_choice
 
 Landscape Rake (LRS)
-  1) lrs_width_in (inches string)
+  1) lrs_width_in
   2) lrs_grade ("Standard" | "Premium (P)") when both exist
   3) lrs_choice_id or lrs_choice
 
 Rear Blade (RB)
-  1) rb_width_in (inches string)
-  2) rb_duty ("Standard" | "Standard (Premium P)" | "Heavy Duty" | "Extreme Duty") per options
+  1) rb_width_in
+  2) rb_duty ("Standard" | "Standard (Premium P)" | "Heavy Duty" | "Extreme Duty")
   3) rb_choice_id or rb_choice
 
-Disc Harrow (DHS/DHM)  [Loop Fix applies]
-  1) dh_width_in (inches string: 48/64/80/96 or as offered)
+Disc Harrow (DHS/DHM)
+  1) dh_width_in (48/64/80/96)
   2) dh_duty ("Standard (DHS)" | "Heavy Duty (DHM)")
   3) dh_blade ("Combo (C)" | "Notched (N)")
-  4) dh_spacing_id (from choices_with_ids) or dh_spacing (exact label)
+  4) dh_spacing_id or dh_spacing  [Stop if spacing prompt loops per Knowledge]
 
 Post Hole Digger (PD)
-  1) pd_model (PD25.21 | PD35.31 | PD95.51) if not selected yet
-  2) auger_id (from choices) or auger_choice (exact label) — REQUIRED to finish
+  1) pd_model (PD25.21 | PD35.31 | PD95.51)
+  2) auger_id or auger_choice (REQUIRED)
 
 Tillers (DB/RT/RTR)
   1) tiller_series ("DB" | "RT")
-  2) tiller_width_in (inches string)
-  3) For RT only: tiller_rotation ("Forward" | "Reverse" → RTR)
+  2) tiller_width_in
+  3) For RT only: tiller_rotation ("Forward" | "Reverse")
   4) tiller_choice_id or tiller_choice
 
 Bale Spear
-  1) bspear_choice_id (from full list returned) or bspear_choice (label)
+  1) bspear_choice_id or bspear_choice
 
 Pallet Fork
-  1) pf_choice_id (from list) or pf_choice (label)
+  1) pf_choice_id or pf_choice
 
 Quick Hitch
-  1) qh_choice_id (from list) or qh_choice (label) — typically TQH1 vs TQH2
+  1) qh_choice_id or qh_choice
 
 Stump Grinder (TSG)
-  1) hydraulics_id (e.g., standard vs high-flow) or hydraulics_choice (label)
+  1) hydraulics_id or hydraulics_choice
 
 General:
-- If /quote returns required_questions, ALWAYS use those exact names and choices next; do not use the family-tree step if the API specified the next parameter.
-- If a driveline question appears with no choices, present: 540 RPM, 1000 RPM.
-- When the user explicitly requests an accessory/option, call /quote with accessory_id or accessory_desc as appropriate and add it as a separate line, unless no price is returned (then show escalation message).
+- If /quote returns required_questions, ALWAYS use those names/choices next; do not use the family tree step.
+- If a driveline question has no choices, present: 540 RPM, 1000 RPM.
+- If the user requests an accessory or option, call /quote with accessory_id or accessory_desc; add as separate line if priced.
 """
 
-# ---------------- Synonyms / Normalization hints ----------------
-SYNONYMS = r"""
-Normalize families from phrasing and typos:
-- "box blade", "boxblade" → box_scraper
-- "brush bull", "brushbull" → brushbull
-- "dual spindle" → dual_spindle
-- "batwing", "bat wimg", "batwng" → batwing
-- "turf batwing" → turf_batwing
-- "rear finish" → rear_finish
-- "grading scraper" → grading_scraper
-- "landscape rake" → landscape_rake
-- "rear blade" → rear_blade
-- "disc harrow" → disc_harrow
-- "post hole digger" → post_hole_digger
-- "tiller" → tiller
-- "bale spear" → bale_spear
-- "pallet fork" → pallet_fork
-- "quick hitch" → quick_hitch
-- "stump grinder" → stump_grinder
-"""
+SYSTEM_PROMPT = KNOWLEDGE + "\n\n--- FAMILY TREE GUIDE ---\n" + FAMILY_TREE_GUIDE
 
-# ---------------- Tool usage summary ----------------
-OPENAPI_HINT = r"""
-Woods Quote Tool (HTTP GET):
-- /health
-- /dealer-discount?dealer_number=178647
-- /quote?{ dealer_number, model, family, width_ft, bw_driveline, bb_shielding, tire_id, bw_tire_qty,
-           ds_mount, ds_shielding, ds_driveline, shielding_rows, deck_rings, tbw_duty, finish_choice,
-           *_choice_id, *_choice, *_width_in, *_duty, *_grade, *_rotation, tire_qty, auger_id,
-           accessory_id (repeatable), accessory_ids, accessory, accessory_desc, part_id, part_no, q }
-
-Rules:
-- Before pricing, call /dealer-discount to get the discount for the dealer.
-- To progress config, call /quote with known params. If {mode:"questions"} is returned, ask exactly ONE question (lettered list) and wait.
-- Never fabricate prices; all numbers come from /quote. If a part can’t be priced, show the escalation message.
-- For Disc Harrow spacing loop: if API keeps repeating the same spacing prompt after you posted it back, stop and show the loop fix message.
-"""
-
-PLANNER_SYSTEM = (
-    KNOWLEDGE
-    + "\n\n--- FAMILY TREES ---\n"
-    + FAMILY_TREE_GUIDE
-    + "\n\n--- SYNONYMS ---\n"
-    + SYNONYMS
-    + "\n\n--- TOOL SPEC SUMMARY ---\n"
-    + OPENAPI_HINT
-    + r"""
-
-You are an AI orchestrator with tool access. On every turn:
-- Use plain English to talk to the user.
-- When you need data, call the HTTP tool to /dealer-discount or /quote.
-- Ask ONE configuration question at a time with A./B./C. lettered options.
-- When final data is available, format the customer-ready quote per Knowledge.
-
-Your output to the user must be plain text; tool calls are separate.
-"""
-)
-
-# ---------------- OpenAI tool (function) ----------------
+# ---------------- One tool definition ----------------
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "http_get",
-            "description": "Call Woods Quote API via HTTP GET. Allowed paths: /health, /dealer-discount, /quote",
+            "description": "HTTP GET to Woods Quote API. Use for /dealer-discount, /quote, /health.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "enum": ["/health", "/dealer-discount", "/quote"],
-                        "description": "Endpoint path to call",
-                    },
-                    "params": {
-                        "type": "object",
-                        "description": "Query parameters to send (e.g., dealer_number, model, family, etc.)",
-                        "additionalProperties": True,
-                    },
+                    "path": {"type": "string", "enum": ["/health", "/dealer-discount", "/quote"]},
+                    "params": {"type": "object", "additionalProperties": True}
                 },
                 "required": ["path", "params"],
-                "additionalProperties": False,
+                "additionalProperties": False
             },
         },
     }
@@ -301,15 +241,16 @@ def woods_http_get(path: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], i
         except Exception as e:
             last_exc = e
             tries += 1
-            if tries >= 2: break
+            if tries >= 2:
+                break
             time.sleep(0.35)
     logging.error("woods_http_get failed %s params=%s error=%s", url, params, last_exc)
     return {"raw_text": str(last_exc)}, 599, url
 
-# ---------------- AI loop ----------------
-def run_ai(messages: List[Dict[str, Any]]) -> str:
+# ---------------- AI loop (persists tool calls/results in history) ----------------
+def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
     if not client:
-        return "Planner unavailable (missing OPENAI_API_KEY)."
+        return "Planner unavailable (missing OPENAI_API_KEY).", messages
 
     completion = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -319,21 +260,22 @@ def run_ai(messages: List[Dict[str, Any]]) -> str:
         tool_choice="auto",
     )
 
-    # Tool-handling loop
     loop_guard = 0
     history = messages[:]
     while True:
         loop_guard += 1
         if loop_guard > 8:
-            return "Tool loop exceeded. Please try again."
+            history.append({"role": "assistant", "content": "Tool loop exceeded. Please try again."})
+            return "Tool loop exceeded. Please try again.", history
 
         choice = completion.choices[0].message
         tool_calls = getattr(choice, "tool_calls", None)
 
         if not tool_calls:
-            return choice.content or ""
+            history.append({"role": "assistant", "content": choice.content or ""})
+            return (choice.content or ""), history
 
-        # Record a single assistant message with all tool_calls
+        # Log the assistant message that invoked tools
         assistant_msg = {
             "role": "assistant",
             "content": choice.content or "",
@@ -343,14 +285,11 @@ def run_ai(messages: List[Dict[str, Any]]) -> str:
             assistant_msg["tool_calls"].append({
                 "id": tc.id,
                 "type": "function",
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments or "{}",
-                },
+                "function": {"name": tc.function.name, "arguments": tc.function.arguments or "{}"},
             })
         history.append(assistant_msg)
 
-        # Execute tools in order and append results
+        # Execute each tool call and append its result
         for tc in tool_calls:
             fn = tc.function.name
             try:
@@ -358,6 +297,7 @@ def run_ai(messages: List[Dict[str, Any]]) -> str:
             except Exception:
                 args = {}
             result = {"ok": False, "status": 0, "url": "", "body": {}}
+
             if fn == "http_get":
                 path = args.get("path") or ""
                 params = args.get("params") or {}
@@ -393,15 +333,22 @@ def chat():
 
         session_id = request.headers.get("X-Session-Id") or data.get("session_id") or f"anon-{int(time.time()*1000)}"
         sess = SESSIONS.setdefault(session_id, {})
-        convo: List[Dict[str, Any]] = sess.get("messages") or []
 
-        if not convo:
-            convo = [{"role": "system", "content": PLANNER_SYSTEM}]
+        # Seed system message once
+        convo: List[Dict[str, Any]] = sess.get("messages") or [{"role": "system", "content": SYSTEM_PROMPT}]
 
+        # Append user turn and run AI
         convo.append({"role": "user", "content": user_message})
-        reply_text = run_ai(convo)
-        convo.append({"role": "assistant", "content": reply_text})
-        sess["messages"] = convo
+        reply_text, updated_history = run_ai(convo)
+
+        # Persist the full updated history (so tool results are remembered)
+        # Optionally trim to avoid unlimited growth
+        MAX_KEEP = 80
+        if len(updated_history) > MAX_KEEP:
+            # keep first system + last N-1
+            head = updated_history[0:1] if updated_history and updated_history[0].get("role") == "system" else []
+            updated_history = head + updated_history[-(MAX_KEEP - len(head)):]
+        sess["messages"] = updated_history
 
         return jsonify({"reply": reply_text})
     except Exception as e:
