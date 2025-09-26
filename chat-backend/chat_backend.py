@@ -10,41 +10,6 @@ try:
 except Exception:
     CORS = None
 
-import re
-
-CHOICE_LINE_RE = re.compile(r"^[A-Z]\.\s+(.+)$", re.M)
-
-def parse_lettered_choices(text: str):
-    """Return ['540 RPM','1000 RPM', ...] if the assistant listed A./B./C. choices."""
-    if not text:
-        return []
-    return [m.group(1).strip() for m in CHOICE_LINE_RE.finditer(text)]
-
-def letter_or_number_to_index(s: str, n: int):
-    """Map 'A'→0, 'b'→1, '1'→0, '2'→1, etc., within 0..n-1."""
-    if not s or n <= 0:
-        return None
-    t = s.strip().lower()
-    if len(t) == 1 and "a" <= t <= "z":
-        i = ord(t) - ord("a")
-        return i if 0 <= i < n else None
-    if t.isdigit():
-        i = int(t) - 1
-        return i if 0 <= i < n else None
-    return None
-
-DEALER_RE_1 = re.compile(r"dealer\s*#\s*(\d{4,7})", re.I)
-DEALER_RE_2 = re.compile(r"\b(\d{5,7})\b")
-
-def find_dealer_number(text: str):
-    """Find a dealer number in free text."""
-    if not text:
-        return None
-    m = DEALER_RE_1.search(text)
-    if m:
-        return m.group(1)
-    m = DEALER_RE_2.search(text)
-    return m.group(1) if m else None
 
 
 # ---------------- Config ----------------
@@ -428,159 +393,19 @@ def chat():
         if not user_message:
             return jsonify({"error": "Missing message"}), 400
 
-        # Stable session id
         session_id = request.headers.get("X-Session-Id") or data.get("session_id") or f"anon-{int(time.time()*1000)}"
         sess = SESSIONS.setdefault(session_id, {})
+        convo: List[Dict[str, Any]] = sess.get("messages") or []
 
-        # Dealer: JSON body → header → text → session → cookie
-        dn = None
-        if data.get("dealer_number"):
-            dn = str(data["dealer_number"]).strip()
-        if not dn:
-            hdr_dn = request.headers.get("X-Dealer-Number")
-            if hdr_dn:
-                dn = str(hdr_dn).strip()
-        if not dn:
-            dn = extract_dealer_number(user_message)
-        if not dn:
-            dn = sess.get("dealer_number")
-        if not dn:
-            dn = request.cookies.get("dealer_number")
-        if dn:
-            sess["dealer_number"] = dn
+        if not convo:
+            convo = [{"role": "system", "content": PLANNER_SYSTEM}]
 
-        # If user sent ONLY a dealer number (and not a model/family), confirm + stop here.
-        only_dn = extract_dealer_number(user_message)
-        mentions_model = bool(MODEL_RE.search(user_message))
-        mentions_family = bool(parse_family(user_message))
-        if only_dn and not mentions_model and not mentions_family:
-            info = call_dealer_discount(only_dn)
-            if "discount" in info:
-                sess["dealer_discount"] = float(info["discount"])
-                sess["dealer_name"] = info.get("dealer_name", "")
-                sess["dealer_number"] = only_dn
-                msg = (
-                    f"Using {sess['dealer_name']} (Dealer #{only_dn}) with a "
-                    f"{int(sess['dealer_discount'] * 100)}% dealer discount for this session. ✅\n\n"
-                    "What would you like me to quote?"
-                )
-                resp = make_response(jsonify({
-                    "reply": msg,
-                    "state": {"dealer_number": only_dn, "dealer_name": sess["dealer_name"]},
-                }))
-                resp.set_cookie("dealer_number", only_dn, max_age=60*60*24*30, httponly=False, samesite="Lax")
-                return resp
+        convo.append({"role": "user", "content": user_message})
+        reply_text = run_ai(convo)
+        convo.append({"role": "assistant", "content": reply_text})
+        sess["messages"] = convo
 
-        # --- CRITICAL: resolve pending multiple-choice before anything else ---
-        pending = sess.get("pending_question")
-        starting_new_quote = mentions_model or mentions_family
-        if pending and not starting_new_quote:
-            cwids = pending.get("choices_with_ids") or []
-            labels = (
-                [str(c.get("label", "")).strip() for c in cwids]
-                if cwids else
-                [str(c).strip() for c in (pending.get("choices") or [])]
-            )
-
-            # Map A/B/C or 1/2/3 → index
-            idx = letter_or_number_choice_to_index(user_message, len(labels))
-
-            # Fuzzy label or id match as backup
-            if idx is None and labels:
-                low = user_message.strip().lower()
-                for i, lab in enumerate(labels):
-                    if lab.lower() == low:
-                        idx = i; break
-                if idx is None:
-                    for i, lab in enumerate(labels):
-                        if low in lab.lower():
-                            idx = i; break
-                if idx is None and cwids:
-                    ids = [str(c.get("id", "")).strip().lower() for c in cwids]
-                    for i, _id in enumerate(ids):
-                        if _id and _id == low:
-                            idx = i; break
-
-            # If we still don’t know, politely re-ask with the options
-            if idx is None:
-                letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                opts = "\n".join(f"{letters[i]}. {labels[i]}" for i in range(len(labels)))
-                return jsonify({
-                    "reply": f"{pending.get('question', 'Please choose:')}\n\n{opts}",
-                    "ui": {"type": "choices",
-                           "name": pending.get("name"),
-                           "question": pending.get("question"),
-                           "choices": cwids or [{"id": str(c), "label": str(c)} for c in (pending.get("choices") or [])]},
-                    "state": {"dealer_number": sess.get("dealer_number"), "dealer_name": sess.get("dealer_name")},
-                })
-
-            # Merge the chosen value and continue the quote immediately
-            value = cwids[idx].get("id") if cwids else (pending.get("choices") or [None])[idx]
-            name = (pending.get("name") or "").strip()
-
-            merged: Dict[str, Any] = {}
-            merged.update(sess.get("accum_params") or {})
-            # Int-coerce *_qty fields
-            if isinstance(value, str) and (name.endswith("_qty") or name.endswith("_quantity")) and value.isdigit():
-                value = int(value)
-            if name:
-                merged[name] = value
-            merged["dealer_number"] = sess.get("dealer_number")
-
-            # Clear pending (the next do_quote call will set the next pending if needed)
-            sess["pending_question"] = None
-            sess["accum_params"] = merged
-
-            return do_quote(sess, {})  # important: immediate API call with merged params
-
-        # If the user clearly started a new quote, reset quote-scoped state (keep dealer)
-        if starting_new_quote:
-            for k in ("pending_question", "accum_params", "params", "family", "post_quote"):
-                sess.pop(k, None)
-            if mentions_family:
-                sess["family"] = parse_family(user_message)
-
-        # --- Planner routing for everything else (free chat + first call) ---
-        plan = call_openai_for_plan(user_message, sess)
-        action = (plan.get("action") or "").lower()
-        reply  = plan.get("reply") or ""
-        p      = plan.get("params") or {}
-
-        if action == "dealer_lookup":
-            dn2 = p.get("dealer_number") or extract_dealer_number(user_message)
-            if not dn2:
-                return jsonify({"reply": "Please provide your dealer number (e.g., dealer #178200)."})
-            info = call_dealer_discount(dn2)
-            if "discount" in info:
-                sess["dealer_discount"] = float(info["discount"])
-                sess["dealer_name"] = info.get("dealer_name", "")
-                sess["dealer_number"] = dn2
-                msg = (f"Using {sess['dealer_name']} (Dealer #{dn2}) with a "
-                       f"{int(sess['dealer_discount']*100)}% dealer discount for this session. ✅\n\n"
-                       "What would you like me to quote?")
-                return jsonify({"reply": msg, "state": {"dealer_number": dn2, "dealer_name": sess["dealer_name"]}})
-
-        elif action == "quote":
-            # Ensure dealer
-            if not p.get("dealer_number"):
-                if not sess.get("dealer_number"):
-                    return jsonify({"reply": "Please provide your dealer number to begin (e.g., dealer #178200)."})
-                p["dealer_number"] = sess["dealer_number"]
-            # Start a fresh quote-scoped state
-            sess["accum_params"] = {}
-            sess.pop("pending_question", None)
-            if p.get("family"):
-                sess["family"] = p["family"]
-            return do_quote(sess, p)
-
-        elif action == "ask":
-            return jsonify({"reply": reply or "What would you like me to quote?",
-                            "state": {"dealer_number": sess.get("dealer_number"), "dealer_name": sess.get("dealer_name")}})
-
-        # smalltalk / default
-        return jsonify({"reply": reply or "How can I help with your Woods quote today?",
-                        "state": {"dealer_number": sess.get("dealer_number"), "dealer_name": sess.get("dealer_name")}})
-
+        return jsonify({"reply": reply_text})
     except Exception as e:
         logging.exception("Unhandled error in /chat")
         return jsonify({
