@@ -1,10 +1,7 @@
-# app.py — AI-first Woods chatbot with tool-calling, with stable session memory
-# - Persists tool calls/results to session (prevents forgetting steps)
-# - Maps A/B/C/1/2/3 to the actual label shown last turn
-# - Injects SESSION_STATE each turn (dealer + last choices)
+# app.py — AI-first Woods chatbot with tool-calling (no hard-coded quoting logic)
 
-import os, re, json, time, logging, traceback
-from typing import Any, Dict, List, Tuple
+import os, json, time, logging, traceback
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from flask import Flask, request, jsonify
@@ -112,7 +109,7 @@ Additional Guidance
   • 1000 RPM
 """
 
-# ---------------- Family-trees ----------------
+# ---------------- Family-tree (FULL) ----------------
 FAMILY_TREE_GUIDE = r"""
 Family-tree guidance — use ONLY when the API does NOT specify the next step (i.e., when /quote does not return required_questions). Ask exactly one question at a time and wait for the answer. Use the exact parameter names shown.
 
@@ -133,74 +130,74 @@ Dual Spindle (DS/MDS)
   5) tire_qty (integer)
 
 Batwing (BW)
-  1) bw_duty (series-specific) — ask only if needed
+  1) bw_duty (series-specific; e.g., "Standard Duty (.52)" | "Heavy Duty (.72)") — ask only if needed
   2) bw_driveline ("540" | "1000")
-  3) shielding_rows ("Single Row" | "Double Row") if supported
-  4) deck_rings ("Yes" | "No") if supported
+  3) shielding_rows ("Single Row" | "Double Row") if a model supports both
+  4) deck_rings ("Yes" | "No") when model supports the R variant
   5) tire_id (choices_with_ids from API)
   6) bw_tire_qty (choices from API / width rules)
 
 Turf Batwing (TBW)
   1) tbw_duty ("Residential (.20)" | "Commercial (.40)")
-  2) width_ft (12/15/17 — residential 12 only)
-  3) front_rollers ("Yes" | "No")
+  2) width_ft (12/15/17 — commercial supports 12/15/17; residential 12)
+  3) front_rollers ("Yes" | "No") — if Yes, AI may set qty 3 in /quote params if required by API
   4) chains ("Yes" | "No")
 
 Rear Discharge Finish Mower
   1) finish_choice ("tk" | "tkp" | "rd990x")
   2) For TK/TKP: front_rollers ("Yes"/"No"), chains ("Yes"/"No") if user asks
 
-Box Scraper (BS)   [valid widths 48/60/72/84 in]
-  1) bs_width_in ("48" | "60" | "72" | "84")
+Box Scraper (BS)   [Correction: valid widths 48/60/72/84 in]
+  1) bs_width_in (inches string: "48" | "60" | "72" | "84")
   2) bs_duty ("Light Duty (.20)" | "Medium Duty (.30)" | "Heavy Duty (.40)") if offered
-  3) bs_choice_id or bs_choice
+  3) bs_choice_id (from choices_with_ids) or bs_choice (exact label) to finalize
 
 Grading Scraper (GS)
-  1) gs_width_in
-  2) gs_choice_id or gs_choice
+  1) gs_width_in (inches string)
+  2) gs_choice_id or gs_choice (exact model choice as returned)
 
 Landscape Rake (LRS)
-  1) lrs_width_in
+  1) lrs_width_in (inches string)
   2) lrs_grade ("Standard" | "Premium (P)") when both exist
   3) lrs_choice_id or lrs_choice
 
 Rear Blade (RB)
-  1) rb_width_in
-  2) rb_duty ("Standard" | "Standard (Premium P)" | "Heavy Duty" | "Extreme Duty")
+  1) rb_width_in (inches string)
+  2) rb_duty ("Standard" | "Standard (Premium P)" | "Heavy Duty" | "Extreme Duty") per options
   3) rb_choice_id or rb_choice
 
 Disc Harrow (DHS/DHM)  [Loop Fix applies]
-  1) dh_width_in (48/64/80/96 or as offered)
+  1) dh_width_in (inches string: 48/64/80/96 or as offered)
   2) dh_duty ("Standard (DHS)" | "Heavy Duty (DHM)")
   3) dh_blade ("Combo (C)" | "Notched (N)")
-  4) dh_spacing_id or dh_spacing
+  4) dh_spacing_id (from choices_with_ids) or dh_spacing (exact label)
 
 Post Hole Digger (PD)
   1) pd_model (PD25.21 | PD35.31 | PD95.51) if not selected yet
-  2) auger_id or auger_choice — REQUIRED to finish
+  2) auger_id (from choices) or auger_choice (exact label) — REQUIRED to finish
 
 Tillers (DB/RT/RTR)
   1) tiller_series ("DB" | "RT")
-  2) tiller_width_in
-  3) For RT only: tiller_rotation ("Forward" | "Reverse")
+  2) tiller_width_in (inches string)
+  3) For RT only: tiller_rotation ("Forward" | "Reverse" → RTR)
   4) tiller_choice_id or tiller_choice
 
 Bale Spear
-  1) bspear_choice_id or bspear_choice
+  1) bspear_choice_id (from full list returned) or bspear_choice (label)
 
 Pallet Fork
-  1) pf_choice_id or pf_choice
+  1) pf_choice_id (from list) or pf_choice (label)
 
 Quick Hitch
-  1) qh_choice_id or qh_choice
+  1) qh_choice_id (from list) or qh_choice (label) — typically TQH1 vs TQH2
 
 Stump Grinder (TSG)
-  1) hydraulics_id or hydraulics_choice
+  1) hydraulics_id (e.g., standard vs high-flow) or hydraulics_choice (label)
 
 General:
 - If /quote returns required_questions, ALWAYS use those exact names and choices next; do not use the family-tree step if the API specified the next parameter.
 - If a driveline question appears with no choices, present: 540 RPM, 1000 RPM.
-- When the user explicitly requests an accessory/option, call /quote with accessory_id or accessory_desc and add it as a separate line, unless no price is returned (then show escalation message).
+- When the user explicitly requests an accessory/option, call /quote with accessory_id or accessory_desc as appropriate and add it as a separate line, unless no price is returned (then show escalation message).
 """
 
 # ---------------- Synonyms / Normalization hints ----------------
@@ -261,49 +258,6 @@ Your output to the user must be plain text; tool calls are separate.
 """
 )
 
-# ---------------- Choice helpers ----------------
-CHOICE_LINE_RE = re.compile(r"^[A-Z]\.\s+(.+)$", re.M)
-DEALER_RE_1 = re.compile(r"dealer\s*#\s*(\d{4,7})", re.I)
-DEALER_RE_2 = re.compile(r"\b(\d{5,7})\b")
-
-def parse_lettered_choices(text: str) -> List[str]:
-    if not text:
-        return []
-    return [m.group(1).strip() for m in CHOICE_LINE_RE.finditer(text)]
-
-def letter_or_number_to_index(s: str, n: int):
-    if not s or n <= 0:
-        return None
-    t = s.strip().lower()
-    if len(t) == 1 and "a" <= t <= "z":
-        i = ord(t) - ord("a")
-        return i if 0 <= i < n else None
-    if t.isdigit():
-        i = int(t) - 1
-        return i if 0 <= i < n else None
-    return None
-
-def find_dealer_number(text: str):
-    if not text:
-        return None
-    m = DEALER_RE_1.search(text)
-    if m:
-        return m.group(1)
-    m = DEALER_RE_2.search(text)
-    return m.group(1) if m else None
-
-def trim_messages(history: List[Dict[str, Any]], keep_last: int = 60) -> List[Dict[str, Any]]:
-    """Keep system + last N messages to control token growth."""
-    if not history:
-        return history
-    # keep first system message if present
-    sys = history[0] if history and history[0].get("role") == "system" else None
-    tail = history[1:] if sys else history[:]
-    if len(tail) <= keep_last:
-        return history
-    trimmed = ( [sys] if sys else [] ) + tail[-keep_last:]
-    return trimmed
-
 # ---------------- OpenAI tool (function) ----------------
 TOOLS = [
     {
@@ -352,10 +306,10 @@ def woods_http_get(path: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], i
     logging.error("woods_http_get failed %s params=%s error=%s", url, params, last_exc)
     return {"raw_text": str(last_exc)}, 599, url
 
-# ---------------- AI loop (returns text + full history) ----------------
-def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+# ---------------- AI loop ----------------
+def run_ai(messages: List[Dict[str, Any]]) -> str:
     if not client:
-        return "Planner unavailable (missing OPENAI_API_KEY).", messages
+        return "Planner unavailable (missing OPENAI_API_KEY)."
 
     completion = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -365,24 +319,21 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
         tool_choice="auto",
     )
 
+    # Tool-handling loop
     loop_guard = 0
-    history = messages[:]  # we will append to this and return it
+    history = messages[:]
     while True:
         loop_guard += 1
         if loop_guard > 8:
-            # Append final assistant notice so history stays consistent
-            history.append({"role": "assistant", "content": "Tool loop exceeded. Please try again."})
-            return "Tool loop exceeded. Please try again.", history
+            return "Tool loop exceeded. Please try again."
 
         choice = completion.choices[0].message
         tool_calls = getattr(choice, "tool_calls", None)
 
         if not tool_calls:
-            # append the assistant's final content to history before returning
-            history.append({"role": "assistant", "content": choice.content or ""})
-            return (choice.content or ""), history
+            return choice.content or ""
 
-        # Record one assistant message containing all tool_calls
+        # Record a single assistant message with all tool_calls
         assistant_msg = {
             "role": "assistant",
             "content": choice.content or "",
@@ -399,7 +350,7 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
             })
         history.append(assistant_msg)
 
-        # Execute tools and append results
+        # Execute tools in order and append results
         for tc in tool_calls:
             fn = tc.function.name
             try:
@@ -422,7 +373,7 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
                 "content": json.dumps(result),
             })
 
-        # Ask the model to continue after tool results
+        # Ask the model to continue after seeing tool results
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0.2,
@@ -440,59 +391,21 @@ def chat():
         if not user_message:
             return jsonify({"error": "Missing message"}), 400
 
-        # Session
         session_id = request.headers.get("X-Session-Id") or data.get("session_id") or f"anon-{int(time.time()*1000)}"
         sess = SESSIONS.setdefault(session_id, {})
         convo: List[Dict[str, Any]] = sess.get("messages") or []
+
         if not convo:
             convo = [{"role": "system", "content": PLANNER_SYSTEM}]
 
-        # Dealer capture from user text (keeps context robust even if prior turns roll off)
-        dn_in_text = find_dealer_number(user_message)
-        if dn_in_text:
-            sess["dealer_number"] = dn_in_text
-
-        # Translate A/B/C/1/2/3 into explicit selection if we have a stored list
-        last_choices: List[str] = sess.get("last_choices") or []
-        idx = letter_or_number_to_index(user_message, len(last_choices)) if last_choices else None
-        if idx is not None:
-            choice_label = last_choices[idx]
-            user_message = f"Selection: {choice_label}"
-
-        # Inject a tiny session snapshot so the model always knows dealer + last choices
-        snapshot = {
-            "dealer_number": sess.get("dealer_number"),
-            "dealer_name": sess.get("dealer_name"),
-            "last_choices": last_choices or None,
-        }
-        convo.append({"role": "system", "content": "SESSION_STATE: " + json.dumps(snapshot)})
-
-        # Append user turn
         convo.append({"role": "user", "content": user_message})
-
-        # Run AI; get BOTH text and full updated history (with tool calls/results)
-        reply_text, updated_history = run_ai(convo)
-
-        # Store updated history (trimmed)
-        updated_history = trim_messages(updated_history, keep_last=60)
-        sess["messages"] = updated_history
-
-        # Update last_choices based on the *final* assistant text (for the next turn)
-        if reply_text and "**Woods Equipment Quote**" in reply_text:
-            # Final quote shown — clear lettered list context
-            sess.pop("last_choices", None)
-        else:
-            # Capture the latest lettered options the assistant showed
-            choices_list = parse_lettered_choices(reply_text or "")
-            if choices_list:
-                # keep max 26
-                sess["last_choices"] = choices_list[:26]
+        reply_text = run_ai(convo)
+        convo.append({"role": "assistant", "content": reply_text})
+        sess["messages"] = convo
 
         return jsonify({"reply": reply_text})
-
     except Exception as e:
         logging.exception("Unhandled error in /chat")
-        # Always JSON (prevents "<!doctype ..." errors in client)
         return jsonify({
             "reply": "There was a system error while handling your request. Please try again.",
             "error": str(e),
