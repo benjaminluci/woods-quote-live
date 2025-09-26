@@ -10,6 +10,43 @@ try:
 except Exception:
     CORS = None
 
+import re
+
+CHOICE_LINE_RE = re.compile(r"^[A-Z]\.\s+(.+)$", re.M)
+
+def parse_lettered_choices(text: str):
+    """Return ['540 RPM','1000 RPM', ...] if the assistant listed A./B./C. choices."""
+    if not text:
+        return []
+    return [m.group(1).strip() for m in CHOICE_LINE_RE.finditer(text)]
+
+def letter_or_number_to_index(s: str, n: int):
+    """Map 'A'→0, 'b'→1, '1'→0, '2'→1, etc., within 0..n-1."""
+    if not s or n <= 0:
+        return None
+    t = s.strip().lower()
+    if len(t) == 1 and "a" <= t <= "z":
+        i = ord(t) - ord("a")
+        return i if 0 <= i < n else None
+    if t.isdigit():
+        i = int(t) - 1
+        return i if 0 <= i < n else None
+    return None
+
+DEALER_RE_1 = re.compile(r"dealer\s*#\s*(\d{4,7})", re.I)
+DEALER_RE_2 = re.compile(r"\b(\d{5,7})\b")
+
+def find_dealer_number(text: str):
+    """Find a dealer number in free text."""
+    if not text:
+        return None
+    m = DEALER_RE_1.search(text)
+    if m:
+        return m.group(1)
+    m = DEALER_RE_2.search(text)
+    return m.group(1) if m else None
+
+
 # ---------------- Config ----------------
 QUOTE_API_BASE = os.environ.get("QUOTE_API_BASE", "https://woods-quote-api.onrender.com").rstrip("/")
 OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
@@ -391,43 +428,65 @@ def chat():
         if not user_message:
             return jsonify({"error": "Missing message"}), 400
 
+        # Session
         session_id = request.headers.get("X-Session-Id") or data.get("session_id") or f"anon-{int(time.time()*1000)}"
         sess = SESSIONS.setdefault(session_id, {})
-        convo: List[Dict[str, Any]] = sess.get("messages") or []
-
+        convo = sess.get("messages") or []
         if not convo:
+            # seed the planner system prompt once
             convo = [{"role": "system", "content": PLANNER_SYSTEM}]
 
+        # Detect dealer change in this user turn and reset choice context to avoid cross-stream bleed
+        incoming_dn = find_dealer_number(user_message)
+        if incoming_dn and incoming_dn != sess.get("dealer_number"):
+            sess["dealer_number"] = incoming_dn
+            # optional: you can also cache dealer_name once the model calls /dealer-discount
+            sess.pop("last_choices", None)  # clear A/B/C context on dealer switch
+            convo.append({"role": "system", "content": f"SESSION NOTE: Dealer context changed to #{incoming_dn}. Use this dealer for subsequent pricing."})
+
+        # If last assistant turn listed choices, map A/B/C or 1/2/3 to the actual label before sending to the model
+        last_choices = sess.get("last_choices") or []
+        idx = letter_or_number_to_index(user_message, len(last_choices)) if last_choices else None
+        if idx is not None:
+            # Rewrite user's short reply into a clear selection the model can't miss
+            chosen = last_choices[idx]
+            user_message = f"Selection: {chosen}"
+
+        # Give the model a tiny ephemeral session snapshot (dealer + last choices) each turn
+        snapshot = {
+            "dealer_number": sess.get("dealer_number"),
+            "dealer_name": sess.get("dealer_name"),
+            "last_choices": last_choices if last_choices else None,
+        }
+        convo.append({"role": "system", "content": "SESSION_STATE: " + json.dumps(snapshot)})
+
+        # User turn → model
         convo.append({"role": "user", "content": user_message})
         reply_text = run_ai(convo)
         convo.append({"role": "assistant", "content": reply_text})
-        sess["messages"] = convo
 
+        # Capture/clear choice context based on assistant reply
+        if "**Woods Equipment Quote**" in (reply_text or ""):
+            # Finalized a quote → clear list context so A/B/C doesn't hit the wrong flow afterward
+            sess.pop("last_choices", None)
+        else:
+            choices = parse_lettered_choices(reply_text or "")
+            if choices:
+                sess["last_choices"] = choices
+            else:
+                # no new choices listed; keep existing last_choices unless you prefer to clear it:
+                # sess.pop("last_choices", None)
+                pass
+
+        sess["messages"] = convo
         return jsonify({"reply": reply_text})
+
     except Exception as e:
         logging.exception("Unhandled error in /chat")
         return jsonify({
             "reply": "There was a system error while handling your request. Please try again.",
             "error": str(e),
             "trace": traceback.format_exc(limit=1),
-        }), 200
-
-@app.route("/health", methods=["GET"])
-def health():
-    try:
-        body, status, _ = woods_http_get("/health", {})
-        return jsonify({
-            "ok": status == 200,
-            "planner": bool(client),
-            "quote_api_base": QUOTE_API_BASE,
-            "api_health": body if isinstance(body, dict) else {},
-        }), 200
-    except Exception:
-        return jsonify({
-            "ok": False,
-            "planner": bool(client),
-            "quote_api_base": QUOTE_API_BASE,
-            "api_health": {},
         }), 200
 
 if __name__ == "__main__":
