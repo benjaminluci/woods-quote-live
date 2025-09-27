@@ -1,9 +1,25 @@
-# app.py — Minimal AI-first Woods chatbot
-# - Only KNOWLEDGE + FAMILY_TREE in the system prompt
-# - One tool: http_get (GET /dealer-discount, /quote, /health)
-# - Persist full tool history in session so the model remembers config steps
-# - No extra UX glue, no choice mapping, no snapshots
+# app.py — AI-first Woods quoting backend (single file)
+# Behavior:
+# - The LLM plans freely and calls ONE tool: http_get (/dealer-discount, /quote, /health).
+# - Your business rules + family-tree guidance are in the system prompt (no rigid backend logic).
+# - Session memory persists the full message + tool history (so the model remembers config steps).
+# - Minimal guardrails: connector retry in the tool; everything else is guided by the prompt.
+#
+# Endpoints:
+#   POST /chat   {"session_id":"<id>","message":"<text>"} -> {"reply": "..."}
+#   GET  /health -> {"ok": bool, "planner": bool, "quote_api_base": str, "api_health": {...}}
+#
+# Env:
+#   QUOTE_API_BASE (default: https://woods-quote-tool.onrender.com)
+#   OPENAI_API_KEY (optional; if omitted, planner is disabled)
+#   OPENAI_MODEL   (default: gpt-4o-mini)
+#   ALLOWED_ORIGINS (CSV, optional CORS for /chat)
+#
+# Run:
+#   pip install flask flask-cors requests openai
+#   python app.py
 
+from __future__ import annotations
 import os, json, time, logging, traceback
 from typing import Any, Dict, List, Tuple
 
@@ -15,9 +31,15 @@ except Exception:
     CORS = None
 
 # ---------------- Config ----------------
-QUOTE_API_BASE = os.environ.get("QUOTE_API_BASE", "https://woods-quote-api.onrender.com").rstrip("/")
+QUOTE_API_BASE = os.environ.get("QUOTE_API_BASE", "https://woods-quote-tool.onrender.com").rstrip("/")
 OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+HTTP_TIMEOUT   = float(os.environ.get("HTTP_TIMEOUT", "25"))
+RETRY_ATTEMPTS = 2
 
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("woods-ai")
+
+# ---------------- OpenAI client (optional) ----------------
 client = None
 try:
     from openai import OpenAI
@@ -26,6 +48,7 @@ try:
 except Exception:
     client = None
 
+# ---------------- Flask app + CORS ----------------
 app = Flask(__name__)
 if CORS:
     allow = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
@@ -34,179 +57,139 @@ if CORS:
     else:
         CORS(app, supports_credentials=False)
 
-logging.basicConfig(level=logging.INFO)
+# ---------------- Sessions (memory) ----------------
 SESSIONS: Dict[str, Dict[str, Any]] = {}
+SESSION_TTL_SECONDS = 60 * 60 * 12  # 12h
 
-# ---------------- Knowledge (as provided) ----------------
+# ---------------- System knowledge (from your spec) ----------------
 KNOWLEDGE = r"""
-This GPT is a quoting assistant for Woods dealership staff. It retrieves part numbers, list prices, dealer discounts, and configuration requirements exclusively from the Woods Pricing API. It never fabricates data and only asks configuration questions when required.
+You are a quoting assistant for Woods Equipment dealership staff. Your primary job is to retrieve part numbers, list prices, dealer discounts, and configuration requirements exclusively from the Woods Pricing API. You never fabricate data, never infer pricing, and only ask configuration questions when required.
 
 ---
 Core Rules
-- Dealer number is required before quoting. Use the API to look up the dealer’s discount. Do not begin quotes or give pricing without it.
-- Dealer numbers may be remembered within a session and across multiple quotes for the same user. This eliminates the need for the dealer to repeatedly enter their number unless they explicitly want to change it.
-- All model, accessory, and pricing data must come directly from the Woods Pricing API. Never invent, infer, reuse, or cache pricing or configurations.
-- Do not reuse prices across quotes. Every quote must pull fresh data — including list prices — from the API for all base units, tires, hub kits, and accessories.
-- If the API returns no price for a valid part number, quoting must stop and inform the dealer that escalation is needed.
+- A dealer number is required before quoting. Use the Pricing API to look up the dealer’s discount. Do not begin quotes or give pricing without it.
+- Dealer numbers may be remembered within a session and across multiple quotes for the same user unless the dealer provides a new number.
+- All model, accessory, and pricing data must be pulled directly from the API. Never invent, infer, reuse, or cache data.
+- Every quote must pull fresh pricing from the API for all items — including list prices and accessories.
+- If a valid part number returns no price, quoting must stop and inform the dealer to escalate the issue.
 
 API Error Handling
-- If an API call fails with a connector error on the first attempt, automatically retry the request once before showing an error.
-- If the retry succeeds, proceed as normal without showing the error.
-- If the retry also fails, show: “There was a system error while retrieving data. Please try again shortly. If the issue persists, escalate to Benjamin Luci at 615-516-8802.”
+- Retry any connector error once automatically before showing an error.
+- If retry succeeds, proceed normally.
+- If retry fails, show: “There was a system error while retrieving data. Please try again shortly. If the issue persists, escalate to Benjamin Luci at 615-516-8802.”
 
 Pricing Logic
-1) Retrieve List Price from API for each part number — never reuse from past quotes
-2) Apply dealer discount from lookup
-3) Always apply 12% cash discount after dealer discount (unless dealer discount is exactly 5%)
-4) Format quote as plain text, customer-ready
-⚠️ Always apply the 12% cash discount unless the dealer discount is exactly 5%. This step is not optional.
+1. Retrieve list price for each part number from API
+2. Apply dealer discount from lookup
+3. Unless the dealer discount is exactly 5%, apply an additional 12% cash discount
+4. Format quote as plain text, customer-ready
+⚠️ Cash discount must always be applied unless dealer discount is exactly 5%. Never skip this.
 
-Quote Output
-- Begin with "Woods Equipment Quote" in bold
-- Include the dealer name and dealer number below the title
-- Final Dealer Net shown boldly with ✅
-- Omit the "Subtotal" section
-- Include: List Price → Discount → Cash Discount → Final Net
-- Include: “Cash discount included only if paid within terms.”
-- If a model or part cannot be priced, say: “Unable to find pricing... contact Benjamin Luci at 615-516-8802.”
+Quote Output Format
+- Begin with "**Woods Equipment Quote**"
+- Include dealer name and dealer number
+- Bold the final dealer net with ✅
+- No "Subtotal" section
+- Always include: List Price → Discount → Cash Discount → Final Net
+- Add: “Cash discount included only if paid within terms.”
+- If any part cannot be priced: “Unable to find pricing... contact Benjamin Luci at 615-516-8802.”
 
 Session Handling
-- Store and reuse dealer number for all quotes within the same session and across multiple quotes for the same user, unless they provide a different dealer number.
-- Store and reuse selected model and config within a single quote only.
-- Between quotes, always start fresh and re-pull prices for all items.
-- Never say “API says…” — always present information as system output.
+- Remember dealer number across quotes in the same session
+- Remember selected model/config only within a single quote
+- Always re-pull prices between quotes
+- Never say “API says…” — present info as system output
 
 Access Control
-- Never disclose one dealer’s pricing to another.
-- Direct dealers to portal to find their dealer number if needed.
+- Never disclose pricing from one dealer to another
+- If dealer needs help finding dealer number, direct them to the Woods dealer portal
 
 Accessory Handling
-- If the dealer explicitly requests an accessory or option (e.g., dual hub kit, chains, tires):
-  - Always attempt an API lookup, regardless of whether the API marks the item as standard.
-  - If pricing is returned, add it as a separate line item.
-  - If no price is returned, stop quoting that item and show the escalation message.
-- Never silently skip or treat a dealer-requested accessory as standard equipment.
+- If a dealer requests a specific accessory (e.g., tires, chains, dual hub):
+  - Attempt API lookup
+  - If priced, add as separate line item
+  - If not priced, stop and show the escalation message
+- Never treat a dealer-requested accessory as included by default
 
 Interaction Style
-- Ask configuration questions one at a time only. Never combine multiple decisions into a single message.
-- Always format multiple options vertically with lettered lists (A., B., C., …) for clarity.
-- Wait for the user’s response before asking the next configuration question.
+- Ask one config question at a time
+- Never combine multiple questions into a single message
+- Format multiple options as lettered vertical lists:
+  A. ...
+  B. ...
+  C. ...
+- Wait for user response before proceeding
 
 Box Scraper Correction
-- Valid Box Scraper widths include: 48 in (4 ft), 60 in (5 ft), 72 in (6 ft), 84 in (7 ft)
+- Valid widths: 48 in (4 ft), 60 in (5 ft), 72 in (6 ft), 84 in (7 ft)
 
 Disc Harrow Fix
-- If the API repeatedly returns the same required disc spacing prompt even after the user has answered:
-  - Detect this loop and stop quoting.
+- If API returns the same required spacing prompt repeatedly:
+  - Detect the loop
+  - Stop quoting
   - Say: “The system is stuck on a required disc spacing selection. Please escalate to Benjamin Luci at 615-516-8802.”
-  - Do not keep retrying the same input. Do not allow an infinite loop.
+  - Do not retry endlessly
 
 Correction Enforcement
-- Quotes must not stop at the dealer discount stage.
-- If dealer discount ≠ 5%, the 12% cash discount must be calculated and clearly shown.
-- Never omit or forget the cash discount application.
-- If the final output does not include the cash discount deduction, that quote is invalid and must be corrected immediately.
-
-Additional Guidance
-- If the API requests a driveline but provides no choices, present these defaults:
-  • 540 RPM
-  • 1000 RPM
+- Do not stop quotes after dealer discount
+- If dealer discount ≠ 5%, 12% cash discount must be shown
+- If cash discount is missing from final output, quote is invalid and must be corrected
 """
 
-# ---------------- Family Tree guidance (as provided) ----------------
 FAMILY_TREE_GUIDE = r"""
-Use this family-tree guidance ONLY when /quote does not return required_questions. Ask exactly one question at a time and wait for the answer. Use the exact parameter names.
+Use this only to clarify choices when /quote doesn’t already ask. Ask EXACTLY one question at a time.
 
 BrushFighter
-  1) width_ft (5/6/7)
-  2) bf_choice_id or bf_choice
-  3) Optional drive hint: drive ("Slip Clutch" | "Shear Pin")
+  width_ft (5/6/7) → bf_choice_id or bf_choice → optional drive ("Slip Clutch" | "Shear Pin")
 
 BrushBull
-  1) bb_shielding ("Belt" | "Chain" | "Single Row" | "Double Row")
-  2) bb_tailwheel ("Single" | "Dual") if the API asks
+  bb_shielding ("Belt" | "Chain" | "Single Row" | "Double Row") → bb_tailwheel ("Single" | "Dual") if asked
 
 Dual Spindle (DS/MDS)
-  1) ds_mount ("mounted" | "pull")
-  2) ds_shielding
-  3) ds_driveline ("540" | "1000")
-  4) tire_id (part ID) if needed
-  5) tire_qty (integer)
+  ds_mount ("mounted" | "pull") → ds_shielding → ds_driveline ("540" | "1000") → tire_id/tire_qty if needed
 
-Batwing (BW)
-  1) bw_duty (series-specific) if needed
-  2) bw_driveline ("540" | "1000")
-  3) shielding_rows ("Single Row" | "Double Row") if supported
-  4) deck_rings ("Yes" | "No") if supported
-  5) tire_id (from choices_with_ids)
-  6) bw_tire_qty (from choices/width rules)
+Batwing
+  width_ft (12/15/20) → bw_duty → bw_driveline ("540" | "1000") → shielding_rows ("Single Row" | "Double Row")
+  deck_rings ("Yes" | "No") if model supports R → bw_tire_qty valid options by width
 
 Turf Batwing (TBW)
-  1) tbw_duty ("Residential (.20)" | "Commercial (.40)")
-  2) width_ft (12/15/17; residential=12)
-  3) front_rollers ("Yes" | "No")
-  4) chains ("Yes" | "No")
+  width_ft (12/15/17) → tbw_duty ("Residential (.20)" | "Commercial (.40)") → front_rollers ("Yes" | "No", qty 3)
+  chains ("Yes" | "No")
 
-Rear Discharge Finish Mower
-  1) finish_choice ("tk" | "tkp" | "rd990x")
-  2) TK/TKP: front_rollers / chains if asked
+Finish Mowers
+  finish_choice (tk | tkp | rd990x) → front_rollers/chains as supported
 
-Box Scraper (BS)
-  1) bs_width_in ("48" | "60" | "72" | "84")
-  2) bs_duty ("Light Duty (.20)" | "Medium Duty (.30)" | "Heavy Duty (.40)") if offered
-  3) bs_choice_id or bs_choice
+Box Scraper
+  bs_width_in (48/60/72/84) → bs_duty → bs_choice_id/bs_choice
 
-Grading Scraper (GS)
-  1) gs_width_in
-  2) gs_choice_id or gs_choice
+Grading Scraper
+  gs_width_in → gs_choice_id/gs_choice
 
-Landscape Rake (LRS)
-  1) lrs_width_in
-  2) lrs_grade ("Standard" | "Premium (P)") when both exist
-  3) lrs_choice_id or lrs_choice
+Landscape Rake
+  lrs_width_in → lrs_grade if width offers both → lrs_choice_id/lrs_choice
 
-Rear Blade (RB)
-  1) rb_width_in
-  2) rb_duty ("Standard" | "Standard (Premium P)" | "Heavy Duty" | "Extreme Duty")
-  3) rb_choice_id or rb_choice
+Rear Blade
+  rb_width_in → rb_duty → rb_choice_id/rb_choice
+
+Post Hole Digger
+  pd_model (PD25.21/PD35.31/PD95.51) → auger_id/auger_choice (required)
 
 Disc Harrow (DHS/DHM)
-  1) dh_width_in (48/64/80/96)
-  2) dh_duty ("Standard (DHS)" | "Heavy Duty (DHM)")
-  3) dh_blade ("Combo (C)" | "Notched (N)")
-  4) dh_spacing_id or dh_spacing  [Stop if spacing prompt loops per Knowledge]
+  dh_width_in → dh_duty ("Standard (DHS)" | "Heavy Duty (DHM)") → dh_blade ("Notched (N)" | "Combo (C)") → dh_spacing_id
 
-Post Hole Digger (PD)
-  1) pd_model (PD25.21 | PD35.31 | PD95.51)
-  2) auger_id or auger_choice (REQUIRED)
+Tillers (DB/RT)
+  tiller_series ("DB" | "RT") → tiller_width_in → (RT only) tiller_rotation ("Forward" | "Reverse") → tiller_choice_id
 
-Tillers (DB/RT/RTR)
-  1) tiller_series ("DB" | "RT")
-  2) tiller_width_in
-  3) For RT only: tiller_rotation ("Forward" | "Reverse")
-  4) tiller_choice_id or tiller_choice
+Bale Spear / Pallet Fork / Quick Hitch / Stump Grinder
+  choose by part ID via choices; use hydraulics_id for stump grinder.
 
-Bale Spear
-  1) bspear_choice_id or bspear_choice
-
-Pallet Fork
-  1) pf_choice_id or pf_choice
-
-Quick Hitch
-  1) qh_choice_id or qh_choice
-
-Stump Grinder (TSG)
-  1) hydraulics_id or hydraulics_choice
-
-General:
-- If /quote returns required_questions, ALWAYS use those names/choices next; do not use the family tree step.
-- If a driveline question has no choices, present: 540 RPM, 1000 RPM.
-- If the user requests an accessory or option, call /quote with accessory_id or accessory_desc; add as separate line if priced.
+If a driveline question has no choices, present: 540 RPM, 1000 RPM.
+If a user requests an accessory, call /quote with accessory params; add as separate line if priced; otherwise escalate.
 """
 
 SYSTEM_PROMPT = KNOWLEDGE + "\n\n--- FAMILY TREE GUIDE ---\n" + FAMILY_TREE_GUIDE
 
-# ---------------- One tool definition ----------------
+# ---------------- Tool schema (for the LLM) ----------------
 TOOLS = [
     {
         "type": "function",
@@ -226,32 +209,31 @@ TOOLS = [
     }
 ]
 
-# ---------------- HTTP executor with retry ----------------
+# ---------------- HTTP executor with retry (tool impl) ----------------
 def woods_http_get(path: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], int, str]:
     url = f"{QUOTE_API_BASE}{path}"
     tries, last_exc = 0, None
-    while tries < 2:
+    while tries < RETRY_ATTEMPTS:
         try:
-            r = requests.get(url, params=params, timeout=30)
-            status = r.status_code
-            ctype = r.headers.get("content-type", "")
-            if "application/json" in (ctype or "").lower():
-                return r.json(), status, r.url
-            return {"raw_text": r.text}, status, r.url
+            r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+            ctype = (r.headers.get("content-type") or "").lower()
+            body = r.json() if "application/json" in ctype else {"raw_text": r.text}
+            return body, r.status_code, r.url
         except Exception as e:
             last_exc = e
             tries += 1
-            if tries >= 2:
+            if tries >= RETRY_ATTEMPTS:
                 break
             time.sleep(0.35)
-    logging.error("woods_http_get failed %s params=%s error=%s", url, params, last_exc)
-    return {"raw_text": str(last_exc)}, 599, url
+    log.error("woods_http_get failed %s params=%s error=%s", url, params, last_exc)
+    return {"error": str(last_exc)}, 599, url
 
-# ---------------- AI loop (persists tool calls/results in history) ----------------
+# ---------------- Planner loop (LLM + tools) ----------------
 def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
     if not client:
         return "Planner unavailable (missing OPENAI_API_KEY).", messages
 
+    # initial step
     completion = client.chat.completions.create(
         model=OPENAI_MODEL,
         temperature=0.2,
@@ -262,6 +244,7 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
 
     loop_guard = 0
     history = messages[:]
+
     while True:
         loop_guard += 1
         if loop_guard > 8:
@@ -272,10 +255,11 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
         tool_calls = getattr(choice, "tool_calls", None)
 
         if not tool_calls:
+            # assistant responded directly
             history.append({"role": "assistant", "content": choice.content or ""})
             return (choice.content or ""), history
 
-        # Log the assistant message that invoked tools
+        # record the assistant message that invoked tools
         assistant_msg = {
             "role": "assistant",
             "content": choice.content or "",
@@ -289,15 +273,15 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
             })
         history.append(assistant_msg)
 
-        # Execute each tool call and append its result
+        # execute each tool call and append its result
         for tc in tool_calls:
             fn = tc.function.name
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except Exception:
                 args = {}
-            result = {"ok": False, "status": 0, "url": "", "body": {}}
 
+            result = {"ok": False, "status": 0, "url": "", "body": {}}
             if fn == "http_get":
                 path = args.get("path") or ""
                 params = args.get("params") or {}
@@ -313,7 +297,7 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
                 "content": json.dumps(result),
             })
 
-        # Ask the model to continue after seeing tool results
+        # continue the loop by giving the model the new tool results
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0.2,
@@ -331,21 +315,26 @@ def chat():
         if not user_message:
             return jsonify({"error": "Missing message"}), 400
 
-        session_id = request.headers.get("X-Session-Id") or data.get("session_id") or f"anon-{int(time.time()*1000)}"
-        sess = SESSIONS.setdefault(session_id, {})
+        # GC expired sessions
+        now = time.time()
+        to_del = [sid for sid, s in SESSIONS.items() if (now - s.get("updated_at", now)) > SESSION_TTL_SECONDS]
+        for sid in to_del:
+            SESSIONS.pop(sid, None)
 
-        # Seed system message once
-        convo: List[Dict[str, Any]] = sess.get("messages") or [{"role": "system", "content": SYSTEM_PROMPT}]
+        session_id = request.headers.get("X-Session-Id") or data.get("session_id") or f"anon-{int(now*1000)}"
+        sess = SESSIONS.setdefault(session_id, {"messages": [{"role": "system", "content": SYSTEM_PROMPT}]})
+        sess["updated_at"] = now
 
-        # Append user turn and run AI
+        # append user turn
+        convo: List[Dict[str, Any]] = list(sess["messages"])
         convo.append({"role": "user", "content": user_message})
+
+        # run the planner
         reply_text, updated_history = run_ai(convo)
 
-        # Persist the full updated history (so tool results are remembered)
-        # Optionally trim to avoid unlimited growth
+        # keep history (first system + last 79 messages)
         MAX_KEEP = 80
         if len(updated_history) > MAX_KEEP:
-            # keep first system + last N-1
             head = updated_history[0:1] if updated_history and updated_history[0].get("role") == "system" else []
             updated_history = head + updated_history[-(MAX_KEEP - len(head)):]
         sess["messages"] = updated_history
