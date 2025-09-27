@@ -1,10 +1,10 @@
-# app.py — Actions backend (full knowledge, dealer auto‑attach, robust planner fallback)
+# app.py — Actions backend (full knowledge, dealer auto-attach, robust planner fallback)
 # - Tools: woods_dealer_discount, woods_quote, woods_health (HTTP proxy to YOUR API)
-# - Free‑will LLM (rules live in system prompt)
-# - Dealer number is cached per session and auto‑attached to every woods_quote call if the model forgets
+# - Free-will LLM (rules live in system prompt)
+# - Dealer number is cached per session and auto-attached to every woods_quote call if the model forgets
 # - Normalizes exact model tokens (e.g., "bw12.40" → model=BW12.40)
 # - Optional header X-Dealer-Number lets your frontend pass the dealer on every turn as a safety net
-# - Graceful when OPENAI_API_KEY is missing: auto‑triggers still run, no crashes
+# - Graceful when OPENAI_API_KEY is missing: auto-triggers still run, no crashes
 # - Exposes POST /chat and GET /health (point your site to https://woods-quote-backend.onrender.com/chat)
 #
 # Env (optional):
@@ -211,7 +211,7 @@ Landscape Rake (LRS)
 - lrs_width_in → lrs_grade ["Standard", "Premium (P)"] if both exist → lrs_choice_id/lrs_choice
 
 Rear Blade (RB)
-- rb_width_in → rb_duty ["Standard", "Standard (Premium P)", "Heavy Duty", "Extreme Duty"] → rb_choice_id/lrs_choice
+- rb_width_in → rb_duty ["Standard", "Standard (Premium P)", "Heavy Duty", "Extreme Duty"] → rb_choice_id/rb_choice
 
 Post Hole Digger (PD)
 - pd_model (PD25.21 / PD35.31 / PD95.51) → auger_id (required) or auger_choice (fallback)
@@ -232,11 +232,11 @@ If a driveline question has no choices, present: 540 RPM and 1000 RPM.
 OPENAPI_HINT = f"""
 Endpoints (used via tools):
 - woods_dealer_discount(dealer_number) -> GET {QUOTE_API_BASE}/dealer-discount
-- woods_quote({...params...}) -> GET {QUOTE_API_BASE}/quote
+- woods_quote({{...params...}}) -> GET {QUOTE_API_BASE}/quote
 - woods_health() -> GET {QUOTE_API_BASE}/health
 
 Behavior:
-- Always include dealer_number on quotes (server auto‑attaches the known dealer if you forget).
+- Always include dealer_number on quotes (server auto-attaches the known dealer if you forget).
 - Ask exactly one configuration question at a time with lettered options.
 - Never say “API says…”. Present results as system output.
 """
@@ -277,7 +277,7 @@ TOOLS = [
     {"type": "function", "function": {"name": "woods_health", "description": "API health check", "parameters": {"type": "object"}}},
 ]
 
-# ---------- Tool implementations (dealer auto‑attach) ----------
+# ---------- Tool implementations (dealer auto-attach) ----------
 def tool_woods_dealer_discount(sess: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
     dealer_number = str(args.get("dealer_number") or "").strip()
     body, status, used = http_get("/dealer-discount", {"dealer_number": dealer_number})
@@ -324,7 +324,7 @@ def normalize_model_arg(text: str) -> Dict[str, Any]:
 # ---------- Planner helpers ----------
 def model_completion(messages: List[Dict[str, Any]]):
     if not client:
-        # No planner available — behave like a no‑op: return object with no tool calls
+        # No planner available — behave like a no-op: return object with no tool calls
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="", tool_calls=None))])
     return client.chat.completions.create(
         model=OPENAI_MODEL, temperature=0.2, messages=messages, tools=TOOLS, tool_choice="auto",
@@ -357,7 +357,7 @@ def chat():
         # Build conversation copy
         convo: List[Dict[str, Any]] = list(sess['messages'])
 
-        # Auto‑triggers BEFORE appending the user message
+        # Auto-triggers BEFORE appending the user message
         # A) Detect dealer in the message → dealer lookup
         m = DEALER_RE.search(user_message)
         if m:
@@ -366,28 +366,30 @@ def chat():
             # inject tool call/result so model sees the context
             call_id = f"woods_dealer_discount-{int(now*1000)}"
             convo.append({"role": "assistant", "content": None, "tool_calls": [{
-                "id": call_id, "type": "function", "function": {"name": "woods_dealer_discount", "arguments": json.dumps({"dealer_number": dn})}
+                "id": call_id, "type": "function",
+                "function": {"name": "woods_dealer_discount", "arguments": json.dumps({"dealer_number": dn})}
             }]})
             convo.append({"role": "tool", "tool_call_id": call_id, "name": "woods_dealer_discount", "content": json.dumps(result)})
 
-        # B) Quote intent → woods_quote (dealer auto‑attach in tool)
+        # B) Quote intent → woods_quote (dealer auto-attach in tool)
         if has_quote_intent(user_message):
             args: Dict[str, Any] = normalize_model_arg(user_message) or {"q": user_message}
             result = tool_woods_quote(sess, args)
             call_id = f"woods_quote-{int(now*1000)}"
             convo.append({"role": "assistant", "content": None, "tool_calls": [{
-                "id": call_id, "type": "function", "function": {"name": "woods_quote", "arguments": json.dumps(args)}
+                "id": call_id, "type": "function",
+                "function": {"name": "woods_quote", "arguments": json.dumps(args)}
             }]})
             convo.append({"role": "tool", "tool_call_id": call_id, "name": "woods_quote", "content": json.dumps(result)})
 
         # Append user message
         convo.append({"role": "user", "content": user_message})
 
-        # Planner step (can be no‑op if no OPENAI_API_KEY)
+        # Planner step (can be no-op if no OPENAI_API_KEY)
         completion = model_completion(convo)
         choice = completion.choices[0].message
         if getattr(choice, 'tool_calls', None):
-            # Execute any model‑requested tools now (rare, since we pre‑fetched)
+            # Execute any model-requested tools now (rare, since we pre-fetched)
             assistant_msg = {"role": "assistant", "content": choice.content or "", "tool_calls": []}
             for tc in choice.tool_calls:
                 assistant_msg["tool_calls"].append({
@@ -425,7 +427,7 @@ def chat():
         MAX_KEEP = 80
         if len(convo) > MAX_KEEP:
             head = convo[0:1] if convo and convo[0].get('role') == 'system' else []
-            convo = head + convo[-(MAX_KEEP - len(head)) : ]
+            convo = head + convo[-(MAX_KEEP - len(head)) :]
         sess['messages'] = convo
 
         return jsonify({"reply": reply_text})
