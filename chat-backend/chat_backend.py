@@ -1,9 +1,8 @@
-# app.py — AI-first Woods quoting backend (single file)
-# Behavior:
-# - The LLM plans freely and calls ONE tool: http_get (/dealer-discount, /quote, /health).
-# - Your business rules + family-tree guidance are in the system prompt (no rigid backend logic).
-# - Session memory persists the full message + tool history (so the model remembers config steps).
-# - Minimal guardrails: connector retry in the tool; everything else is guided by the prompt.
+# app.py — AI-first Woods quoting backend (less strict, GPT-driven)
+# - Mirrors your previous file’s shape (Flask, sessions, http_get tool, OpenAI planner)
+# - Minimal guardrails; the model has “free will” guided by your knowledge + family trees
+# - One tool: http_get -> GET /dealer-discount, /quote, /health (with retry)
+# - Sessions persist full message + tool history; model remembers config Q&A per session
 #
 # Endpoints:
 #   POST /chat   {"session_id":"<id>","message":"<text>"} -> {"reply": "..."}
@@ -11,9 +10,10 @@
 #
 # Env:
 #   QUOTE_API_BASE (default: https://woods-quote-tool.onrender.com)
-#   OPENAI_API_KEY (optional; if omitted, planner is disabled)
+#   OPENAI_API_KEY (optional; if omitted, planner is disabled and you’ll get a fallback message)
 #   OPENAI_MODEL   (default: gpt-4o-mini)
-#   ALLOWED_ORIGINS (CSV, optional CORS for /chat)
+#   ALLOWED_ORIGINS (CSV, optional CORS whitelist for /chat)
+#   SYSTEM_PROMPT_APPEND (optional text appended to the system prompt)
 #
 # Run:
 #   pip install flask flask-cors requests openai
@@ -42,6 +42,7 @@ log = logging.getLogger("woods-ai")
 # ---------------- OpenAI client (optional) ----------------
 client = None
 try:
+    # Modern SDK
     from openai import OpenAI
     if os.environ.get("OPENAI_API_KEY"):
         client = OpenAI()
@@ -57,15 +58,16 @@ if CORS:
     else:
         CORS(app, supports_credentials=False)
 
-# ---------------- Sessions (memory) ----------------
+# ---------------- Sessions (simple in-memory) ----------------
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 SESSION_TTL_SECONDS = 60 * 60 * 12  # 12h
 
-# ---------------- System knowledge (from your spec) ----------------
+# ---------------- Knowledge & Family Trees (model-guided) ----------------
 KNOWLEDGE = r"""
-You are a quoting assistant for Woods Equipment dealership staff. Your primary job is to retrieve part numbers, list prices, dealer discounts, and configuration requirements exclusively from the Woods Pricing API. You never fabricate data, never infer pricing, and only ask configuration questions when required.
+You are a quoting assistant for Woods Equipment dealership staff. Your primary job is to retrieve part numbers,
+list prices, dealer discounts, and configuration requirements exclusively from the Woods Pricing API. You never
+fabricate data, never infer pricing, and only ask configuration questions when required.
 
----
 Core Rules
 - A dealer number is required before quoting. Use the Pricing API to look up the dealer’s discount. Do not begin quotes or give pricing without it.
 - Dealer numbers may be remembered within a session and across multiple quotes for the same user unless the dealer provides a new number.
@@ -79,10 +81,10 @@ API Error Handling
 - If retry fails, show: “There was a system error while retrieving data. Please try again shortly. If the issue persists, escalate to Benjamin Luci at 615-516-8802.”
 
 Pricing Logic
-1. Retrieve list price for each part number from API
-2. Apply dealer discount from lookup
-3. Unless the dealer discount is exactly 5%, apply an additional 12% cash discount
-4. Format quote as plain text, customer-ready
+1) Retrieve list price for each part number from API
+2) Apply dealer discount from lookup
+3) Unless the dealer discount is exactly 5%, apply an additional 12% cash discount
+4) Format quote as plain text, customer-ready
 ⚠️ Cash discount must always be applied unless dealer discount is exactly 5%. Never skip this.
 
 Quote Output Format
@@ -114,17 +116,14 @@ Accessory Handling
 Interaction Style
 - Ask one config question at a time
 - Never combine multiple questions into a single message
-- Format multiple options as lettered vertical lists:
-  A. ...
-  B. ...
-  C. ...
+- Format multiple options as lettered vertical lists (A., B., C., …)
 - Wait for user response before proceeding
 
 Box Scraper Correction
 - Valid widths: 48 in (4 ft), 60 in (5 ft), 72 in (6 ft), 84 in (7 ft)
 
 Disc Harrow Fix
-- If API returns the same required spacing prompt repeatedly:
+- If the system repeatedly requires disc spacing for the same selection:
   - Detect the loop
   - Stop quoting
   - Say: “The system is stuck on a required disc spacing selection. Please escalate to Benjamin Luci at 615-516-8802.”
@@ -136,8 +135,8 @@ Correction Enforcement
 - If cash discount is missing from final output, quote is invalid and must be corrected
 """
 
-FAMILY_TREE_GUIDE = r"""
-Use this only to clarify choices when /quote doesn’t already ask. Ask EXACTLY one question at a time.
+FAMILY_TREE = r"""
+Use this guide only when /quote does not already ask. Ask exactly one question at a time.
 
 BrushFighter
   width_ft (5/6/7) → bf_choice_id or bf_choice → optional drive ("Slip Clutch" | "Shear Pin")
@@ -184,12 +183,12 @@ Bale Spear / Pallet Fork / Quick Hitch / Stump Grinder
   choose by part ID via choices; use hydraulics_id for stump grinder.
 
 If a driveline question has no choices, present: 540 RPM, 1000 RPM.
-If a user requests an accessory, call /quote with accessory params; add as separate line if priced; otherwise escalate.
 """
 
-SYSTEM_PROMPT = KNOWLEDGE + "\n\n--- FAMILY TREE GUIDE ---\n" + FAMILY_TREE_GUIDE
+SYSTEM_PROMPT = KNOWLEDGE + "\n\n--- FAMILY TREE GUIDE ---\n" + FAMILY_TREE + \
+                ("\n\n" + os.environ["SYSTEM_PROMPT_APPEND"] if os.environ.get("SYSTEM_PROMPT_APPEND") else "")
 
-# ---------------- Tool schema (for the LLM) ----------------
+# ---------------- Tools schema (for the LLM) ----------------
 TOOLS = [
     {
         "type": "function",
@@ -230,20 +229,20 @@ def woods_http_get(path: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], i
 
 # ---------------- Planner loop (LLM + tools) ----------------
 def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+    """Return assistant text and updated message history."""
     if not client:
         return "Planner unavailable (missing OPENAI_API_KEY).", messages
 
-    # initial step
     completion = client.chat.completions.create(
         model=OPENAI_MODEL,
-        temperature=0.2,
+        temperature=0.2,          # light creativity; 'free will' but consistent
         messages=messages,
         tools=TOOLS,
         tool_choice="auto",
     )
 
-    loop_guard = 0
     history = messages[:]
+    loop_guard = 0
 
     while True:
         loop_guard += 1
@@ -251,19 +250,19 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
             history.append({"role": "assistant", "content": "Tool loop exceeded. Please try again."})
             return "Tool loop exceeded. Please try again.", history
 
-        choice = completion.choices[0].message
-        tool_calls = getattr(choice, "tool_calls", None)
+        msg = completion.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None)
 
         if not tool_calls:
-            # assistant responded directly
-            history.append({"role": "assistant", "content": choice.content or ""})
-            return (choice.content or ""), history
+            # assistant text reply
+            history.append({"role": "assistant", "content": msg.content or ""})
+            return msg.content or "", history
 
-        # record the assistant message that invoked tools
+        # record assistant tool invocations
         assistant_msg = {
             "role": "assistant",
-            "content": choice.content or "",
-            "tool_calls": []
+            "content": msg.content or "",
+            "tool_calls": [],
         }
         for tc in tool_calls:
             assistant_msg["tool_calls"].append({
@@ -273,15 +272,15 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
             })
         history.append(assistant_msg)
 
-        # execute each tool call and append its result
+        # execute each tool call and append results
         for tc in tool_calls:
             fn = tc.function.name
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except Exception:
                 args = {}
-
             result = {"ok": False, "status": 0, "url": "", "body": {}}
+
             if fn == "http_get":
                 path = args.get("path") or ""
                 params = args.get("params") or {}
@@ -297,7 +296,7 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
                 "content": json.dumps(result),
             })
 
-        # continue the loop by giving the model the new tool results
+        # next step with new tool results
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0.2,
@@ -332,7 +331,7 @@ def chat():
         # run the planner
         reply_text, updated_history = run_ai(convo)
 
-        # keep history (first system + last 79 messages)
+        # keep history compact (preserve the system prompt; otherwise cap ~80 messages)
         MAX_KEEP = 80
         if len(updated_history) > MAX_KEEP:
             head = updated_history[0:1] if updated_history and updated_history[0].get("role") == "system" else []
