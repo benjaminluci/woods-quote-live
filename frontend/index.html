@@ -47,10 +47,12 @@
 
   <script>
     // ====== CONFIG ======
-    // Backend that exposes POST /chat and GET /health
-    // If your frontend and backend share a domain, set CHAT_BACKEND = '/chat'
-    const CHAT_BACKEND   = 'https://woodsequipment-quote.onrender.com/chat';
-    const HEALTH_BACKEND = CHAT_BACKEND.replace(/\/chat$/, '/health');
+    // If frontend and backend are the SAME service, prefer relative:
+    const CHAT_BACKEND   = '/chat';
+    const HEALTH_BACKEND = '/health';
+    // If they’re different services, use absolute URLs instead:
+    // const CHAT_BACKEND   = 'https://woodsequipment-quote.onrender.com/chat';
+    // const HEALTH_BACKEND = 'https://woodsequipment-quote.onrender.com/health';
 
     // ====== ELEMENTS ======
     const chat  = document.getElementById('chat');
@@ -135,21 +137,42 @@
       return lines.join('\n');
     }
 
+    async function parseSafeJSON(response) {
+      // Try JSON first when content-type says JSON; otherwise try text, then JSON parse, then fallback
+      const ct = (response.headers.get('content-type') || '').toLowerCase();
+      try {
+        if (ct.includes('application/json')) {
+          return await response.json();
+        } else {
+          const txt = await response.text();
+          try {
+            return JSON.parse(txt);
+          } catch {
+            return { reply: txt || '', _status: response.status, _contentType: ct };
+          }
+        }
+      } catch {
+        // No body or invalid JSON
+        const txt = await response.text().catch(() => '');
+        return { reply: txt || '', _status: response.status, _contentType: ct };
+      }
+    }
+
     // ====== Warm-up & header info ======
     async function warmUp() {
       try {
         const r = await fetch(HEALTH_BACKEND, { method: 'GET', cache: 'no-store' });
-        const h = await r.json().catch(() => ({}));
-        const host = new URL(CHAT_BACKEND, location.href).host;
+        const h = await parseSafeJSON(r);
+        const host = location.host;
         const sidShort = sessionId.slice(0, 8);
         env.textContent = `session ${sidShort} · ${host} · model: ${h.model ?? 'n/a'}`;
       } catch {
-        const host = new URL(CHAT_BACKEND, location.href).host;
+        const host = location.host;
         const sidShort = sessionId.slice(0, 8);
         env.textContent = `session ${sidShort} · ${host} · (health unavailable)`;
       }
     }
-    warmUp(); // fire-and-forget
+    warmUp();
 
     // ====== Send message ======
     async function send() {
@@ -170,43 +193,41 @@
           },
           body: JSON.stringify({ message: text })
         });
-        const data = await r.json();
 
+        const data = await parseSafeJSON(r);
         thinking.remove();
 
-        // Primary AI text
+        // Build human reply
         let reply = typeof data?.reply === 'string' ? sanitizeReply(data.reply) : '';
-
-        // Fallbacks: if reply is empty or looked JSON-ish, prefer pending question or a friendly message
         if (!reply) {
-          if (data?.pending) {
+          if (data?._status && data._status !== 200) {
+            reply = `Server returned ${data._status}. Please try again in a moment.`;
+          } else if (data?.pending) {
             reply = formatPendingLettered(data.pending);
-          } else if (typeof data?.action_error === 'string' && data.action_error) {
-            reply = "There was a system error while retrieving data. Please try again shortly. If the issue persists, escalate to Benjamin Luci at 615-516-8802.";
+          } else if (data && typeof data === 'object') {
+            // last resort: show something readable
+            const txt = data._contentType ? `(non-JSON ${data._contentType})` : '(no content)';
+            reply = `I didn't receive readable data from the server ${txt}. Please try again.`;
           } else {
-            reply = "Okay.";
+            reply = 'Okay.';
           }
         }
 
         add(reply, 'bot');
 
-        // Render choice pills if a follow-up question exists
+        // Choice pills for follow-up questions
         if (data?.pending?.choices?.length) {
           addChoicePills(data.pending);
         }
 
-        // Optionally surface raw quote data in a collapsible block
+        // Optional: show raw quote data
         if (data?.quote) {
           addDetails(data.quote, 'Quote details');
         }
 
-        // Nudge warm-up on connector errors
-        if (typeof data?.reply === 'string' && data.reply.includes('system error while retrieving data')) {
-          warmUp();
-        }
       } catch (e) {
         thinking.remove();
-        add('Error: ' + (e?.message || e), 'bot');
+        add('Network error. Please try again.', 'bot');
       } finally {
         setBusy(false);
         inp.focus();
@@ -229,12 +250,12 @@
           },
           body: JSON.stringify({ message: 'Ben Luci reset' })
         });
-        const data = await r.json();
+        const data = await parseSafeJSON(r);
         thinking.remove();
-        add(typeof data?.reply === 'string' ? data.reply : '✅ Session reset.', 'bot');
-        // Keep the same local sessionId; backend clears server-side state
-      } catch (e) {
-        add('Reset failed: ' + (e?.message || e), 'bot');
+        const msg = typeof data?.reply === 'string' && data.reply ? data.reply : '✅ Session reset.';
+        add(msg, 'bot');
+      } catch {
+        add('Reset failed. Please try again.', 'bot');
       } finally {
         if (!wasBusy) setBusy(false);
       }
