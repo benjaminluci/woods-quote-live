@@ -7,19 +7,16 @@
   <style>
     html,body { height:100%; margin:0; }
     body { font-family: system-ui, Arial, sans-serif; background:#f6f7f9; display:flex; flex-direction:column; }
-    header { padding:12px 16px; background:#111827; color:#fff; display:flex; align-items:center; gap:12px; }
+    header { padding:12px 16px; background:#111827; color:#fff; display:flex; align-items:center; justify-content:space-between; gap:12px; }
     header small { opacity:.8; font-size:.8rem; }
     #chat { flex:1; overflow:auto; padding:16px; }
     .msg { max-width: 720px; margin: 8px auto; padding: 12px 14px; border-radius: 12px; white-space: pre-wrap; line-height: 1.45; }
     .user { background:#2563eb; color:#fff; margin-left:auto; }
     .bot { background:#fff; border:1px solid #e5e7eb; margin-right:auto; }
     footer { display:flex; gap:8px; padding:12px; background:#fff; border-top:1px solid #e5e7eb; position:sticky; bottom:0; }
-    input { flex:1; padding:10px 12px; border-radius:10px; border:1px solid #cbd5e1; outline:none; }
-    input:focus { border-color:#111827; }
-    button { padding:10px 14px; border-radius:10px; border:1px solid #111827; background:#111827; color:#fff; cursor:pointer; }
-    button:disabled { opacity:.6; cursor:not-allowed; }
-    .row { display:flex; align-items:center; gap:10px; }
-    .pill { background:#fff; color:#111827; border:1px solid #e5e7eb; padding:4px 8px; border-radius:999px; font-size:.75rem; }
+    input { flex:1; font-size:16px; padding:10px 12px; border:1px solid #d1d5db; border-radius:10px; outline:none; }
+    button { padding:10px 14px; border:none; border-radius:10px; background:#111827; color:#fff; cursor:pointer; }
+    button[disabled] { opacity:.6; cursor:not-allowed; }
   </style>
 </head>
 <body>
@@ -27,7 +24,9 @@
     <div>Woods Quoting Assistant</div>
     <small id="env"></small>
   </header>
+
   <div id="chat" aria-live="polite"></div>
+
   <footer>
     <input id="inp" placeholder="Please Enter Dealer Number To Begin Quoting" autocomplete="off" />
     <button id="send">Send</button>
@@ -35,79 +34,94 @@
 
   <script>
     // ====== CONFIG ======
-    // Your AI bot endpoint (NOT the Woods Pricing API). This is the server that proxies tools to your app.py API.
-    const CHAT_BACKEND = 'https://woods-quote-backend.onrender.com/chat';
+    // Prefer same-origin. If your backend lives elsewhere, set window.CHAT_BACKEND = "https://your-domain/chat" before this script.
+    const CHAT_BACKEND  = (window.CHAT_BACKEND || '/chat');
     const HEALTH_BACKEND = CHAT_BACKEND.replace(/\/chat$/, '/health');
 
-    // ====== ELEMENTS ======
+    // ====== SESSION (PERSISTENT) ======
+    function getSessionId() {
+      const KEY = 'woods_sid';
+      let sid = localStorage.getItem(KEY);
+      if (!sid) {
+        sid = 'sid-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+        localStorage.setItem(KEY, sid);
+      }
+      return sid;
+    }
+    const SESSION_ID = getSessionId();
+
+    // ====== UI helpers ======
     const chat = document.getElementById('chat');
     const inp  = document.getElementById('inp');
     const btn  = document.getElementById('send');
     const env  = document.getElementById('env');
 
-    // ====== SESSION (sticky across page loads) ======
-    const SID_KEY = 'woods_sid';
-    let sessionId = localStorage.getItem(SID_KEY);
-    if (!sessionId) {
-      sessionId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
-      localStorage.setItem(SID_KEY, sessionId);
-    }
-
-    // Show quick env info in header for troubleshooting
-    env.textContent = `session: ${sessionId.slice(0,8)}… · backend: ${new URL(CHAT_BACKEND).host}`;
-
-    // ====== UI helpers ======
-    function add(text, who) {
+    function addMsg(text, who='bot') {
       const div = document.createElement('div');
-      div.className = `msg ${who}`;
+      div.className = 'msg ' + (who === 'user' ? 'user' : 'bot');
       div.textContent = text;
       chat.appendChild(div);
       chat.scrollTop = chat.scrollHeight;
+      return div;
     }
 
-    function setBusy(state) {
-      btn.disabled = state;
-      inp.disabled = state;
+    function setBusy(b) {
+      btn.disabled = b;
+      inp.disabled = b;
     }
 
-    // ====== Warm-up (pre-ping backend so upstream Render isn't sleepy) ======
-    async function warmUp() {
-      try { await fetch(HEALTH_BACKEND, { method: 'GET', cache: 'no-store' }); }
-      catch (_) { /* ignore */ }
+    // show small env hint (backend host + short SID)
+    try {
+      const a = document.createElement('a');
+      a.href = CHAT_BACKEND;
+      const shortSid = SESSION_ID.slice(0, 8);
+      env.textContent = `${a.origin || location.origin} · sid:${shortSid}`;
+    } catch {
+      env.textContent = `sid:${SESSION_ID.slice(0,8)}`;
     }
-    // fire and forget
-    warmUp();
 
-    // ====== Send message ======
+    // Optional: warm-up /health (non-blocking)
+    (async () => {
+      try {
+        const r = await fetch(HEALTH_BACKEND, { method: 'GET' });
+        // You could parse and show a ✔️/⚠️ here if you want
+      } catch {}
+    })();
+
+    // ====== SEND logic ======
     async function send() {
       const text = inp.value.trim();
       if (!text) return;
+
+      addMsg(text, 'user');
       inp.value = '';
-      add(text, 'user');
-      add('…', 'bot');
-      const thinking = chat.lastChild;
       setBusy(true);
 
       try {
-        const r = await fetch(CHAT_BACKEND, {
+        const res = await fetch(CHAT_BACKEND, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'X-Session-Id': sessionId  // CRITICAL: same session every turn
+            // >>> IMPORTANT: send the session ID in BOTH header and body <<<
+            'X-Session-Id': SESSION_ID
           },
-          body: JSON.stringify({ message: text })
+          body: JSON.stringify({
+            session_id: SESSION_ID,
+            message: text
+          })
         });
-        const data = await r.json();
-        thinking.remove();
-        add((data && data.reply) ? data.reply : JSON.stringify(data, null, 2), 'bot');
 
-        // If we hit a connector error on the first real quote, try warming again silently.
-        if (typeof data?.reply === 'string' && data.reply.includes('system error while retrieving data')) {
-          warmUp();
-        }
+        const data = await res.json().catch(() => ({}));
+        const reply = (data && (data.reply || data.error)) || 'Sorry, no response.';
+        addMsg(reply, 'bot');
+
+        // If your backend returns a dealer badge, you can show it here:
+        // if (data && data.dealer && (data.dealer.dealer_number || data.dealer.dealer_name)) {
+        //   env.textContent = `${env.textContent.split(' · ')[0]} · ${data.dealer.dealer_name || ''} #${data.dealer.dealer_number || ''}`.trim();
+        // }
+
       } catch (e) {
-        thinking.remove();
-        add('Error: ' + (e?.message || e), 'bot');
+        addMsg('Network error. Please try again in a moment.', 'bot');
       } finally {
         setBusy(false);
         inp.focus();
@@ -122,4 +136,3 @@
   </script>
 </body>
 </html>
-
