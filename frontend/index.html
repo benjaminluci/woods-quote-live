@@ -6,57 +6,44 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     html,body { height:100%; margin:0; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#f6f7f9; display:flex; flex-direction:column; }
-    header { padding:12px 16px; background:#111827; color:#fff; display:flex; align-items:center; gap:12px; justify-content:space-between; }
-    header .left { display:flex; align-items:center; gap:12px; }
+    body { font-family: system-ui, Arial, sans-serif; background:#f6f7f9; display:flex; flex-direction:column; }
+    header { padding:12px 16px; background:#111827; color:#fff; display:flex; align-items:center; gap:12px; }
     header small { opacity:.8; font-size:.8rem; }
     #chat { flex:1; overflow:auto; padding:16px; }
-    .msg { max-width: 720px; margin: 8px auto; padding: 12px 14px; border-radius: 12px; white-space: pre-wrap; line-height: 1.45; word-break: break-word; }
+    .msg { max-width: 720px; margin: 8px auto; padding: 12px 14px; border-radius: 12px; white-space: pre-wrap; line-height: 1.45; }
     .user { background:#2563eb; color:#fff; margin-left:auto; }
-    .bot  { background:#fff; border:1px solid #e5e7eb; margin-right:auto; }
+    .bot { background:#fff; border:1px solid #e5e7eb; margin-right:auto; }
     footer { display:flex; gap:8px; padding:12px; background:#fff; border-top:1px solid #e5e7eb; position:sticky; bottom:0; }
-    input  { flex:1; padding:10px 12px; border-radius:10px; border:1px solid #cbd5e1; outline:none; }
+    input { flex:1; padding:10px 12px; border-radius:10px; border:1px solid #cbd5e1; outline:none; }
     input:focus { border-color:#111827; }
     button { padding:10px 14px; border-radius:10px; border:1px solid #111827; background:#111827; color:#fff; cursor:pointer; }
-    button.secondary { background:#fff; color:#111827; }
     button:disabled { opacity:.6; cursor:not-allowed; }
-    .row { display:flex; align-items:center; gap:10px; max-width:720px; margin: 4px auto 12px; flex-wrap:wrap; }
-    .pill { background:#fff; color:#111827; border:1px solid #e5e7eb; padding:6px 10px; border-radius:999px; font-size:.8rem; cursor:pointer; }
-    details { max-width:720px; margin: 8px auto; background:#fff; border:1px solid #e5e7eb; border-radius:12px; }
-    details > summary { cursor:pointer; padding:10px 14px; outline:none; }
-    details pre { margin:0; padding:12px 14px; overflow:auto; border-top:1px solid #e5e7eb; white-space:pre-wrap; word-break:break-word; }
+    .row { display:flex; align-items:center; gap:10px; }
+    .pill { background:#fff; color:#111827; border:1px solid #e5e7eb; padding:4px 8px; border-radius:999px; font-size:.75rem; }
   </style>
 </head>
 <body>
   <header>
-    <div class="left">
-      <div>Woods Quoting Assistant</div>
-      <small id="env">checking backend…</small>
-    </div>
-    <div class="right">
-      <button id="reset" class="secondary" title="Reset session">Reset</button>
-    </div>
+    <div>Woods Quoting Assistant</div>
+    <small id="env"></small>
   </header>
-
   <div id="chat" aria-live="polite"></div>
-
   <footer>
-    <input id="inp" placeholder="Please Enter Dealer Number To Begin Quoting" autocomplete="off" />
+    <input id="inp" placeholder="Please Enter Dealer Number To Begin Quo" autocomplete="off" />
     <button id="send">Send</button>
   </footer>
 
   <script>
-    // ====== CONFIG (hard-coded backend) ======
-    const CHAT_BASE      = 'https://woods-quote-backend.onrender.com';
-    const CHAT_BACKEND   = CHAT_BASE + '/chat';
-    const HEALTH_BACKEND = CHAT_BASE + '/health';
+    // ====== CONFIG ======
+    // Your AI bot endpoint (NOT the Woods Pricing API). This is the server that proxies tools to your app.py API.
+    const CHAT_BACKEND = 'https://woods-quote-backend.onrender.com/chat';
+    const HEALTH_BACKEND = CHAT_BACKEND.replace(/\/chat$/, '/health');
 
     // ====== ELEMENTS ======
-    const chat  = document.getElementById('chat');
-    const inp   = document.getElementById('inp');
-    const btn   = document.getElementById('send');
-    const env   = document.getElementById('env');
-    const reset = document.getElementById('reset');
+    const chat = document.getElementById('chat');
+    const inp  = document.getElementById('inp');
+    const btn  = document.getElementById('send');
+    const env  = document.getElementById('env');
 
     // ====== SESSION (sticky across page loads) ======
     const SID_KEY = 'woods_sid';
@@ -65,6 +52,9 @@
       sessionId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
       localStorage.setItem(SID_KEY, sessionId);
     }
+
+    // Show quick env info in header for troubleshooting
+    env.textContent = `session: ${sessionId.slice(0,8)}… · backend: ${new URL(CHAT_BACKEND).host}`;
 
     // ====== UI helpers ======
     function add(text, who) {
@@ -75,103 +65,17 @@
       chat.scrollTop = chat.scrollHeight;
     }
 
-    function addDetails(obj, label = 'Quote details') {
-      if (!obj) return;
-      const det = document.createElement('details');
-      const sum = document.createElement('summary');
-      sum.textContent = label;
-      const pre = document.createElement('pre');
-      pre.textContent = JSON.stringify(obj, null, 2);
-      det.appendChild(sum);
-      det.appendChild(pre);
-      chat.appendChild(det);
-      chat.scrollTop = chat.scrollHeight;
-    }
-
-    function addChoicePills(pending) {
-      if (!pending?.choices?.length) return;
-      const row = document.createElement('div');
-      row.className = 'row';
-      for (const c of pending.choices) {
-        const b = document.createElement('button');
-        b.className = 'pill';
-        b.textContent = c.letter;
-        b.addEventListener('click', () => {
-          inp.value = c.letter;
-          btn.click();
-        });
-        row.appendChild(b);
-      }
-      chat.appendChild(row);
-      chat.scrollTop = chat.scrollHeight;
-    }
-
     function setBusy(state) {
       btn.disabled = state;
       inp.disabled = state;
-      reset.disabled = state;
     }
 
-    function looksJsonish(text) {
-      if (typeof text !== 'string') return false;
-      const t = text.trim();
-      return t.startsWith('{') || t.startsWith('[') || /```json/i.test(t);
-    }
-
-    function sanitizeReply(text) {
-      if (typeof text !== 'string') return '';
-      let out = text.replace(/```json[\s\S]*?```/gi, '').trim();
-      if (looksJsonish(out)) out = '';
-      return out;
-    }
-
-    function formatPendingLettered(pending) {
-      if (!pending || !Array.isArray(pending.choices)) return '';
-      const lines = [pending.question || 'Please select an option:', ''];
-      for (const c of pending.choices) lines.push(`${c.letter}. ${c.label}`);
-      return lines.join('\n');
-    }
-
-    async function parseSafeJSON(response) {
-      const ct = (response.headers.get('content-type') || '').toLowerCase();
-      try {
-        if (ct.includes('application/json')) {
-          const txt = await response.clone().text();
-          if (!txt) return {};
-          return JSON.parse(txt);
-        } else {
-          const txt = await response.text();
-          try { return JSON.parse(txt); }
-          catch { return { reply: txt || '', _status: response.status, _contentType: ct }; }
-        }
-      } catch {
-        try {
-          const txt = await response.text();
-          return { reply: txt || '', _status: response.status, _contentType: ct };
-        } catch {
-          return { reply: '', _status: response.status, _contentType: ct };
-        }
-      }
-    }
-
-    function cacheBust(url) {
-      const u = new URL(url);
-      u.searchParams.set('ts', Date.now().toString());
-      return u.toString();
-    }
-
-    // ====== Warm-up & header info ======
+    // ====== Warm-up (pre-ping backend so upstream Render isn't sleepy) ======
     async function warmUp() {
-      try {
-        const r = await fetch(cacheBust(HEALTH_BACKEND), { method: 'GET', cache: 'no-store' });
-        const h = await parseSafeJSON(r);
-        const sidShort = sessionId.slice(0, 8);
-        env.textContent = `session ${sidShort} · model: ${h.model ?? 'n/a'}`;
-      } catch {
-        const sidShort = sessionId.slice(0, 8);
-        env.textContent = `session ${sidShort} · (health unavailable)`;
-      }
+      try { await fetch(HEALTH_BACKEND, { method: 'GET', cache: 'no-store' }); }
+      catch (_) { /* ignore */ }
     }
+    // fire and forget
     warmUp();
 
     // ====== Send message ======
@@ -185,79 +89,35 @@
       setBusy(true);
 
       try {
-        const r = await fetch(cacheBust(CHAT_BACKEND), {
+        const r = await fetch(CHAT_BACKEND, {
           method: 'POST',
-          cache: 'no-store',
           headers: {
             'Content-Type': 'application/json',
-            'X-Session-Id': sessionId
+            'X-Session-Id': sessionId  // CRITICAL: same session every turn
           },
           body: JSON.stringify({ message: text })
         });
-
-        const data = await parseSafeJSON(r);
+        const data = await r.json();
         thinking.remove();
+        add((data && data.reply) ? data.reply : JSON.stringify(data, null, 2), 'bot');
 
-        let reply = typeof data?.reply === 'string' ? sanitizeReply(data.reply) : '';
-        if (!reply) {
-          if (data?._status && data._status !== 200) {
-            reply = `Server returned ${data._status}. Please try again in a moment.`;
-          } else if (data?.pending) {
-            reply = formatPendingLettered(data.pending);
-          } else if (data && typeof data === 'object' && (data._contentType || Object.keys(data).length)) {
-            const txt = data._contentType ? `(non-JSON ${data._contentType})` : '(no content)';
-            reply = `I didn't receive readable data from the server ${txt}. Please try again.`;
-          } else {
-            reply = 'Okay.';
-          }
+        // If we hit a connector error on the first real quote, try warming again silently.
+        if (typeof data?.reply === 'string' && data.reply.includes('system error while retrieving data')) {
+          warmUp();
         }
-
-        add(reply, 'bot');
-
-        if (data?.pending?.choices?.length) addChoicePills(data.pending);
-        if (data?.quote) addDetails(data.quote, 'Quote details');
-
       } catch (e) {
-        try { thinking.remove(); } catch {}
-        add('Network error. Please try again.', 'bot');
+        thinking.remove();
+        add('Error: ' + (e?.message || e), 'bot');
       } finally {
         setBusy(false);
         inp.focus();
       }
     }
 
-    // ====== Reset session button ======
-    async function doReset() {
-      const wasBusy = btn.disabled || inp.disabled;
-      if (!wasBusy) setBusy(true);
-      try {
-        add('Reset session', 'user');
-        add('…', 'bot');
-        const thinking = chat.lastChild;
-        const r = await fetch(cacheBust(CHAT_BACKEND), {
-          method: 'POST',
-          cache: 'no-store',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Session-Id': sessionId
-          },
-          body: JSON.stringify({ message: 'Ben Luci reset' })
-        });
-        const data = await parseSafeJSON(r);
-        thinking.remove();
-        add((data && data.reply) ? sanitizeReply(data.reply) : '✅ Session reset.', 'bot');
-      } catch {
-        add('Reset failed. Please try again.', 'bot');
-      } finally {
-        if (!wasBusy) setBusy(false);
-      }
-    }
-
-    // ====== Wire up ======
     btn.addEventListener('click', send);
     inp.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
-    reset.addEventListener('click', doReset);
 
+    // Focus input on load
     window.addEventListener('load', () => inp.focus(), { once: true });
   </script>
 </body>
