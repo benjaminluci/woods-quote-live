@@ -13,9 +13,9 @@
     #chat { flex:1; overflow:auto; padding:16px; }
     .msg { max-width: 720px; margin: 8px auto; padding: 12px 14px; border-radius: 12px; white-space: pre-wrap; line-height: 1.45; word-break: break-word; }
     .user { background:#2563eb; color:#fff; margin-left:auto; }
-    .bot { background:#fff; border:1px solid #e5e7eb; margin-right:auto; }
+    .bot  { background:#fff; border:1px solid #e5e7eb; margin-right:auto; }
     footer { display:flex; gap:8px; padding:12px; background:#fff; border-top:1px solid #e5e7eb; position:sticky; bottom:0; }
-    input { flex:1; padding:10px 12px; border-radius:10px; border:1px solid #cbd5e1; outline:none; }
+    input  { flex:1; padding:10px 12px; border-radius:10px; border:1px solid #cbd5e1; outline:none; }
     input:focus { border-color:#111827; }
     button { padding:10px 14px; border-radius:10px; border:1px solid #111827; background:#111827; color:#fff; cursor:pointer; }
     button.secondary { background:#fff; color:#111827; }
@@ -46,11 +46,10 @@
   </footer>
 
   <script>
-    // ====== CONFIG ======
-    // If frontend and backend are the SAME service, prefer relative:
-    const BASE = '';
-    const CHAT_BACKEND   = BASE + '/chat';
-    const HEALTH_BACKEND = BASE + '/health';
+    // ====== CONFIG (hard-coded backend) ======
+    const CHAT_BASE      = 'https://woods-quote-backend.onrender.com';
+    const CHAT_BACKEND   = CHAT_BASE + '/chat';
+    const HEALTH_BACKEND = CHAT_BASE + '/health';
 
     // ====== ELEMENTS ======
     const chat  = document.getElementById('chat');
@@ -121,9 +120,7 @@
 
     function sanitizeReply(text) {
       if (typeof text !== 'string') return '';
-      // strip fenced JSON blocks if any
       let out = text.replace(/```json[\s\S]*?```/gi, '').trim();
-      // if what's left still looks like raw JSON, suppress it
       if (looksJsonish(out)) out = '';
       return out;
     }
@@ -136,24 +133,18 @@
     }
 
     async function parseSafeJSON(response) {
-      // Cache-bust read (in case proxies strip body) by cloning
       const ct = (response.headers.get('content-type') || '').toLowerCase();
       try {
         if (ct.includes('application/json')) {
-          // This can still be empty on some hosts; guard with text check
           const txt = await response.clone().text();
           if (!txt) return {};
           return JSON.parse(txt);
         } else {
           const txt = await response.text();
-          try {
-            return JSON.parse(txt);
-          } catch {
-            return { reply: txt || '', _status: response.status, _contentType: ct };
-          }
+          try { return JSON.parse(txt); }
+          catch { return { reply: txt || '', _status: response.status, _contentType: ct }; }
         }
       } catch {
-        // No body or invalid JSON
         try {
           const txt = await response.text();
           return { reply: txt || '', _status: response.status, _contentType: ct };
@@ -164,7 +155,7 @@
     }
 
     function cacheBust(url) {
-      const u = new URL(url, location.origin);
+      const u = new URL(url);
       u.searchParams.set('ts', Date.now().toString());
       return u.toString();
     }
@@ -204,7 +195,6 @@
           body: JSON.stringify({ message: text })
         });
 
-        // If the server returned non-OK and no body, avoid json() entirely
         const data = await parseSafeJSON(r);
         thinking.remove();
 
@@ -224,13 +214,8 @@
 
         add(reply, 'bot');
 
-        if (data?.pending?.choices?.length) {
-          addChoicePills(data.pending);
-        }
-
-        if (data?.quote) {
-          addDetails(data.quote, 'Quote details');
-        }
+        if (data?.pending?.choices?.length) addChoicePills(data.pending);
+        if (data?.quote) addDetails(data.quote, 'Quote details');
 
       } catch (e) {
         try { thinking.remove(); } catch {}
@@ -260,8 +245,7 @@
         });
         const data = await parseSafeJSON(r);
         thinking.remove();
-        const msg = typeof data?.reply === 'string' && data.reply ? data.reply : '✅ Session reset.';
-        add(msg, 'bot');
+        add((data && data.reply) ? sanitizeReply(data.reply) : '✅ Session reset.', 'bot');
       } catch {
         add('Reset failed. Please try again.', 'bot');
       } finally {
@@ -274,8 +258,8 @@
     inp.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
     reset.addEventListener('click', doReset);
 
-    // Focus input on load
     window.addEventListener('load', () => inp.focus(), { once: true });
   </script>
 </body>
 </html>
+
