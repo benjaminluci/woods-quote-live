@@ -1,9 +1,9 @@
-# chat_backend.py — Woods Quoting Assistant (with cash-discount enforcement)
-# - GET /quote?model=...&dealer_number=... (+ options) — unchanged from your working version
-# - Detect models like bb60.30, bw12.40, ds8.30 (uppercase normalize)
-# - Store dealer after dealer-discount; inject dealer_number (and dealer_discount) into quote calls
-# - Enforce 12% cash discount (unless dealer discount == 5%) in a server-side "_enforced_totals" block
-# - Keep full knowledge verbatim
+# chat_backend.py — Woods Quoting Assistant
+# - Uses GET /quote?model=...&dealer_number=... (+ options)
+# - Detects models like bb60.30, bw12.40, ds8.30 → normalized to uppercase
+# - Stores dealer after dealer-discount and auto-injects dealer_number into quote calls
+# - Full knowledge prompt included (verbatim)
+# - Tool schema includes a comprehensive set of option fields (+ additionalProperties=True)
 
 from __future__ import annotations
 import os, re, json, time, logging, traceback
@@ -26,7 +26,7 @@ LOG_LEVEL      = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 log = logging.getLogger("woods-qa")
 
-# ---------------- OpenAI (planner optional) ----------------
+# ---------------- OpenAI (optional; planner) ----------------
 client = None
 try:
     from openai import OpenAI
@@ -139,16 +139,26 @@ Correction Enforcement
 - If cash discount is missing from final output, quote is invalid and must be corrected
 """
 
-# Small directive so the assistant uses server-enforced totals if present.
-ENFORCER_NOTE = r"""
----
-Server Enforcement
-If a tool result contains an "_enforced_totals" object, you must use those numbers when presenting:
-- list total, dealer discount amount, cash discount amount, and the Final Net.
-Never recompute these yourself; use the provided values.
+# (Optional helper synopsis for the model; harmless to include)
+FAMILY_GUIDE = r"""
+Guide (only if /quote does not already ask):
+- BrushBull: bb_shielding, bb_tailwheel (sometimes).
+- Batwing: bw_duty, bw_driveline (540/1000), shielding_rows, deck_rings, bw_tire_qty.
+- Dual Spindle (DS/MDS): ds_mount, ds_shielding, ds_driveline (540/1000), tire_id, tire_qty.
+- Turf Batwing (TBW): width_ft (12/15/17), tbw_duty, front_rollers, chains.
+- Finish Mowers: finish_choice (tk/tkp/rd990x), rollers, chains.
+- Box Scraper: bs_width_in (48/60/72/84), bs_duty, bs_choice_id.
+- Grading Scraper: gs_width_in, gs_choice_id.
+- Landscape Rake: lrs_width_in, lrs_grade, lrs_choice_id.
+- Rear Blade: rb_width_in, rb_duty, rb_choice_id.
+- Post Hole Digger: pd_model, auger_id.
+- Disc Harrow: dh_width_in, dh_duty (DHS/DHM), dh_spacing_id.
+- Tillers (DB/RT/RTR): tiller_series, tiller_width_in, tiller_rotation, tiller_choice_id.
+- Bale Spear / Pallet Fork / Quick Hitch: use specific choice_id/part_id.
+- Stump Grinder: hydraulics_id.
 """
 
-SYSTEM_PROMPT = KNOWLEDGE + ENFORCER_NOTE
+SYSTEM_PROMPT = KNOWLEDGE + "\n\n--- CONFIG GUIDE ---\n" + FAMILY_GUIDE
 
 # ---------------- HTTP helper ----------------
 def http_get(path: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], int, str]:
@@ -170,19 +180,15 @@ def http_get(path: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], int, st
     log.error("http_get failed %s params=%s error=%s", url, params, last_exc)
     return {"error": str(last_exc)}, 599, url
 
-# ---------------- Model + dealer detection ----------------
+# ---------------- Model detection ----------------
+# Matches: bb60.30, bw12.40, ds8.30, mds12.40, etc.
 MODEL_RE = re.compile(r"\b([A-Za-z]{2,3}\d{1,2}\.\d{2})\b")
-DEALER_NUM_RE = re.compile(r"\b(\d{5,9})\b")
 
 def detect_model(text: str) -> str | None:
     m = MODEL_RE.search(text or "")
     return m.group(1).upper() if m else None
 
-def extract_dealer(text: str) -> str | None:
-    m = DEALER_NUM_RE.search(text or "")
-    return m.group(1) if m else None
-
-# ---------------- Tools (schemas) ----------------
+# ---------------- Tools (function schemas) ----------------
 TOOLS = [
     {
         "type": "function",
@@ -210,9 +216,8 @@ TOOLS = [
                     # REQUIRED CORE
                     "model": {"type": "string", "description": "Exact model, e.g., BB60.30, BW12.40, DS8.30"},
                     "dealer_number": {"type": "string"},
-                    # Provide dealer_discount if known so the server can compute enforced totals
-                    "dealer_discount": {"type": "number", "description": "Dealer discount rate (e.g., 0.24)."},
-                    # -------- MANY OPTIONAL FIELDS (kept broad) --------
+
+                    # -------- GENERIC / SHARED --------
                     "quantity": {"type": "integer"},
                     "part_id": {"type": "string"},
                     "accessory_id": {"type": "string"},
@@ -220,48 +225,70 @@ TOOLS = [
                     "width": {"type": "string"},
                     "width_ft": {"type": "string"},
                     "width_in": {"type": "string"},
-                    "bb_shielding": {"type": "string"},
-                    "bb_tailwheel": {"type": "string"},
+
+                    # -------- BRUSHBULL (BB) --------
+                    "bb_shielding": {"type": "string", "description": "Belt or Chain"},
+                    "bb_tailwheel": {"type": "string", "description": "Single or Dual, if applicable"},
+
+                    # -------- BATWING (BW/TBW) --------
                     "bw_duty": {"type": "string"},
-                    "bw_driveline": {"type": "string"},
+                    "bw_driveline": {"type": "string", "description": "540 or 1000"},
                     "bw_tire_qty": {"type": "integer"},
                     "shielding_rows": {"type": "string"},
                     "deck_rings": {"type": "string"},
                     "tbw_duty": {"type": "string"},
                     "front_rollers": {"type": "string"},
                     "chains": {"type": "string"},
+
+                    # -------- DUAL SPINDLE (DS/MDS) --------
                     "ds_mount": {"type": "string"},
                     "ds_shielding": {"type": "string"},
-                    "ds_driveline": {"type": "string"},
+                    "ds_driveline": {"type": "string", "description": "540 or 1000"},
                     "tire_id": {"type": "string"},
                     "tire_qty": {"type": "integer"},
+
+                    # -------- DISC HARROW (DHS/DHM) --------
                     "dh_width_in": {"type": "string"},
-                    "dh_duty": {"type": "string"},
+                    "dh_duty": {"type": "string", "description": "DHS or DHM"},
                     "dh_spacing_id": {"type": "string"},
+
+                    # -------- BOX / GRADING SCRAPERS --------
                     "bs_width_in": {"type": "string"},
                     "bs_duty": {"type": "string"},
                     "bs_choice_id": {"type": "string"},
                     "gs_width_in": {"type": "string"},
                     "gs_choice_id": {"type": "string"},
+
+                    # -------- LANDSCAPE RAKE --------
                     "lrs_width_in": {"type": "string"},
                     "lrs_grade": {"type": "string"},
                     "lrs_choice_id": {"type": "string"},
+
+                    # -------- REAR BLADE --------
                     "rb_width_in": {"type": "string"},
                     "rb_duty": {"type": "string"},
                     "rb_choice_id": {"type": "string"},
+
+                    # -------- POST HOLE DIGGER --------
                     "pd_model": {"type": "string"},
                     "auger_id": {"type": "string"},
+
+                    # -------- TILLERS (DB/RT/RTR) --------
                     "tiller_series": {"type": "string"},
                     "tiller_width_in": {"type": "string"},
                     "tiller_rotation": {"type": "string"},
                     "tiller_choice_id": {"type": "string"},
+
+                    # -------- FINISH MOWERS --------
                     "finish_choice": {"type": "string"},
                     "rollers": {"type": "string"},
+
+                    # -------- STUMP GRINDER / MISC --------
                     "hydraulics_id": {"type": "string"},
                     "choice_id": {"type": "string"},
                 },
                 "required": ["dealer_number"],
-                "additionalProperties": True
+                "additionalProperties": True  # safety net for any new fields
             },
         },
     },
@@ -277,98 +304,14 @@ TOOLS = [
 
 # ---------------- Tool implementations ----------------
 def tool_woods_dealer_discount(args: Dict[str, Any]) -> Dict[str, Any]:
-    dn = str(args.get("dealer_number") or "").strip()
-    body, status, used = http_get("/dealer-discount", {"dealer_number": dn})
+    dealer_number = str(args.get("dealer_number") or "").strip()
+    body, status, used = http_get("/dealer-discount", {"dealer_number": dealer_number})
     return {"ok": status == 200, "status": status, "url": used, "body": body}
-
-def _num(x):
-    try:
-        if isinstance(x, (int, float)): return float(x)
-        if isinstance(x, str): return float(x.replace(",", "").strip())
-    except Exception:
-        return None
-    return None
-
-def _sum_list_total(body: Dict[str, Any]) -> float | None:
-    """
-    Try to compute list_total from common shapes:
-    - body["items"] or body["line_items"] with list_price (+ qty/quantity)
-    - body["totals"]["list_total"]
-    """
-    # totals shortcut
-    totals = body.get("totals") if isinstance(body, dict) else None
-    if isinstance(totals, dict):
-        lt = _num(totals.get("list_total"))
-        if lt is not None: return lt
-
-    # items / line_items
-    for key in ("items", "line_items"):
-        arr = body.get(key)
-        if isinstance(arr, list) and arr:
-            s = 0.0
-            any_found = False
-            for it in arr:
-                if not isinstance(it, dict): continue
-                price = _num(it.get("list_price")) or _num(it.get("list")) or (_num(it.get("list_price_cents")) or 0)/100.0
-                qty = _num(it.get("qty")) or _num(it.get("quantity")) or 1.0
-                if price is not None:
-                    any_found = True
-                    s += price * float(qty)
-            if any_found:
-                return s
-    # single line quote?
-    lt = _num(body.get("list_price")) or _num(body.get("list"))
-    return lt
-
-def _enforce_cash_totals(body: Dict[str, Any], dealer_discount: float | None) -> Dict[str, Any] | None:
-    """
-    Return a dict with enforced totals if we can compute them; else None.
-    """
-    if dealer_discount is None:
-        # maybe present in body
-        dd = _num((body.get("dealer") or {}).get("discount") if isinstance(body.get("dealer"), dict) else body.get("dealer_discount"))
-        dealer_discount = dd if dd is not None else None
-
-    list_total = _sum_list_total(body)
-    if list_total is None or dealer_discount is None:
-        return None
-
-    dd_rate = float(dealer_discount)
-    net_after_dealer = list_total * (1.0 - dd_rate)
-
-    # Cash discount rule: apply 12% unless dealer discount is exactly 5%
-    cash_rate = 0.0 if abs(dd_rate - 0.05) < 1e-9 else 0.12
-    cash_amount = net_after_dealer * cash_rate
-    final_net = net_after_dealer * (1.0 - cash_rate)
-
-    # round to cents
-    def r2(x): return float(f"{x:.2f}")
-    return {
-        "list_total": r2(list_total),
-        "dealer_discount_rate": r2(dd_rate),
-        "dealer_discount_amount": r2(list_total * dd_rate),
-        "net_after_dealer": r2(net_after_dealer),
-        "cash_discount_rate": r2(cash_rate),
-        "cash_discount_amount": r2(cash_amount),
-        "final_net_enforced": r2(final_net),
-        "note": "12% cash discount applied unless dealer discount is exactly 5%.",
-    }
 
 def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     # GET /quote with params as-is (must include model + dealer_number for reliable results)
     params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
     body, status, used = http_get("/quote", params)
-
-    # Attach enforced totals if we can compute them
-    try:
-        if status == 200 and isinstance(body, dict):
-            dd = args.get("dealer_discount")
-            enforced = _enforce_cash_totals(body, _num(dd) if dd is not None else None)
-            if enforced:
-                body["_enforced_totals"] = enforced
-    except Exception as e:
-        log.warning("enforcer failed: %s", e)
-
     return {"ok": status == 200, "status": status, "url": used, "body": body}
 
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -417,32 +360,22 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
             except Exception:
                 args = {}
 
-            # ALWAYS inject dealer_number and dealer_discount for woods_quote if the model forgot
-            if name == "woods_quote":
-                # dealer number
-                dn = args.get("dealer_number")
-                dd_rate = args.get("dealer_discount")
+            # ALWAYS inject dealer_number for woods_quote if the model forgot it
+            if name == "woods_quote" and not args.get("dealer_number"):
+                # scan history for the last dealer lookup
+                dn = None
                 for m in reversed(history):
-                    if dn and dd_rate is not None:
-                        break
                     if m.get("role") == "tool" and m.get("name") == "woods_dealer_discount":
                         try:
                             payload = json.loads(m.get("content") or "{}")
                             b = payload.get("body") or {}
-                            if not dn:
-                                dn0 = b.get("dealer_number") or b.get("number")
-                                if dn0: dn = str(dn0)
-                            if dd_rate is None:
-                                ddr = b.get("discount")
-                                if ddr is not None:
-                                    try: dd_rate = float(ddr)
-                                    except Exception: pass
+                            dn = b.get("dealer_number") or b.get("number")
+                            if dn:
+                                break
                         except Exception:
                             pass
-                if dn and not args.get("dealer_number"):
-                    args["dealer_number"] = dn
-                if (dd_rate is not None) and (args.get("dealer_discount") is None):
-                    args["dealer_discount"] = dd_rate
+                if dn:
+                    args["dealer_number"] = str(dn)
 
             if name == "woods_dealer_discount":
                 result = tool_woods_dealer_discount(args)
@@ -465,6 +398,12 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
         )
 
 # ---------------- Utilities ----------------
+DEALER_NUM_RE = re.compile(r"\b(\d{5,9})\b")
+
+def extract_dealer(text: str) -> str | None:
+    m = DEALER_NUM_RE.search(text or "")
+    return m.group(1) if m else None
+
 def add_tool_exchange(convo: List[Dict[str, Any]], name: str, args: Dict[str, Any], result: Dict[str, Any]) -> None:
     call_id = f"{name}-{int(time.time()*1000)}"
     convo.append({
@@ -495,17 +434,19 @@ def chat():
         # session resolve + GC
         now = time.time()
         sid = request.headers.get("X-Session-Id") or payload.get("session_id") or f"anon-{int(now*1000)}"
+        # GC old sessions
         for k in list(SESS.keys()):
             if now - SESS[k].get("updated_at", now) > SESSION_TTL:
                 SESS.pop(k, None)
+
         sess = SESS.setdefault(sid, {"messages": [], "dealer": None, "updated_at": now})
         sess["updated_at"] = now
 
-        # Build conversation: system → history → (auto tool results) → user
+        # Build fresh conversation: system → history → (auto tool results) → user
         convo: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         convo.extend(sess["messages"])
 
-        # Auto: dealer detection
+        # -------- Auto: Dealer detection --------
         dn_from_msg = extract_dealer(user_message)
         if dn_from_msg:
             res = tool_woods_dealer_discount({"dealer_number": dn_from_msg})
@@ -519,55 +460,45 @@ def chat():
                 }
 
         # Determine dealer for quoting (session first, else scan convo)
-        dealer_num, dealer_disc = None, None
-        if sess.get("dealer"):
-            dealer_num = str(sess["dealer"].get("dealer_number") or "") or None
-            dealer_disc = sess["dealer"].get("discount")
-        if (dealer_num is None) or (dealer_disc is None):
+        dealer_num = None
+        if sess.get("dealer", {}).get("dealer_number"):
+            dealer_num = str(sess["dealer"]["dealer_number"])
+        else:
             for m in reversed(convo):
                 if m.get("role") == "tool" and m.get("name") == "woods_dealer_discount":
                     try:
                         payload = json.loads(m.get("content") or "{}")
                         b = payload.get("body") or {}
-                        if dealer_num is None:
-                            dn = b.get("dealer_number") or b.get("number")
-                            if dn: dealer_num = str(dn)
-                        if dealer_disc is None and (b.get("discount") is not None):
-                            dealer_disc = float(b.get("discount"))
-                        if dealer_num and (dealer_disc is not None):
-                            break
+                        dn = b.get("dealer_number") or b.get("number")
+                        if dn:
+                            dealer_num = str(dn); break
                     except Exception:
                         pass
 
-        # Auto: quote trigger ONLY when model detected AND dealer present
+        # -------- Auto: Quote trigger ONLY if a model is detected AND we have dealer --------
         model = detect_model(user_message)
         if model and dealer_num:
             args = {"model": model, "dealer_number": dealer_num}
-            if dealer_disc is not None:
-                args["dealer_discount"] = float(dealer_disc)
             res = tool_woods_quote(args)
             add_tool_exchange(convo, "woods_quote", args, res)
 
-        # Append user & run planner
+        # Append user and run planner
         convo.append({"role": "user", "content": user_message})
         reply, hist = run_ai(convo)
 
-        # trim + persist (keep system injected anew each turn)
+        # trim + persist (keep system at the front next time by regenerating)
         MAX_KEEP = 80
+        # drop explicit system cards from stored history; we'll re-inject next turn
         trimmed = [m for m in hist if m.get("role") != "system"]
         if len(trimmed) > MAX_KEEP:
             trimmed = trimmed[-MAX_KEEP:]
         sess["messages"] = trimmed
 
-        # badge for UI
+        # echo dealer badge for UI (optional)
         dealer_badge = sess.get("dealer") or {}
-        return jsonify({
-            "reply": reply,
-            "dealer": {
-                "dealer_number": dealer_badge.get("dealer_number"),
-                "dealer_name": dealer_badge.get("dealer_name"),
-            }
-        })
+
+        return jsonify({"reply": reply, "dealer": {"dealer_number": dealer_badge.get("dealer_number"),
+                                                   "dealer_name": dealer_badge.get("dealer_name")}})
     except Exception as e:
         logging.exception("chat error")
         return jsonify({
