@@ -2,13 +2,15 @@
 #
 # Endpoints
 #   POST /chat   -> { reply: "...", quote?: {...}, dealer?: {...}, dealer_number?: "..." }
-#   GET  /health -> { ok, planner, model, action_base, include_routing }
+#   GET  /health -> { ok, planner, model, action_base, allowed_origins, include_routing }
 #
-# Quick start
-#   pip install flask flask-cors openai requests
-#   export OPENAI_API_KEY=sk-...
-#   export ACTION_BASE_URL="https://woods-quote-api.onrender.com"  # quoting API base
-#   python chat_backend.py
+# Env (Render):
+#   OPENAI_API_KEY=...
+#   ALLOWED_ORIGINS=https://woodsequipment-quote.onrender.com
+#   QUOTE_API_BASE=https://woods-quote-api.onrender.com      # or ACTION_BASE_URL
+#   (optional) INCLUDE_ROUTING=false
+#   (optional) OPENAI_MODEL=gpt-4o-mini
+#   (optional) TEMPERATURE=0.3
 #
 from __future__ import annotations
 import os, time, logging, traceback, json, re
@@ -26,9 +28,13 @@ import requests
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 TEMPERATURE  = float(os.environ.get("TEMPERATURE", "0.3"))
 SESSION_TTL_SECONDS = 60 * 30  # 30 minutes
-# Quoting API base (NOT the chat backend host)
-ACTION_BASE_URL = os.environ.get("ACTION_BASE_URL", "https://woods-quote-api.onrender.com")
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "https://woodsequipment-quote.onrender.com")
+
+# Quoting API base (NOT the chat backend host) — supports either env name
+ACTION_BASE_URL = (
+    os.environ.get("ACTION_BASE_URL")
+    or os.environ.get("QUOTE_API_BASE")
+    or "https://woods-quote-api.onrender.com"
+)
 
 # Hide routing JSON from HTTP responses by default
 INCLUDE_ROUTING = str(os.environ.get("INCLUDE_ROUTING", "false")).lower() not in ("0", "false", "no")
@@ -246,12 +252,12 @@ def extract_routing_json(text: str) -> Optional[Dict[str, Any]]:
         return None
     t = text.strip()
 
-    # 1) fenced ```json ... ```
+    # fenced ```json ... ```
     m = re.search(r"```json\s*([\s\S]*?)\s*```", t, flags=re.IGNORECASE)
     if m:
         t = m.group(1).strip()
 
-    # 2) quoted JSON blob
+    # quoted JSON blob
     if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
         inner = t[1:-1]
         try:
@@ -259,7 +265,7 @@ def extract_routing_json(text: str) -> Optional[Dict[str, Any]]:
         except Exception:
             t = inner
 
-    # 3) direct parse
+    # direct parse
     try:
         obj = json.loads(t)
         if isinstance(obj, dict):
@@ -271,7 +277,7 @@ def extract_routing_json(text: str) -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
-    # 4) largest {...} chunk
+    # largest {...} chunk
     m = re.search(r"\{[\s\S]*\}", t)
     if m:
         chunk = m.group(0)
@@ -581,7 +587,6 @@ def chat():
 
     routing = extract_routing_json(model_reply)
     if not routing and _looks_jsonish(model_reply):
-        # second attempt if reply looks JSON-ish
         maybe = extract_routing_json(model_reply)
         if maybe and is_valid_routing(maybe):
             routing = maybe
@@ -650,11 +655,13 @@ def chat():
 
 @app.route("/health", methods=["GET"])
 def health():
+    allow = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
     return jsonify({
         "ok": True,
         "planner": bool(client),
         "model": OPENAI_MODEL,
         "action_base": ACTION_BASE_URL,
+        "allowed_origins": allow,
         "include_routing": INCLUDE_ROUTING,
     }), 200
 
