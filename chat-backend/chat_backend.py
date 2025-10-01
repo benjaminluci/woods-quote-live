@@ -238,14 +238,6 @@ def _looks_jsonish(text: str) -> bool:
     t = text.strip()
     return t.startswith("{") or t.startswith("[") or "```json" in t.lower()
 
-def _sanitize_to_ai_reply(text: str) -> str:
-    if not isinstance(text, str):
-        return ""
-    out = re.sub(r"```json[\s\S]*?```", "", text, flags=re.IGNORECASE).strip()
-    if _looks_jsonish(out):
-        return "Got it — handled that selection. What would you like next?"
-    return out or "Okay."
-
 def extract_routing_json(text: str) -> Optional[Dict[str, Any]]:
     """Parse routing JSON even if the model wrapped it in quotes or code fences."""
     if not text:
