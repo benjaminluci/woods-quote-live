@@ -7,174 +7,107 @@
   <style>
     html,body { height:100%; margin:0; }
     body { font-family: system-ui, Arial, sans-serif; background:#f6f7f9; display:flex; flex-direction:column; }
-    header { padding:12px 16px; background:#111827; color:#fff; display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    header { padding:12px 16px; background:#111827; color:#fff; display:flex; align-items:center; gap:12px; }
     header small { opacity:.8; font-size:.8rem; }
-    #right { display:flex; align-items:center; gap:10px; }
-    .pill { padding:2px 8px; border-radius:999px; font-size:.75rem; background:#374151; }
-    .pill.ok { background:#065f46; }
-    .pill.bad { background:#7f1d1d; }
     #chat { flex:1; overflow:auto; padding:16px; }
     .msg { max-width: 720px; margin: 8px auto; padding: 12px 14px; border-radius: 12px; white-space: pre-wrap; line-height: 1.45; }
     .user { background:#2563eb; color:#fff; margin-left:auto; }
     .bot { background:#fff; border:1px solid #e5e7eb; margin-right:auto; }
     footer { display:flex; gap:8px; padding:12px; background:#fff; border-top:1px solid #e5e7eb; position:sticky; bottom:0; }
-    input { flex:1; font-size:16px; padding:10px 12px; border:1px solid #d1d5db; border-radius:10px; outline:none; }
-    button { padding:10px 14px; border:none; border-radius:10px; background:#111827; color:#fff; cursor:pointer; }
-    button[disabled] { opacity:.6; cursor:not-allowed; }
-    #cfg { background:#374151; }
+    input { flex:1; padding:10px 12px; border-radius:10px; border:1px solid #cbd5e1; outline:none; }
+    input:focus { border-color:#111827; }
+    button { padding:10px 14px; border-radius:10px; border:1px solid #111827; background:#111827; color:#fff; cursor:pointer; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    .row { display:flex; align-items:center; gap:10px; }
+    .pill { background:#fff; color:#111827; border:1px solid #e5e7eb; padding:4px 8px; border-radius:999px; font-size:.75rem; }
   </style>
 </head>
 <body>
   <header>
     <div>Woods Quoting Assistant</div>
-    <div id="right">
-      <small id="env"></small>
-      <span id="health" class="pill">health:…</span>
-      <button id="cfg" title="Configure backend URL">Configure…</button>
-    </div>
+    <small id="env"></small>
   </header>
-
   <div id="chat" aria-live="polite"></div>
-
   <footer>
     <input id="inp" placeholder="Please Enter Dealer Number To Begin Quoting" autocomplete="off" />
     <button id="send">Send</button>
   </footer>
 
   <script>
-    // ====== PERSISTENT SESSION ======
-    function getSessionId() {
-      const KEY = 'woods_sid';
-      let sid = localStorage.getItem(KEY);
-      if (!sid) {
-        sid = 'sid-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
-        localStorage.setItem(KEY, sid);
-      }
-      return sid;
-    }
-    const SESSION_ID = getSessionId();
+    // ====== CONFIG ======
+    // Your AI bot endpoint (NOT the Woods Pricing API). This is the server that proxies tools to your app.py API.
+    const CHAT_BACKEND = 'https://woods-quote-backend.onrender.com/chat';
+    const HEALTH_BACKEND = CHAT_BACKEND.replace(/\/chat$/, '/health');
 
-    // ====== BACKEND URL (configurable) ======
-    // Priority: localStorage override -> window.CHAT_BACKEND -> same-origin '/chat'
-    function getBackendURL() {
-      const saved = localStorage.getItem('woods_backend');
-      if (saved && saved.trim()) return saved.trim();
-      if (window.CHAT_BACKEND) return String(window.CHAT_BACKEND);
-      return '/chat';
-    }
-    function setBackendURL(url) {
-      if (url) localStorage.setItem('woods_backend', url);
-    }
-    function getHealthURL() {
-      const u = getBackendURL();
-      try { return u.replace(/\/chat$/, '/health'); } catch { return '/health'; }
-    }
-
-    // ====== UI helpers ======
+    // ====== ELEMENTS ======
     const chat = document.getElementById('chat');
     const inp  = document.getElementById('inp');
     const btn  = document.getElementById('send');
     const env  = document.getElementById('env');
-    const healthPill = document.getElementById('health');
-    const cfgBtn = document.getElementById('cfg');
 
-    function addMsg(text, who='bot') {
+    // ====== SESSION (sticky across page loads) ======
+    const SID_KEY = 'woods_sid';
+    let sessionId = localStorage.getItem(SID_KEY);
+    if (!sessionId) {
+      sessionId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
+      localStorage.setItem(SID_KEY, sessionId);
+    }
+
+    // Show quick env info in header for troubleshooting
+    env.textContent = `session: ${sessionId.slice(0,8)}… · backend: ${new URL(CHAT_BACKEND).host}`;
+
+    // ====== UI helpers ======
+    function add(text, who) {
       const div = document.createElement('div');
-      div.className = 'msg ' + (who === 'user' ? 'user' : 'bot');
+      div.className = `msg ${who}`;
       div.textContent = text;
       chat.appendChild(div);
       chat.scrollTop = chat.scrollHeight;
-      return div;
-    }
-    function setBusy(b) { btn.disabled = b; inp.disabled = b; }
-
-    function updateEnvBadge() {
-      const backend = getBackendURL();
-      let originText = backend;
-      try { const a = document.createElement('a'); a.href = backend; originText = a.origin || backend; } catch {}
-      const shortSid = SESSION_ID.slice(0,8);
-      env.textContent = `Backend: ${originText} · sid:${shortSid}`;
     }
 
-    async function pingHealth() {
-      const url = getHealthURL();
-      healthPill.className = 'pill';
-      healthPill.textContent = 'health:…';
-      try {
-        const r = await fetch(url, { method: 'GET' });
-        const txt = await r.text(); // read as text first
-        let json = null;
-        try { json = JSON.parse(txt); } catch {}
-        if (r.ok && json && typeof json === 'object') {
-          const ok = json.ok !== false && (json.planner === undefined || json.planner);
-          healthPill.className = 'pill ' + (ok ? 'ok' : 'bad');
-          healthPill.textContent = ok ? 'health: OK' : 'health: ISSUE';
-        } else {
-          healthPill.className = 'pill bad';
-          healthPill.textContent = `health: ${r.status}`;
-        }
-      } catch (e) {
-        healthPill.className = 'pill bad';
-        healthPill.textContent = 'health: error';
-      }
+    function setBusy(state) {
+      btn.disabled = state;
+      inp.disabled = state;
     }
 
-    cfgBtn.addEventListener('click', () => {
-      const current = getBackendURL();
-      const next = prompt('Enter full backend /chat URL (e.g. https://your-render-app.onrender.com/chat):', current);
-      if (next && next.trim()) {
-        setBackendURL(next.trim());
-        updateEnvBadge();
-        pingHealth();
-      }
-    });
+    // ====== Warm-up (pre-ping backend so upstream Render isn't sleepy) ======
+    async function warmUp() {
+      try { await fetch(HEALTH_BACKEND, { method: 'GET', cache: 'no-store' }); }
+      catch (_) { /* ignore */ }
+    }
+    // fire and forget
+    warmUp();
 
-    // ====== SEND logic with robust error display ======
+    // ====== Send message ======
     async function send() {
       const text = inp.value.trim();
       if (!text) return;
-
-      addMsg(text, 'user');
       inp.value = '';
+      add(text, 'user');
+      add('…', 'bot');
+      const thinking = chat.lastChild;
       setBusy(true);
 
-      const CHAT_BACKEND = getBackendURL();
-
       try {
-        const res = await fetch(CHAT_BACKEND, {
+        const r = await fetch(CHAT_BACKEND, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'X-Session-Id': SESSION_ID
+            'X-Session-Id': sessionId  // CRITICAL: same session every turn
           },
-          body: JSON.stringify({ session_id: SESSION_ID, message: text })
+          body: JSON.stringify({ message: text })
         });
+        const data = await r.json();
+        thinking.remove();
+        add((data && data.reply) ? data.reply : JSON.stringify(data, null, 2), 'bot');
 
-        // Try JSON first; if that fails, show status + snippet
-        const raw = await res.text();
-        let data = null;
-        try { data = JSON.parse(raw); } catch {}
-
-        if (!res.ok) {
-          addMsg(`HTTP ${res.status} ${res.statusText}\n${raw.slice(0,300)}`, 'bot');
-        } else if (data && (data.reply || data.error)) {
-          addMsg(data.reply || data.error, 'bot');
-
-          // Dealer badge if present
-          if (data.dealer && (data.dealer.dealer_number || data.dealer.dealer_name)) {
-            const a = document.createElement('a'); a.href = CHAT_BACKEND;
-            const hostText = (a.origin || location.origin);
-            const shortSid = SESSION_ID.slice(0, 8);
-            const badge = `${data.dealer.dealer_name ? data.dealer.dealer_name + ' ' : ''}${data.dealer.dealer_number ? '#' + data.dealer.dealer_number : ''}`.trim();
-            env.textContent = `${hostText ? 'Backend: ' + hostText : ''} · sid:${shortSid}${badge ? ' · ' + badge : ''}`;
-          }
-        } else {
-          // Not JSON, or JSON without reply/error
-          addMsg(`No JSON reply.\nStatus: ${res.status}\nPreview:\n${raw.slice(0,300)}`, 'bot');
+        // If we hit a connector error on the first real quote, try warming again silently.
+        if (typeof data?.reply === 'string' && data.reply.includes('system error while retrieving data')) {
+          warmUp();
         }
-
       } catch (e) {
-        addMsg('Network error (could not reach backend). Check the backend URL and CORS.', 'bot');
+        thinking.remove();
+        add('Error: ' + (e?.message || e), 'bot');
       } finally {
         setBusy(false);
         inp.focus();
@@ -184,10 +117,9 @@
     btn.addEventListener('click', send);
     inp.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
 
-    // ====== Init ======
-    updateEnvBadge();
-    pingHealth();
+    // Focus input on load
     window.addEventListener('load', () => inp.focus(), { once: true });
   </script>
 </body>
 </html>
+
