@@ -43,7 +43,7 @@ TEMPERATURE  = float(os.environ.get("TEMPERATURE", "0.3"))
 SESSION_TTL_SECONDS = 60 * 30  # 30 minutes
 ACTION_BASE_URL = os.environ.get("ACTION_BASE_URL", "https://woods-quote-tool.onrender.com")
 INCLUDE_ROUTING = str(os.environ.get("INCLUDE_ROUTING", "true")).lower() not in ("0", "false", "no")
-ACTION_BASE_URL=https://woods-quote-api.onrender.com
+ACTION_BASE_URL = "https://woods-quote-api.onrender.com"
 
 
 # =========================
@@ -269,7 +269,7 @@ def is_valid_routing(obj: Dict[str, Any]) -> bool:
     if "params" not in obj or not isinstance(obj["params"], dict): return False
     return True
 
-def http_get_with_retry(url: str, params: Dict[str, Any], retries: int = 1, timeout: int = 20) -> Tuple[int, Any, Optional[str]]:
+def http_get_with_retry(url: str, params: Dict[str, Any], retries: int = 1, timeout: int = 60) -> Tuple[int, Any, Optional[str]]:
     """GET with one retry on connector errors; returns (status_code, json_or_text, error)."""
     try:
         r = requests.get(url, params=params, timeout=timeout)
