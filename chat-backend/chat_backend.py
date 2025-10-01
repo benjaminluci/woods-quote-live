@@ -62,7 +62,7 @@ if CORS:
 
 # ---------------- Sessions ----------------
 SESSIONS: Dict[str, Dict[str, Any]] = {}
-SESSION_TTL_SECONDS = 60 * 60 * 12  # 12h
+SESSION_TTL_SECONDS = 60 * 30  # 30 min
 
 # ---------------- System prompt (rules + family trees) ----------------
 KNOWLEDGE = r"""
