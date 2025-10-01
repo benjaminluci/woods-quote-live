@@ -48,11 +48,9 @@
   <script>
     // ====== CONFIG ======
     // If frontend and backend are the SAME service, prefer relative:
-    const CHAT_BACKEND   = '/chat';
-    const HEALTH_BACKEND = '/health';
-    // If they’re different services, use absolute URLs instead:
-    // const CHAT_BACKEND   = 'https://woodsequipment-quote.onrender.com/chat';
-    // const HEALTH_BACKEND = 'https://woodsequipment-quote.onrender.com/health';
+    const BASE = '';
+    const CHAT_BACKEND   = BASE + '/chat';
+    const HEALTH_BACKEND = BASE + '/health';
 
     // ====== ELEMENTS ======
     const chat  = document.getElementById('chat');
@@ -138,11 +136,14 @@
     }
 
     async function parseSafeJSON(response) {
-      // Try JSON first when content-type says JSON; otherwise try text, then JSON parse, then fallback
+      // Cache-bust read (in case proxies strip body) by cloning
       const ct = (response.headers.get('content-type') || '').toLowerCase();
       try {
         if (ct.includes('application/json')) {
-          return await response.json();
+          // This can still be empty on some hosts; guard with text check
+          const txt = await response.clone().text();
+          if (!txt) return {};
+          return JSON.parse(txt);
         } else {
           const txt = await response.text();
           try {
@@ -153,23 +154,31 @@
         }
       } catch {
         // No body or invalid JSON
-        const txt = await response.text().catch(() => '');
-        return { reply: txt || '', _status: response.status, _contentType: ct };
+        try {
+          const txt = await response.text();
+          return { reply: txt || '', _status: response.status, _contentType: ct };
+        } catch {
+          return { reply: '', _status: response.status, _contentType: ct };
+        }
       }
+    }
+
+    function cacheBust(url) {
+      const u = new URL(url, location.origin);
+      u.searchParams.set('ts', Date.now().toString());
+      return u.toString();
     }
 
     // ====== Warm-up & header info ======
     async function warmUp() {
       try {
-        const r = await fetch(HEALTH_BACKEND, { method: 'GET', cache: 'no-store' });
+        const r = await fetch(cacheBust(HEALTH_BACKEND), { method: 'GET', cache: 'no-store' });
         const h = await parseSafeJSON(r);
-        const host = location.host;
         const sidShort = sessionId.slice(0, 8);
-        env.textContent = `session ${sidShort} · ${host} · model: ${h.model ?? 'n/a'}`;
+        env.textContent = `session ${sidShort} · model: ${h.model ?? 'n/a'}`;
       } catch {
-        const host = location.host;
         const sidShort = sessionId.slice(0, 8);
-        env.textContent = `session ${sidShort} · ${host} · (health unavailable)`;
+        env.textContent = `session ${sidShort} · (health unavailable)`;
       }
     }
     warmUp();
@@ -185,8 +194,9 @@
       setBusy(true);
 
       try {
-        const r = await fetch(CHAT_BACKEND, {
+        const r = await fetch(cacheBust(CHAT_BACKEND), {
           method: 'POST',
+          cache: 'no-store',
           headers: {
             'Content-Type': 'application/json',
             'X-Session-Id': sessionId
@@ -194,18 +204,17 @@
           body: JSON.stringify({ message: text })
         });
 
+        // If the server returned non-OK and no body, avoid json() entirely
         const data = await parseSafeJSON(r);
         thinking.remove();
 
-        // Build human reply
         let reply = typeof data?.reply === 'string' ? sanitizeReply(data.reply) : '';
         if (!reply) {
           if (data?._status && data._status !== 200) {
             reply = `Server returned ${data._status}. Please try again in a moment.`;
           } else if (data?.pending) {
             reply = formatPendingLettered(data.pending);
-          } else if (data && typeof data === 'object') {
-            // last resort: show something readable
+          } else if (data && typeof data === 'object' && (data._contentType || Object.keys(data).length)) {
             const txt = data._contentType ? `(non-JSON ${data._contentType})` : '(no content)';
             reply = `I didn't receive readable data from the server ${txt}. Please try again.`;
           } else {
@@ -215,18 +224,16 @@
 
         add(reply, 'bot');
 
-        // Choice pills for follow-up questions
         if (data?.pending?.choices?.length) {
           addChoicePills(data.pending);
         }
 
-        // Optional: show raw quote data
         if (data?.quote) {
           addDetails(data.quote, 'Quote details');
         }
 
       } catch (e) {
-        thinking.remove();
+        try { thinking.remove(); } catch {}
         add('Network error. Please try again.', 'bot');
       } finally {
         setBusy(false);
@@ -242,8 +249,9 @@
         add('Reset session', 'user');
         add('…', 'bot');
         const thinking = chat.lastChild;
-        const r = await fetch(CHAT_BACKEND, {
+        const r = await fetch(cacheBust(CHAT_BACKEND), {
           method: 'POST',
+          cache: 'no-store',
           headers: {
             'Content-Type': 'application/json',
             'X-Session-Id': sessionId
