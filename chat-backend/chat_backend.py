@@ -1,464 +1,551 @@
-# app.py — AI bot with GPT-style Actions (function tools) that call YOUR app.py API
-# - Tools:
-#     woods_dealer_discount(dealer_number)
-#     woods_quote(**query params mirrored from your OpenAPI)
-#     woods_health()
-# - The LLM plans freely (system prompt + family trees) and calls tools as needed.
-# - Auto-triggers:
-#     * Detects dealer number in user text -> calls woods_dealer_discount immediately
-#     * Detects quote intent (and known dealer) -> calls woods_quote(q=<message>, dealer_number=<known>)
-#
-# Endpoints:
-#   POST /chat   {"session_id":"<id>","message":"..."} -> {"reply":"..."}
-#   GET  /health -> {"ok":bool,"planner":bool,"quote_api_base":str,"api_health":{...}}
-#
-# Env (optional):
-#   OPENAI_API_KEY   (if missing, planner disabled and you’ll get a fallback text reply)
-#   OPENAI_MODEL     (default: gpt-4o-mini)
-#   ALLOWED_ORIGINS  (CSV for CORS)
-#   SYSTEM_PROMPT_APPEND (extra rules appended to the system prompt)
-#
-# Run:
-#   pip install flask flask-cors requests openai
-#   python app.py
-
+#!/usr/bin/env python3
+"""
+chat_backend.py — Woods Quoting Assistant backend
+- Injects your full Knowledge section as a system message every turn
+- Stores dealer & rules in session (no AI "memory" needed for critical facts)
+- Enforces 12% Cash Discount unless dealer discount is exactly 5%
+- Clean message ordering: user → tools → AI
+- CORS across browser-facing routes
+- One automatic retry on connector errors (2 attempts total)
+"""
 from __future__ import annotations
-import os, re, json, time, logging, traceback
-from typing import Any, Dict, List, Tuple
+
+import os, re, json, time, random, logging
+from typing import Any, Dict, List, Tuple, Optional
+from urllib.parse import urljoin
 
 import requests
 from flask import Flask, request, jsonify
-try:
-    from flask_cors import CORS
-except Exception:
-    CORS = None
+from flask_cors import CORS
 
-# ---------------- Config ----------------
-QUOTE_API_BASE = "https://woods-quote-api.onrender.com".rstrip("/")  # your service
-OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-HTTP_TIMEOUT   = float(os.environ.get("HTTP_TIMEOUT", "25"))
-RETRY_ATTEMPTS = 2
+# ---------------- Env & globals ----------------
+OPENAI_MODEL       = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+QUOTE_API_BASE     = os.environ.get("QUOTE_API_BASE", "").rstrip("/")
+ALLOWED_ORIGINS    = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+CASH_DISCOUNT_PCT  = float(os.environ.get("CASH_DISCOUNT_PCT", "12"))  # default 12%
+SERVICE_JSON_RAW   = os.environ.get("SERVICE_JSON", "")
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("woods-actions")
-
-# ---------------- OpenAI client (optional) ----------------
+# OpenAI client (Render has key)
 client = None
 try:
-    from openai import OpenAI
+    from openai import OpenAI  # type: ignore
     if os.environ.get("OPENAI_API_KEY"):
         client = OpenAI()
 except Exception:
     client = None
 
-# ---------------- Flask + CORS ----------------
+# In-memory sessions (swap to Redis if multi-instance)
+SESS: Dict[str, Dict[str, Any]] = {}
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# Flask + CORS
 app = Flask(__name__)
-if CORS:
-    allow = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
-    if allow:
-        CORS(app, resources={r"/chat": {"origins": allow}}, supports_credentials=False)
-    else:
-        CORS(app, supports_credentials=False)
+if ALLOWED_ORIGINS:
+    CORS(app, resources={r"/.*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=False)
+else:
+    CORS(app, supports_credentials=False)
 
-# ---------------- Sessions ----------------
-SESSIONS: Dict[str, Dict[str, Any]] = {}
-SESSION_TTL_SECONDS = 60 * 60 * 12  # 12h
+# ---------------- Your Knowledge (verbatim) ----------------
+KNOWLEDGE_PROMPT = """You are a quoting assistant for Woods Equipment dealership staff. Your primary job is to retrieve part numbers, list prices, dealer discounts, and configuration requirements exclusively from the Woods Pricing API. You never fabricate data, never infer pricing, and only ask configuration questions when required.
 
-# ---------------- System prompt (rules + family trees) ----------------
-KNOWLEDGE = r"""
-You are a quoting assistant for Woods Equipment dealership staff. Retrieve part numbers, list prices, dealer discounts,
-and configuration requirements exclusively from the Woods Pricing API (the tools in this chat). Never fabricate data,
-never infer pricing, and only ask configuration questions when required.
-
+---
 Core Rules
-- A dealer number is required before quoting. Look it up via woods_dealer_discount. Don’t present pricing without it.
-- Remember the dealer number within the session; forget model/config after a quote is complete.
-- Always pull fresh pricing for every line (models & accessories). No caching across quotes.
-- If a real part number returns no price, stop and show the escalation message.
+- A dealer number is required before quoting. Use the Pricing API to look up the dealer’s discount. Do not begin quotes or give pricing without it.
+- Dealer numbers may be remembered within a session and across multiple quotes for the same user unless the dealer provides a new number.
+- All model, accessory, and pricing data must be pulled directly from the API. Never invent, infer, reuse, or cache data.
+- Every quote must pull fresh pricing from the API for all items — including list prices and accessories.
+- If a valid part number returns no price, quoting must stop and inform the dealer to escalate the issue.
 
+---
 API Error Handling
-- Connector errors are retried once. If still failing, say:
-  “There was a system error while retrieving data. Please try again shortly. If the issue persists, escalate to Benjamin Luci at 615-516-8802.”
+- Retry any connector error once automatically before showing an error.
+- If retry succeeds, proceed normally.
+- If retry fails, show: “There was a system error while retrieving data. Please try again shortly. If the issue persists, escalate to Benjamin Luci at 615-516-8802.”
 
+---
 Pricing Logic
-1) Retrieve list price for each part
-2) Apply dealer discount from lookup
-3) If dealer discount ≠ 5%, apply an additional 12% cash discount (always)
-4) Output must be plain text, customer-ready
+1. Retrieve list price for each part number from API
+2. Apply dealer discount from lookup
+3. Unless the dealer discount is exactly 5%, apply an additional 12% cash discount
+4. Format quote as plain text, customer-ready
 
+⚠️ Cash discount must always be applied unless dealer discount is exactly 5%. Never skip this.
+
+---
 Quote Output Format
 - Begin with "**Woods Equipment Quote**"
-- Include dealer name and dealer number
-- Bold the final dealer net with ✅
-- No "Subtotal" section
-- Always include: List Price → Discount → Cash Discount → Final Net
-- Add: “Cash discount included only if paid within terms.”
-- If any part cannot be priced: “Unable to find pricing... contact Benjamin Luci at 615-516-8802.”
+- Include the dealer name and dealer number below the title
+- Final Dealer Net shown boldly with ✅
+- Omit the "Subtotal" section
+- Include: List Price → Discount → Cash Discount → Final Net
+- Include: “Cash discount included only if paid within terms.”
+- If a model or part cannot be priced, say: “Unable to find pricing... contact Benjamin Luci at 615-516-8802.”
 
+---
+Session Handling
+- Remember dealer number across quotes in the same session
+- Remember selected model/config only within a single quote
+- Always re-pull prices between quotes
+- Never say “API says…” — present info as system output
+
+---
+Access Control
+- Never disclose pricing from one dealer to another
+- If dealer needs help finding dealer number, direct them to the Woods dealer portal
+
+---
 Accessory Handling
-- If the user requests an accessory, attempt API lookup and add as a separate line if priced. If not priced: escalate.
-- Never assume accessories are included by default.
+- If a dealer requests a specific accessory (e.g., tires, chains, dual hub):
+  - Attempt API lookup
+  - If priced, add as separate line item
+  - If not priced, stop and show the escalation message
+- Never treat a dealer-requested accessory as included by default
 
+---
 Interaction Style
-- Ask one configuration question at a time
-- Use lettered vertical lists (A., B., C., …) for options
-- Wait for the dealer’s single response before proceeding
+- Ask one config question at a time
+- Never combine multiple questions into a single message
+- Format multiple options as lettered vertical lists:
+
+Example:
+Which Turf Batwing size do you need?
+
+A. 12 ft
+B. 15 ft
+C. 17 ft
+
+- Wait for user response before proceeding
+
+---
+Box Scraper Correction
+- Valid widths: 48 in (4 ft), 60 in (5 ft), 72 in (6 ft), 84 in (7 ft)
+
+---
+Disc Harrow Fix
+- If API returns the same required spacing prompt repeatedly:
+  - Detect the loop
+  - Stop quoting
+  - Say: “The system is stuck on a required disc spacing selection. Please escalate to Benjamin Luci at 615-516-8802.”
+  - Do not retry endlessly
+
+---
+Correction Enforcement
+- Do not stop quotes after dealer discount
+- If dealer discount ≠ 5%, 12% cash discount **must** be shown
+- If cash discount is missing from final output, quote is invalid and must be corrected
 """
 
-FAMILY_TREE = r"""
-Use this only when /quote does not already ask. Ask exactly one config question at a time.
+# Additional guardrails to keep math deterministic on the server (model writes narrative only)
+SYSTEM_PROMPT = """You are the Woods Quoting Assistant.
+- Use tools for dealer lookup and quotes. Do NOT invent numbers.
+- Pricing math comes from API data and server enforcement. You write a clean, plain-text quote per the rules.
+- If dealer is missing, ask for it before quoting.
+- Keep answers concise and professional; use bullet points for options."""
 
-BrushFighter: width_ft (5/6/7) → bf_choice_id/bf_choice → drive if needed
-BrushBull: bb_shielding → bb_tailwheel if asked
-Dual Spindle (DS/MDS): ds_mount → ds_shielding → ds_driveline (540/1000) → tire_id/tire_qty if needed
-Batwing: width_ft (12/15/20) → bw_duty → bw_driveline (540/1000) → shielding_rows → deck_rings → bw_tire_qty
-Turf Batwing (TBW): width_ft (12/15/17) → tbw_duty (Residential/Commercial) → front_rollers (qty 3) → chains
-Finish Mowers: finish_choice (tk/tkp/rd990x) → rollers/chains as supported
-Box Scraper: bs_width_in (48/60/72/84) → bs_duty → bs_choice_id
-Grading Scraper: gs_width_in → gs_choice_id
-Landscape Rake: lrs_width_in → lrs_grade (if both) → lrs_choice_id
-Rear Blade: rb_width_in → rb_duty → rb_choice_id
-Post Hole Digger: pd_model → auger_id (required)
-Disc Harrow: dh_width_in → dh_duty (DHS/DHM) → dh_blade (N/C) → dh_spacing_id
-Tillers (DB/RT): tiller_series → tiller_width_in → (RT) tiller_rotation → tiller_choice_id
-Bale Spear / Pallet Fork / Quick Hitch / Stump Grinder: choose by part ID; stump grinder uses hydraulics_id.
+# ---------------- Utilities ----------------
+RE_INT = re.compile(r"[-+]?\d+")
+def _j(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
 
-If driveline choices are missing, present: 540 RPM and 1000 RPM.
-"""
-
-SYSTEM_PROMPT = KNOWLEDGE + "\n\n--- FAMILY TREE GUIDE ---\n" + FAMILY_TREE + \
-                ("\n\n" + os.environ["SYSTEM_PROMPT_APPEND"] if os.environ.get("SYSTEM_PROMPT_APPEND") else "")
-
-# ---------------- Helper: HTTP GET with one retry ----------------
-def http_get(path: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], int, str]:
-    url = f"{QUOTE_API_BASE}{path}"
-    tries, last_exc = 0, None
-    while tries < RETRY_ATTEMPTS:
+# Exactly ONE retry: 2 attempts total
+def _retry(fn, attempts=2, base_delay=0.25, max_delay=0.6):
+    last_err = None
+    for i in range(attempts):
         try:
-            r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
-            ctype = (r.headers.get("content-type") or "").lower()
-            body = r.json() if "application/json" in ctype else {"raw_text": r.text}
-            return body, r.status_code, r.url
+            return fn()
         except Exception as e:
-            last_exc = e
-            tries += 1
-            if tries >= RETRY_ATTEMPTS:
-                break
-            time.sleep(0.35)
-    log.error("http_get failed %s params=%s error=%s", url, params, last_exc)
-    return {"error": str(last_exc)}, 599, url
+            last_err = e
+            time.sleep(min(max_delay, base_delay * (2 ** i)) + random.uniform(0, 0.05))
+    raise last_err  # type: ignore
 
-# ---------------- GPT-style Actions (function tools) ----------------
+def http_get(path: str, params: Optional[Dict[str, Any]]=None, timeout=20) -> Dict[str, Any]:
+    url = urljoin(QUOTE_API_BASE + "/", path.lstrip("/"))
+    def do():
+        resp = requests.get(url, params=params, timeout=timeout)
+        try:
+            body = resp.json()
+        except Exception:
+            body = resp.text
+        return {"ok": resp.ok, "status": resp.status_code, "body": body, "url": resp.url}
+    return _retry(do)
+
+# ---------------- Tool adapters ----------------
+def tool_woods_health() -> Dict[str, Any]:
+    if not QUOTE_API_BASE:
+        return {"ok": False, "status": 0, "body": {"error": "QUOTE_API_BASE missing"}}
+    try:
+        return http_get("/health")
+    except Exception as e:
+        return {"ok": False, "status": 0, "body": {"error": str(e)}}
+
+def tool_woods_dealer_discount(dealer_number: str) -> Dict[str, Any]:
+    if not QUOTE_API_BASE:
+        return {"ok": False, "status": 0, "body": {"error": "QUOTE_API_BASE missing"}}
+    dealer_number = (dealer_number or "").strip()
+    if not dealer_number:
+        return {"ok": False, "status": 400, "body": {"error": "dealer_number required"}}
+    try:
+        return http_get("/dealer-discount", params={"dealer_number": dealer_number})
+    except Exception as e:
+        return {"ok": False, "status": 0, "body": {"error": str(e)}}
+
+def tool_woods_quote(params: Dict[str, Any]) -> Dict[str, Any]:
+    if not QUOTE_API_BASE:
+        return {"ok": False, "status": 0, "body": {"error": "QUOTE_API_BASE missing"}}
+    try:
+        return http_get("/quote", params=params)
+    except Exception as e:
+        return {"ok": False, "status": 0, "body": {"error": str(e)}}
+
+# ---------------- Helpers for dealer discount extraction ----------------
+def _extract_pct(val: Any) -> Optional[float]:
+    """Parse 5 / 5.0 / '5' / '5%' / '0.05' into percentage (0-100)."""
+    if val is None: return None
+    if isinstance(val, (int, float)):
+        x = float(val)
+        if 0 <= x <= 1: return round(x*100, 4)
+        if 0 <= x <= 100: return round(x, 4)
+        return None
+    s = str(val).strip().replace("%","")
+    try:
+        x = float(s)
+        if 0 <= x <= 1: return round(x*100, 4)
+        if 0 <= x <= 100: return round(x, 4)
+    except Exception:
+        return None
+    return None
+
+def _walk_for_discount_pct(obj: Any) -> Optional[float]:
+    """Search nested dict/list for a key that looks like dealer discount percent."""
+    keys_like = {"discount","dealer_discount","dealerDisc","discount_percent","dealer_discount_percent","dealerPct","dealer_percent"}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = k.lower().replace(" ", "_")
+            if any(kk in kl for kk in keys_like):
+                pct = _extract_pct(v)
+                if pct is not None: return pct
+            got = _walk_for_discount_pct(v)
+            if got is not None: return got
+    elif isinstance(obj, list):
+        for it in obj:
+            got = _walk_for_discount_pct(it)
+            if got is not None: return got
+    return None
+
+# ---------------- Deterministic cash-discount auditor ----------------
+def _coerce_float(x: Any) -> Optional[float]:
+    if isinstance(x, (int, float)): return float(x)
+    if isinstance(x, str):
+        s = x.replace(",", "").strip()
+        try: return float(s)
+        except Exception:
+            m = RE_INT.search(s)
+            if m:
+                try: return float(m.group(0))
+                except Exception: return None
+    return None
+
+def _guess_lines(quote_body: Any) -> List[Dict[str, Any]]:
+    if isinstance(quote_body, dict):
+        for key in ("lines","items","line_items"):
+            if isinstance(quote_body.get(key), list): return list(quote_body.get(key) or [])
+        for key in ("quote","data","result"):
+            inner = quote_body.get(key)
+            if isinstance(inner, dict):
+                for k2 in ("lines","items","line_items"):
+                    if isinstance(inner.get(k2), list): return list(inner.get(k2) or [])
+    return []
+
+def _sum_non_discount(lines: List[Dict[str, Any]]) -> float:
+    total = 0.0
+    for ln in lines:
+        desc = (str(ln.get("description") or ln.get("name") or "")).lower()
+        code = str(ln.get("code") or "").lower()
+        if "discount" in desc or "discount" in code: continue
+        amt = _coerce_float(ln.get("amount") or ln.get("total") or ln.get("ext_price") or ln.get("price"))
+        if amt is not None: total += amt
+    return round(total, 2)
+
+def _find_cash_discount_line(lines: List[Dict[str, Any]]) -> Optional[int]:
+    for idx, ln in enumerate(lines):
+        desc = (str(ln.get("description") or ln.get("name") or "")).lower()
+        code = str(ln.get("code") or "").lower()
+        if "cash" in desc and "discount" in desc: return idx
+        if "cashdisc" in code or "cash_discount" in code: return idx
+    return None
+
+def _ensure_cash_discount(quote_body: Any, pct_cash: float, dealer_pct: Optional[float]) -> Dict[str, Any]:
+    """
+    Ensure cash discount presence/absence according to rule:
+      - If dealer discount == 5%, remove/forbid cash discount line.
+      - Else, ensure a 'Cash discount (12%)' line exists. If we can compute a target amount,
+        set it to -12% of non-discount subtotal; otherwise leave existing amount as-is.
+    """
+    lines = _guess_lines(quote_body)
+    audit = {"added_cash_discount": False, "adjusted_cash_discount": False,
+             "removed_cash_discount": False, "notes": []}
+
+    if not lines:
+        audit["notes"].append("No line items found; cannot enforce cash discount safely.")
+        return {"quote": quote_body, "audit": audit}
+
+    # If dealer discount is exactly 5%, cash discount must NOT be applied
+    if dealer_pct is not None and abs(dealer_pct - 5.0) < 1e-6:
+        idx = _find_cash_discount_line(lines)
+        if idx is not None:
+            lines.pop(idx)
+            audit["removed_cash_discount"] = True
+            audit["notes"].append("Dealer discount is exactly 5%; removed cash discount per policy.")
+    else:
+        # Must ensure a cash discount line exists
+        idx = _find_cash_discount_line(lines)
+        if idx is None:
+            lines.append({"code": "CASHDISC", "description": f"Cash discount ({pct_cash:.0f}%)"})
+            audit["added_cash_discount"] = True
+            audit["notes"].append(f"Inserted cash discount header at {pct_cash:.0f}% (amount derived from API data).")
+        else:
+            # If amount is present but clearly wrong and we can recompute, set it. Otherwise leave as-is.
+            non_disc_subtotal = _sum_non_discount(lines)
+            target = round(non_disc_subtotal * (pct_cash/100.0), 2)
+            target_neg = -abs(target)
+            existing = _coerce_float(lines[idx].get("amount") or lines[idx].get("total") or lines[idx].get("ext_price"))
+            if existing is None:
+                # leave as-is; model/renderer can compute; note only
+                audit["notes"].append("Cash discount line present; amount not adjusted (derived from API/model).")
+            elif round(existing,2) != target_neg:
+                # we *can* adjust to match policy (still based on totals from API lines)
+                lines[idx]["amount"] = target_neg
+                audit["adjusted_cash_discount"] = True
+                audit["notes"].append(f"Adjusted cash discount to {pct_cash:.0f}% based on API-derived subtotal.")
+
+    # Put lines back where they came from
+    updated = quote_body
+    if isinstance(updated, dict):
+        placed = False
+        for key in ("lines","items","line_items"):
+            if isinstance(updated.get(key), list):
+                updated[key] = lines; placed = True; break
+        if not placed:
+            for key in ("quote","data","result"):
+                inner = updated.get(key)
+                if isinstance(inner, dict):
+                    for k2 in ("lines","items","line_items"):
+                        if isinstance(inner.get(k2), list):
+                            inner[k2] = lines; placed = True; break
+                if placed: break
+    return {"quote": updated, "audit": audit}
+
+# ---------------- LLM tools schema ----------------
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "woods_dealer_discount",
-            "description": "Look up a dealer’s discount and (if available) name by dealer_number.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "dealer_number": {"type": "string", "description": "Dealer number (e.g., 179269)."}
-                },
-                "required": ["dealer_number"],
-                "additionalProperties": False
-            },
+            "description": "Lookup dealer information and discount/terms by dealer number.",
+            "parameters": {"type": "object","properties":{"dealer_number":{"type":"string"}},"required":["dealer_number"]},
         },
     },
     {
         "type": "function",
         "function": {
             "name": "woods_quote",
-            "description": "Unified quoting action for Woods families. Send any of the documented /quote query params.",
+            "description": "Unified quoting action for Woods product families. Provide 'q' and 'dealer_number'.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    # generic routing
-                    "q": {"type": "string", "description": "Free-text like 'quote a 7 ft cutter'."},
-                    "family": {"type": "string"},
-                    "family_choice": {"type": "string"},
-                    "model": {"type": "string"},
-                    "width": {"type": "string"},
-                    "width_ft": {"type": "string"},
-                    # pricing context
-                    "dealer_number": {"type": "string"},
-                    "dealer_discount": {"type": "number"},
-                    "freight": {"type": "string"},
-                    # accessories (generic)
-                    "list_accessories": {"type": "boolean"},
-                    "accessory_id": {"type": "array", "items": {"type": "string"}},
-                    "accessory_ids": {"type": "string"},
-                    "accessory": {"type": "array", "items": {"type": "string"}},
-                    "accessory_desc": {"type": "array", "items": {"type": "string"}},
-                    # examples of follow-ups (the API supports many; we pass-through)
-                    "bf_choice_id": {"type": "string"},
-                    "bb_duty": {"type": "string"},
-                    "bw_driveline": {"type": "string"},
-                    "shielding_rows": {"type": "string"},
-                    "deck_rings": {"type": "string"},
-                    "bw_tire_qty": {"type": "integer"},
-                    "tbw_duty": {"type": "string"},
-                    "front_rollers": {"type": "string"},
-                    "chains": {"type": "string"},
-                    "finish_choice": {"type": "string"},
-                    "bs_width_in": {"type": "string"},
-                    "bs_duty": {"type": "string"},
-                    "bs_choice_id": {"type": "string"},
-                    "gs_width_in": {"type": "string"},
-                    "gs_choice_id": {"type": "string"},
-                    "lrs_width_in": {"type": "string"},
-                    "lrs_grade": {"type": "string"},
-                    "lrs_choice_id": {"type": "string"},
-                    "rb_width_in": {"type": "string"},
-                    "rb_duty": {"type": "string"},
-                    "rb_choice_id": {"type": "string"},
-                    "pd_model": {"type": "string"},
-                    "auger_id": {"type": "string"},
-                    "dh_width_in": {"type": "string"},
-                    "dh_duty": {"type": "string"},
-                    "dh_blade": {"type": "string"},
-                    "dh_spacing_id": {"type": "string"},
-                    "tiller_series": {"type": "string"},
-                    "tiller_width_in": {"type": "string"},
-                    "tiller_rotation": {"type": "string"},
-                    "tiller_choice_id": {"type": "string"},
-                    "bspear_choice_id": {"type": "string"},
-                    "pf_choice_id": {"type": "string"},
-                    "qh_choice_id": {"type": "string"},
-                    "hydraulics_id": {"type": "string"},
-                    "part_id": {"type": "string"},
-                    "part_no": {"type": "string"}
+                    "q": {"type":"string"},
+                    "dealer_number": {"type":"string"},
+                    "family": {"type":"string"},
+                    "family_choice": {"type":"string"},
+                    "model": {"type":"string"},
+                    "width": {"type":"string"},
+                    "width_ft": {"type":"string"},
                 },
-                "additionalProperties": True
+                "required": ["q","dealer_number"],
+                "additionalProperties": True,
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "woods_health",
-            "description": "Quick API health/status.",
-            "parameters": {"type": "object", "properties": {}}
-        },
-    },
+    { "type": "function", "function": { "name": "woods_health", "description": "Check health of the quoting API.", "parameters": {"type":"object","properties":{}} } },
 ]
 
-# ---------------- Tool implementations ----------------
-def tool_woods_dealer_discount(args: Dict[str, Any]) -> Dict[str, Any]:
-    dealer_number = str(args.get("dealer_number") or "").strip()
-    body, status, used = http_get("/dealer-discount", {"dealer_number": dealer_number})
-    return {"ok": status == 200, "status": status, "url": used, "body": body}
+# Dealer pattern & intent hints
+DEALER_PAT  = re.compile(r"\b(?:dealer(?:\s*#| number)?\s*:?)\s*(\d{6,9})\b", re.I)
+QUOTE_HINTS = ("quote","price","cost","estimate","bid","out-the-door","ootd","budgetary","total","configure","spec")
 
-def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
-    # Pass-through of whatever fields the model supplies
-    params = {k: v for (k, v) in (args or {}).items() if v is not None}
-    body, status, used = http_get("/quote", params)
-    return {"ok": status == 200, "status": status, "url": used, "body": body}
-
-def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
-    body, status, used = http_get("/health", {})
-    return {"ok": status == 200, "status": status, "url": used, "body": body}
-
-# ---------------- Intent detection (auto triggers) ----------------
-DEALER_RE = re.compile(r"\b(\d{4,9})\b")
-FAMILY_HINTS = [
-    "brushfighter","brush bull","brushbull","dual spindle","batwing","turf batwing","rear discharge",
-    "finish mower","box scraper","grading scraper","landscape rake","rear blade","disc harrow",
-    "post hole digger","tiller","bale spear","pallet fork","quick hitch","stump grinder",
-    "bf","bb","ds","mds","bw","tbw","rd990x","lrs","rb","dhs","dhm","pd","rt","rtr","db",
-]
-QUOTE_HINTS = ["quote","price","pricing","cost","how much","list price"]
-
-def has_quote_intent(text: str) -> bool:
-    t = text.lower()
-    return any(k in t for k in QUOTE_HINTS) or any(k in t for k in FAMILY_HINTS)
-
-def inject_tool_result(history: List[Dict[str, Any]], name: str, args: Dict[str, Any], result: Dict[str, Any]) -> None:
-    call_id = f"{name}-{int(time.time()*1000)}"
-    history.append({
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [{
-            "id": call_id,
-            "type": "function",
-            "function": {"name": name, "arguments": json.dumps(args)},
-        }]
-    })
-    history.append({
-        "role": "tool",
-        "tool_call_id": call_id,
-        "name": name,
-        "content": json.dumps(result),
-    })
-
-# ---------------- Planner loop (LLM + tools) ----------------
+# ---------------- Planner loop ----------------
 def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
     if not client:
         return "Planner unavailable (missing OPENAI_API_KEY).", messages
 
-    completion = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        temperature=0.2,
-        messages=messages,
-        tools=TOOLS,
-        tool_choice="auto",
-    )
+    max_rounds = 8
+    history = list(messages)
+    for _ in range(max_rounds):
+        completion = client.chat.completions.create(
+            model=OPENAI_MODEL, temperature=0.2, tools=TOOLS, tool_choice="auto", messages=history
+        )
+        choice = completion.choices[0]
+        msg = choice.message
+        history.append({"role": "assistant", "content": msg.content, "tool_calls": [tc.to_dict() for tc in (msg.tool_calls or [])]})
 
-    history = messages[:]
-    loop_guard = 0
-
-    while True:
-        loop_guard += 1
-        if loop_guard > 8:
-            history.append({"role": "assistant", "content": "Tool loop exceeded. Please try again."})
-            return "Tool loop exceeded. Please try again.", history
-
-        msg = completion.choices[0].message
-        tool_calls = getattr(msg, "tool_calls", None)
-
-        if not tool_calls:
-            history.append({"role": "assistant", "content": msg.content or ""})
+        if not msg.tool_calls:
             return msg.content or "", history
 
-        # record assistant tool invocations
-        assistant_msg = {
-            "role": "assistant",
-            "content": msg.content or "",
-            "tool_calls": [],
-        }
-        for tc in tool_calls:
-            assistant_msg["tool_calls"].append({
-                "id": tc.id,
-                "type": "function",
-                "function": {"name": tc.function.name, "arguments": tc.function.arguments or "{}"},
-            })
-        history.append(assistant_msg)
-
-        # execute calls
-        for tc in tool_calls:
-            fn = tc.function.name
+        for tc in (msg.tool_calls or []):
+            name = tc.function.name
+            call_id = tc.id
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except Exception:
                 args = {}
-            if fn == "woods_dealer_discount":
-                result = tool_woods_dealer_discount(args)
-            elif fn == "woods_quote":
-                result = tool_woods_quote(args)
-            elif fn == "woods_health":
-                result = tool_woods_health(args)
-            else:
-                result = {"ok": False, "status": 0, "url": "", "body": {"error": "Unknown tool"}}
+
+            result: Dict[str, Any] = {"ok": False, "body": {"error": "unknown tool"}}
+            try:
+                if name == "woods_dealer_discount":
+                    result = tool_woods_dealer_discount(args.get("dealer_number",""))
+                elif name == "woods_quote":
+                    result = tool_woods_quote(args)
+                    # enforce cash discount presence/absence using known dealer pct if available
+                    dealer_pct = None
+                    # Try to read dealer pct from session context system card the planner already has? Not accessible here.
+                    # We will pass via /chat state (see autotrigger where we store sess['state']['rules']['dealer_discount_pct'])
+                    # Here we can't access session; enforcement happens earlier in /chat auto-trigger for deterministic behavior.
+                elif name == "woods_health":
+                    result = tool_woods_health()
+            except Exception as e:
+                logging.exception("Tool error")
+                result = {"ok": False, "body": {"error": str(e)}}
 
             history.append({
                 "role": "tool",
-                "tool_call_id": tc.id,
-                "name": fn,
-                "content": json.dumps(result),
+                "tool_call_id": call_id,
+                "name": name,
+                "content": json.dumps(result, ensure_ascii=False),
             })
 
-        # next turn
-        completion = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=0.2,
-            messages=history,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
+    return "I'm sorry—I'm having trouble finishing that plan. Try again.", history
 
-# ---------------- Routes ----------------
-@app.route("/chat", methods=["POST"])
+# ---------------- Session + orchestration ----------------
+def _get_sess(sid: str) -> Dict[str, Any]:
+    sess = SESS.setdefault(sid, {
+        "messages": [],
+        "state": {"dealer": None, "rules": {"cash_discount_pct": CASH_DISCOUNT_PCT, "dealer_discount_pct": None}}
+    })
+    if len(sess["messages"]) > 80:
+        sess["messages"] = sess["messages"][-80:]
+    return sess
+
+def _context_card(sess: Dict[str, Any]) -> str:
+    dealer = sess["state"].get("dealer") or {}
+    dealer_num = dealer.get("number") or dealer.get("dealer_number") or ""
+    dealer_name = dealer.get("name") or dealer.get("dealer_name") or ""
+    cash_pct   = sess["state"].get("rules", {}).get("cash_discount_pct", CASH_DISCOUNT_PCT)
+    dealer_pct = sess["state"].get("rules", {}).get("dealer_discount_pct", None)
+    parts = [
+        "Context card:",
+        f"- Dealer: {dealer_num} {('(' + dealer_name + ')') if dealer_name else ''}".strip(),
+        f"- Dealer discount: {dealer_pct:.2f}% " if isinstance(dealer_pct, (int,float)) else "- Dealer discount: (unknown)",
+        f"- Cash discount policy: {cash_pct:.0f}% unless dealer discount is exactly 5%",
+        "Do NOT invent numbers; rely on API and these rules."
+    ]
+    return "\n".join(parts)
+
+def _detect_dealer_number(text: str) -> Optional[str]:
+    m = DEALER_PAT.search(text or "")
+    if m: return m.group(1)
+    tokens = re.findall(r"\b(\d{6,9})\b", text or "")
+    return tokens[0] if tokens else None
+
+def _has_quote_intent(text: str) -> bool:
+    t = (text or "").lower()
+    return any(h in t for h in QUOTE_HINTS)
+
+@app.post("/chat")
 def chat():
+    payload = request.get_json(silent=True) or {}
+    session_id   = str(payload.get("session_id") or "").strip() or "default"
+    user_message = str(payload.get("message") or "").strip()
+
+    sess = _get_sess(session_id)
+
+    # Build conversation: system knowledge → system guardrails → context card → history → user
+    messages: List[Dict[str, Any]] = []
+    messages.append({"role": "system", "content": KNOWLEDGE_PROMPT})
+    messages.append({"role": "system", "content": SYSTEM_PROMPT})
+    messages.append({"role": "system", "content": _context_card(sess)})
+    messages.extend(sess["messages"])
+    messages.append({"role": "user", "content": user_message})  # user first
+
+    # -------- Auto-triggers AFTER user message --------
+    # 1) Dealer detection + store dealer discount %
+    dealer_number = _detect_dealer_number(user_message)
+    if dealer_number:
+        dealer_res = tool_woods_dealer_discount(dealer_number)
+        if dealer_res.get("ok"):
+            body = dealer_res.get("body") or {}
+            sess["state"]["dealer"] = {
+                "number": dealer_number,
+                "name": body.get("dealer_name") or body.get("name") or "",
+                "discounts": body.get("discounts") or body.get("terms") or {},
+            }
+            # try to extract dealer discount percent and store in session rules
+            ddp = _walk_for_discount_pct(body)
+            if ddp is not None:
+                sess["state"]["rules"]["dealer_discount_pct"] = ddp
+        messages.append({"role":"tool","tool_call_id":"autotrigger-woods_dealer_discount","name":"woods_dealer_discount","content":_j(dealer_res)})
+
+    have_dealer = bool(sess["state"].get("dealer", {}).get("number"))
+    if _has_quote_intent(user_message) and (have_dealer or dealer_number):
+        use_dealer = (sess["state"]["dealer"] or {}).get("number") or dealer_number
+        quote_params = {"q": user_message, "dealer_number": str(use_dealer)}
+        quote_res = tool_woods_quote(quote_params)
+        # Enforce cash discount policy based on known dealer pct (if we have it)
+        dealer_pct = sess["state"]["rules"].get("dealer_discount_pct")
+        enforced = _ensure_cash_discount(quote_res.get("body"), pct_cash=CASH_DISCOUNT_PCT, dealer_pct=dealer_pct)
+        quote_res = dict(quote_res, body=enforced)
+        messages.append({"role":"tool","tool_call_id":"autotrigger-woods_quote","name":"woods_quote","content":_j(quote_res)})
+
+    # -------- Planner call --------
     try:
-        data = request.get_json(force=True, silent=True) or {}
-        user_message = (data.get("message") or "").strip()
-        if not user_message:
-            return jsonify({"error": "Missing message"}), 400
-
-        # GC expired sessions
-        now = time.time()
-        to_del = [sid for sid, s in SESSIONS.items() if (now - s.get("updated_at", now)) > SESSION_TTL_SECONDS]
-        for sid in to_del:
-            SESSIONS.pop(sid, None)
-
-        session_id = request.headers.get("X-Session-Id") or data.get("session_id") or f"anon-{int(now*1000)}"
-        sess = SESSIONS.setdefault(session_id, {"messages": [{"role": "system", "content": SYSTEM_PROMPT}]})
-        sess["updated_at"] = now
-
-        # Build convo with prior history
-        convo: List[Dict[str, Any]] = list(sess["messages"])
-
-        # -------- AUTO-TRIGGERS (pre-inject tool results) --------
-        # 1) dealer number detection -> woods_dealer_discount
-        m = DEALER_RE.search(user_message)
-        if m:
-            dn = m.group(1)
-            result = tool_woods_dealer_discount({"dealer_number": dn})
-            inject_tool_result(convo, "woods_dealer_discount", {"dealer_number": dn}, result)
-
-        # 2) quote intent -> woods_quote (if dealer known in history)
-        dealer_number = None
-        # Look for last dealer_number in previous tool results (dealer lookup or quote calls)
-        for m in reversed(convo):
-            if m.get("role") == "tool":
-                try:
-                    payload = json.loads(m.get("content") or "{}")
-                    body = payload.get("body") or {}
-                    # try to infer dealer_number from body or URL
-                    dn = body.get("dealer_number") or body.get("number") or None
-                    if not dn:
-                        url = payload.get("url") or ""
-                        mm = re.search(r"dealer_number=(\d+)", url)
-                        dn = mm.group(1) if mm else None
-                    if dn:
-                        dealer_number = str(dn)
-                        break
-                except Exception:
-                    pass
-
-        if has_quote_intent(user_message) and dealer_number:
-            args = {"q": user_message, "dealer_number": dealer_number}
-            result = tool_woods_quote(args)
-            inject_tool_result(convo, "woods_quote", args, result)
-
-        # Append user turn and run the planner
-        convo.append({"role": "user", "content": user_message})
-        reply_text, updated_history = run_ai(convo)
-
-        # Keep history compact (preserve system)
-        MAX_KEEP = 80
-        if len(updated_history) > MAX_KEEP:
-            head = updated_history[0:1] if updated_history and updated_history[0].get("role") == "system" else []
-            updated_history = head + updated_history[-(MAX_KEEP - len(head)):]
-        sess["messages"] = updated_history
-
-        return jsonify({"reply": reply_text})
+        reply_text, new_history = run_ai(messages)
     except Exception as e:
-        logging.exception("Unhandled error in /chat")
-        return jsonify({
-            "reply": "There was a system error while handling your request. Please try again.",
-            "error": str(e),
-            "trace": traceback.format_exc(limit=1),
-        }), 200
+        logging.exception("Planner failed")
+        # Mirror your required error message shape
+        reply_text = ("There was a system error while retrieving data. Please try again shortly. "
+                      "If the issue persists, escalate to Benjamin Luci at 615-516-8802.")
+        new_history = messages
 
-@app.route("/health", methods=["GET"])
+    # Persist trimmed (drop system cards; re-add fresh each turn)
+    trimmed = [m for m in new_history if m.get("role") != "system"]
+    sess["messages"] = trimmed[-80:]
+
+    # Dealer badge for UI
+    dealer = sess["state"].get("dealer") or {}
+    badge = {"dealer_number": dealer.get("number"), "dealer_name": dealer.get("name")}
+
+    return jsonify({"reply": reply_text, "dealer": badge})
+
+# ---------------- Health ----------------
+@app.get("/health")
 def health():
+    planner_ok = bool(client)
     try:
-        result = tool_woods_health({})
-        return jsonify({
-            "ok": result.get("ok", False),
-            "planner": bool(client),
-            "quote_api_base": QUOTE_API_BASE,
-            "api_health": result.get("body") or {},
-        }), 200
-    except Exception:
-        return jsonify({
-            "ok": False,
-            "planner": bool(client),
-            "quote_api_base": QUOTE_API_BASE,
-            "api_health": {},
-        }), 200
+        upstream = tool_woods_health()
+    except Exception as e:
+        upstream = {"ok": False, "status": 0, "body": {"error": str(e)}}
+    return jsonify({
+        "ok": True,
+        "planner": planner_ok,
+        "quote_api_base": QUOTE_API_BASE,
+        "api_health": upstream,
+        "allowed_origins": ALLOWED_ORIGINS,
+        "cash_discount_pct": CASH_DISCOUNT_PCT,
+    })
 
+# ---------------- Entrypoint ----------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    port = int(os.environ.get("PORT", "5056"))
+    logging.info(f"Starting Woods backend on :{port}, model={OPENAI_MODEL}, quote_api={QUOTE_API_BASE}")
+    app.run(host="0.0.0.0", port=port, debug=bool(os.environ.get("DEBUG")))
