@@ -1,17 +1,13 @@
-# chat_backend.py — AI chat backend with Woods family-tree Q&A and action execution
+# chat_backend.py — AI chat backend with Woods actions + family-tree Q&A
 #
-# - POST /chat   -> { reply: "...", quote?: {...}, dealer?: {...}, dealer_number?: "..." }
-# - GET  /health -> { ok, planner, model, action_base }
-#
-# Behavior:
-# • Model may output routing JSON ({action, reply, params}). We execute actions and hide routing from users.
-# • Family-tree logic: if /quote returns follow-up questions, we ask one-at-a-time, store pending,
-#   map A/B/C or label -> correct param(s), and re-call /quote until complete.
+# Endpoints
+#   POST /chat   -> { reply: "...", quote?: {...}, dealer?: {...}, dealer_number?: "..." }
+#   GET  /health -> { ok, planner, model, action_base, include_routing }
 #
 # Quick start
 #   pip install flask flask-cors openai requests
 #   export OPENAI_API_KEY=sk-...
-#   export ACTION_BASE_URL="https://woods-quote-api.onrender.com"
+#   export ACTION_BASE_URL="https://woods-quote-api.onrender.com"  # quoting API base
 #   python chat_backend.py
 #
 from __future__ import annotations
@@ -30,8 +26,11 @@ import requests
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 TEMPERATURE  = float(os.environ.get("TEMPERATURE", "0.3"))
 SESSION_TTL_SECONDS = 60 * 30  # 30 minutes
+# Quoting API base (NOT the chat backend host)
 ACTION_BASE_URL = os.environ.get("ACTION_BASE_URL", "https://woods-quote-api.onrender.com")
-# Hide routing JSON by default from the HTTP response
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "https://woodsequipment-quote.onrender.com")
+
+# Hide routing JSON from HTTP responses by default
 INCLUDE_ROUTING = str(os.environ.get("INCLUDE_ROUTING", "false")).lower() not in ("0", "false", "no")
 
 logging.basicConfig(level=logging.INFO)
@@ -161,6 +160,31 @@ if CORS:
     else:
         CORS(app, supports_credentials=False)
 
+# Ensure JSON body + no-store on every response
+@app.after_request
+def ensure_non_empty_json(resp):
+    try:
+        if resp.status_code == 200 and (not resp.data or resp.data == b""):
+            resp = app.response_class(
+                response=json.dumps({"reply": "There was a system error while handling your request. Please try again."}),
+                status=200,
+                mimetype="application/json",
+            )
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    except Exception:
+        return app.response_class(
+            response='{"reply":"There was a system error while handling your request. Please try again."}',
+            status=200,
+            mimetype="application/json",
+            headers={"Cache-Control": "no-store"},
+        )
+
+@app.errorhandler(Exception)
+def on_error(e):
+    log.exception("Unhandled exception")
+    return jsonify({"reply": "There was a system error while handling your request. Please try again."}), 200
+
 # -------------- Sessions (in-memory) --------------
 # Session shape:
 # {
@@ -173,7 +197,7 @@ if CORS:
 #       "question": "Which duty do you need?",
 #       "use_id": True|False,
 #       "choices": [{"letter":"A","label":"...","id":"...","value":"..."}],
-#       "raw": {...}                  # original object for debugging if needed
+#       "raw": {...}
 #   }
 # }
 SESSIONS: Dict[str, Dict[str, Any]] = {}
@@ -202,28 +226,67 @@ def trim_history(messages: List[Dict[str, str]], max_keep: int = 60) -> List[Dic
     head = messages[:1] if messages and messages[0].get("role") == "system" else []
     return head + messages[-(max_keep - len(head)) :]
 
+def _looks_jsonish(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    t = text.strip()
+    return t.startswith("{") or t.startswith("[") or "```json" in t.lower()
+
+def _sanitize_to_ai_reply(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    out = re.sub(r"```json[\s\S]*?```", "", text, flags=re.IGNORECASE).strip()
+    if _looks_jsonish(out):
+        return "Got it — handled that selection. What would you like next?"
+    return out or "Okay."
+
 def extract_routing_json(text: str) -> Optional[Dict[str, Any]]:
-    # direct JSON?
+    """Parse routing JSON even if the model wrapped it in quotes or code fences."""
+    if not text:
+        return None
+    t = text.strip()
+
+    # 1) fenced ```json ... ```
+    m = re.search(r"```json\s*([\s\S]*?)\s*```", t, flags=re.IGNORECASE)
+    if m:
+        t = m.group(1).strip()
+
+    # 2) quoted JSON blob
+    if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
+        inner = t[1:-1]
+        try:
+            t = bytes(inner, "utf-8").decode("unicode_escape")
+        except Exception:
+            t = inner
+
+    # 3) direct parse
     try:
-        obj = json.loads(text)
+        obj = json.loads(t)
         if isinstance(obj, dict):
             return obj
+        if isinstance(obj, str):
+            obj2 = json.loads(obj)
+            if isinstance(obj2, dict):
+                return obj2
     except Exception:
         pass
-    # fenced code ```
-    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL|re.I)
+
+    # 4) largest {...} chunk
+    m = re.search(r"\{[\s\S]*\}", t)
     if m:
+        chunk = m.group(0)
         try:
-            return json.loads(m.group(1))
+            obj = json.loads(chunk)
+            if isinstance(obj, dict):
+                return obj
         except Exception:
-            return None
-    # loose { .. }
-    m = re.search(r"(\{.*\})", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except Exception:
-            return None
+            chunk2 = chunk.replace("“", '"').replace("”", '"').replace("’", "'")
+            try:
+                obj = json.loads(chunk2)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                return None
     return None
 
 def is_valid_routing(obj: Dict[str, Any]) -> bool:
@@ -254,34 +317,6 @@ def http_get_with_retry(url: str, params: Dict[str, Any], retries: int = 1, time
         return 0, None, str(e)
 
 # ---------- Family-tree Q&A interpreter ----------
-def _first_required_question(payload: Any) -> Optional[Dict[str, Any]]:
-    """
-    Heuristics to extract the NEXT question from API payload.
-    Looks for common shapes:
-      - {"required_questions":[{"param","question","choices"| "choices_with_ids": [...]}, ...]}
-      - {"question":"...", "choices":[...]} or {"question":"...", "choices_with_ids":[...]}
-    Returns a normalized dict: {param, question, use_id, choices:[{label,id?,value?}], raw}
-    """
-    if not isinstance(payload, dict):
-        return None
-
-    # Case 1: required_questions list
-    rq = payload.get("required_questions")
-    if isinstance(rq, list) and rq:
-        q = rq[0]
-        return _normalize_question(q)
-
-    # Case 2: direct question/choices at top level
-    if "question" in payload and ("choices" in payload or "choices_with_ids" in payload):
-        return _normalize_question(payload)
-
-    # Case 3: nested "next_question"
-    nq = payload.get("next_question")
-    if isinstance(nq, dict) and ("choices" in nq or "choices_with_ids" in nq):
-        return _normalize_question(nq)
-
-    return None
-
 def _normalize_question(q: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not isinstance(q, dict):
         return None
@@ -307,7 +342,6 @@ def _normalize_question(q: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not choices:
         return None
 
-    # Add letters A, B, C...
     letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     out_choices = []
     for idx, it in enumerate(choices):
@@ -324,6 +358,19 @@ def _normalize_question(q: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "raw": q,
     }
 
+def _first_required_question(payload: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    rq = payload.get("required_questions")
+    if isinstance(rq, list) and rq:
+        return _normalize_question(rq[0])
+    if "question" in payload and ("choices" in payload or "choices_with_ids" in payload):
+        return _normalize_question(payload)
+    nq = payload.get("next_question")
+    if isinstance(nq, dict) and ("choices" in nq or "choices_with_ids" in nq):
+        return _normalize_question(nq)
+    return None
+
 def _format_lettered(qnorm: Dict[str, Any]) -> str:
     lines = [qnorm["question"], ""]
     for it in qnorm["choices"]:
@@ -331,44 +378,34 @@ def _format_lettered(qnorm: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 def _guess_param_names(base_param: str, prefer_id: bool) -> List[str]:
-    """
-    Given a question 'param' and whether IDs are used, return a list of param
-    names to try when posting back to /quote.
-    """
     names = []
     if prefer_id:
         if base_param.endswith("_id"):
             names.append(base_param)
         else:
-            names.append(base_param + "_id")  # common pattern
-    names.append(base_param)  # always include original
-    # common fallbacks
+            names.append(base_param + "_id")
+    names.append(base_param)
     if base_param.endswith("_choice") and prefer_id:
         names.append(base_param.replace("_choice", "_id"))
     if base_param.endswith("_width") and prefer_id:
         names.append(base_param + "_id")
-    return list(dict.fromkeys(names))  # unique order
+    return list(dict.fromkeys(names))
 
 def _apply_user_answer_to_params(user_text: str, pending: Dict[str, Any], accum: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Map 'A'/'1'/label to selected choice, then update accum params using the best param name(s).
-    When choices have IDs, prefer *_id if available; also include label fallback as *_choice if helpful.
-    """
     t = (user_text or "").strip()
     choice = None
 
-    # try letter or number
+    # letter or number
     for it in pending["choices"]:
         if t.lower() == it["letter"].lower():
             choice = it
             break
-        if t.isdigit():
-            # allow "1" for A, etc.
-            idx = int(t) - 1
-            if 0 <= idx < len(pending["choices"]) and pending["choices"][idx] == it:
-                choice = pending["choices"][idx]
-                break
-    # try exact/loose label match
+    if not choice and t.isdigit():
+        idx = int(t) - 1
+        if 0 <= idx < len(pending["choices"]):
+            choice = pending["choices"][idx]
+
+    # exact / startswith label
     if not choice:
         for it in pending["choices"]:
             if t.lower() == (it["label"] or "").lower():
@@ -381,17 +418,14 @@ def _apply_user_answer_to_params(user_text: str, pending: Dict[str, Any], accum:
                     break
 
     if not choice:
-        # No match; keep accum unchanged
-        return accum
+        return accum  # unchanged
 
     prefer_id = pending.get("use_id", False)
     names_to_try = _guess_param_names(pending["param"], prefer_id)
 
-    # Build value(s)
     value_id = choice.get("id")
     value_label = choice.get("value") or choice.get("label")
 
-    # Apply
     new_params = dict(accum)
     applied = False
     if prefer_id and value_id:
@@ -401,10 +435,8 @@ def _apply_user_answer_to_params(user_text: str, pending: Dict[str, Any], accum:
                 applied = True
                 break
     if not applied:
-        # set the base param to the label/value
         new_params[names_to_try[-1]] = value_label
 
-    # Also include *_choice for helpful backends (non-breaking)
     base = pending["param"].rstrip("_id")
     new_params.setdefault(base + "_choice", choice.get("label"))
 
@@ -413,7 +445,6 @@ def _apply_user_answer_to_params(user_text: str, pending: Dict[str, Any], accum:
 def _detect_disc_harrow_loop(prev_pending: Optional[Dict[str, Any]], new_pending: Optional[Dict[str, Any]]) -> bool:
     if not prev_pending or not new_pending:
         return False
-    # crude: same param text and same choices count means we're stuck
     return (
         prev_pending.get("param") == new_pending.get("param")
         and prev_pending.get("question") == new_pending.get("question")
@@ -430,12 +461,9 @@ def run_dealer_lookup(sess: Dict[str, Any], dealer_number: str) -> Tuple[Optiona
     return None, err or f"Lookup failed (status {code})."
 
 def run_quote(sess: Dict[str, Any], params: Dict[str, Any]) -> Tuple[Optional[Any], Optional[Dict[str, Any]], Optional[str]]:
-    # ensure dealer_number
     p = dict(params)
     if not p.get("dealer_number") and sess.get("dealer_number"):
         p["dealer_number"] = sess["dealer_number"]
-
-    # merge any accumulated params from prior questions
     p.update(sess.get("accum_params") or {})
 
     url = f"{ACTION_BASE_URL}/quote"
@@ -443,7 +471,6 @@ def run_quote(sess: Dict[str, Any], params: Dict[str, Any]) -> Tuple[Optional[An
     if code != 200:
         return None, None, err or f"Quote failed (status {code})."
 
-    # Check if API is asking a follow-up
     pending = _first_required_question(data)
     return data, pending, None
 
@@ -456,13 +483,13 @@ def stringify(obj: Any, limit: int = 12000) -> str:
     return s if len(s) <= limit else s[:limit] + "\n... (truncated) ..."
 
 def build_quote_text_from_payload(payload: Any, dealer_number: Optional[str], params_sent: Dict[str, Any]) -> str:
-    # Use a second, low-temp LLM pass to format nicely (rules already in KNOWLEDGE).
     if client:
         try:
             messages = [
                 {"role":"system","content":
                  "You are a Woods quoting assistant. Follow the 'Quote Output Format' exactly. "
-                 "Use ONLY the provided payload values. If any required price is missing, state the escalation message exactly."},
+                 "Use ONLY the provided payload values. If any required price is missing, state the escalation message exactly. "
+                 "Apply the cash discount rule strictly."},
                 {"role":"user","content":
                  f"Dealer number: {dealer_number}\n"
                  f"Params sent: {json.dumps(params_sent, ensure_ascii=False)}\n"
@@ -479,164 +506,157 @@ def build_quote_text_from_payload(payload: Any, dealer_number: Optional[str], pa
 # -------------- Routes --------------
 @app.route("/chat", methods=["POST"])
 def chat():
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        text = (data.get("message") or "").strip()
-        if not text:
-            return jsonify({"error": "Missing message"}), 400
+    data = request.get_json(force=True, silent=True) or {}
+    text = (data.get("message") or "").strip()
+    if not text:
+        return jsonify({"error": "Missing message"}), 400
 
-        session_id = request.headers.get("X-Session-Id") or data.get("session_id") or f"anon-{int(time.time()*1000)}"
+    session_id = request.headers.get("X-Session-Id") or data.get("session_id") or f"anon-{int(time.time()*1000)}"
 
-        # --- Manual session reset trigger ---
-        if text.lower() == "ben luci reset":
-            SESSIONS.pop(session_id, None)
-            return jsonify({"reply": "✅ Session reset."}), 200
+    # Manual session reset
+    if text.lower() == "ben luci reset":
+        SESSIONS.pop(session_id, None)
+        return jsonify({"reply": "✅ Session reset."}), 200
 
-        sess = get_session(session_id)
+    sess = get_session(session_id)
 
-        # ---------- If waiting on a pending question, interpret user's answer first ----------
-        if sess.get("pending_question"):
-            pending = sess["pending_question"]
-            new_params = _apply_user_answer_to_params(text, pending, sess.get("accum_params") or {})
-            # If nothing changed, prompt again
-            if new_params == (sess.get("accum_params") or {}):
-                prompt = _format_lettered(pending) + "\n\nPlease reply with a letter (A, B, C) or the exact option."
-                return jsonify({"reply": prompt, "pending": pending})
-            # Update accum and call /quote again
-            sess["accum_params"] = new_params
-            quote_payload, new_pending, err = run_quote(sess, params={})
-            if err:
-                sess["pending_question"] = None
-                return jsonify({"reply":
-                    "There was a system error while retrieving data. Please try again shortly. "
-                    "If the issue persists, escalate to Benjamin Luci at 615-516-8802.",
-                    "action_error": err
-                })
-            # Loop detection for Disc Harrow spacing
-            if _detect_disc_harrow_loop(pending, new_pending):
-                sess["pending_question"] = None
-                return jsonify({"reply":
-                    "The system is stuck on a required disc spacing selection. Please escalate to Benjamin Luci at 615-516-8802."
-                })
-            if new_pending:
-                sess["pending_question"] = new_pending
-                prompt = _format_lettered(new_pending)
-                return jsonify({"reply": prompt, "pending": new_pending})
-            # Done — build final quote reply
+    # If waiting on a pending question, interpret user's answer first
+    if sess.get("pending_question"):
+        pending = sess["pending_question"]
+        new_params = _apply_user_answer_to_params(text, pending, sess.get("accum_params") or {})
+        if new_params == (sess.get("accum_params") or {}):
+            prompt = _format_lettered(pending) + "\n\nPlease reply with a letter (A, B, C) or the exact option."
+            prompt = _sanitize_to_ai_reply(prompt)
+            return jsonify({"reply": prompt, "pending": pending})
+        sess["accum_params"] = new_params
+        quote_payload, new_pending, err = run_quote(sess, params={})
+        if err:
             sess["pending_question"] = None
-            quote_text = build_quote_text_from_payload(quote_payload, sess.get("dealer_number"), sess.get("accum_params") or {})
-            out = {"reply": quote_text, "quote": quote_payload}
-            if sess.get("dealer_number"):
-                out["dealer_number"] = sess["dealer_number"]
-            return jsonify(out)
-
-        # ---------- Not waiting — proceed with LLM to decide routing ----------
-        # Build conversation
-        convo: List[Dict[str, str]] = list(sess["messages"]) + [{"role": "user", "content": text}]
-        convo = trim_history(convo)
-
-        if not client:
-            # Fallback echo
-            reply = "(Backend missing OPENAI_API_KEY) — echo: " + text
-            sess["messages"] = convo + [{"role": "assistant", "content": reply}]
-            return jsonify({"reply": reply})
-
-        try:
-            resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                temperature=TEMPERATURE,
-                messages=convo,
-            )
-            model_reply = resp.choices[0].message.content or ""
-        except Exception as e:
-            log.error("OpenAI error: %s", e)
-            reply = "There was an error generating a reply. Please try again."
-            sess["messages"] = trim_history(convo + [{"role": "assistant", "content": reply}])
-            return jsonify({"reply": reply})
-
-        routing = extract_routing_json(model_reply)
-        dealer_result: Optional[Any] = None
-        quote_result: Optional[Any] = None
-        action_error: Optional[str] = None
-        user_reply: str
-
-        if routing and is_valid_routing(routing):
-            action = routing["action"]
-            params = dict(routing.get("params") or {})
-
-            if action == "dealer_lookup":
-                dn = params.get("dealer_number")
-                if not dn:
-                    user_reply = "Please provide your dealer number to begin."
-                else:
-                    dealer_result, action_error = run_dealer_lookup(sess, dn)
-                    user_reply = f"Dealer #{dn} verified. What would you like to quote next?" if not action_error else (
-                        "There was a system error while retrieving data. Please try again shortly. "
-                        "If the issue persists, escalate to Benjamin Luci at 615-516-8802."
-                    )
-
-            elif action == "quote":
-                # Start a fresh accum_params bucket for this quote
-                sess["accum_params"] = {}
-                quote_result, pending, action_error = run_quote(sess, params)
-                if action_error:
-                    user_reply = ("There was a system error while retrieving data. Please try again shortly. "
-                                  "If the issue persists, escalate to Benjamin Luci at 615-516-8802.")
-                elif pending:
-                    sess["pending_question"] = pending
-                    user_reply = _format_lettered(pending)
-                else:
-                    # Done — final quote
-                    sess["pending_question"] = None
-                    user_reply = build_quote_text_from_payload(quote_result, sess.get("dealer_number"), params)
-
-            elif action == "ask":
-                user_reply = (routing.get("reply") or "What do you need next?").strip()
-
-            else:  # smalltalk
-                user_reply = (routing.get("reply") or "How can I help?").strip()
-        else:
-            routing = None
-            user_reply = model_reply.strip() or "How can I help?"
-
-        # Persist assistant message (natural text only)
-        sess["messages"] = trim_history(convo + [{"role": "assistant", "content": user_reply}])
-
-        out: Dict[str, Any] = {"reply": user_reply}
-        if dealer_result is not None:
-            out["dealer"] = dealer_result
-        if quote_result is not None:
-            out["quote"] = quote_result
+            return jsonify({"reply":
+                "There was a system error while retrieving data. Please try again shortly. "
+                "If the issue persists, escalate to Benjamin Luci at 615-516-8802.",
+                "action_error": err
+            })
+        if _detect_disc_harrow_loop(pending, new_pending):
+            sess["pending_question"] = None
+            return jsonify({"reply":
+                "The system is stuck on a required disc spacing selection. Please escalate to Benjamin Luci at 615-516-8802."
+            })
+        if new_pending:
+            sess["pending_question"] = new_pending
+            prompt = _sanitize_to_ai_reply(_format_lettered(new_pending))
+            return jsonify({"reply": prompt, "pending": new_pending})
+        # Done — final quote reply
+        sess["pending_question"] = None
+        quote_text = build_quote_text_from_payload(quote_payload, sess.get("dealer_number"), sess.get("accum_params") or {})
+        quote_text = _sanitize_to_ai_reply(quote_text)
+        out = {"reply": quote_text, "quote": quote_payload}
         if sess.get("dealer_number"):
             out["dealer_number"] = sess["dealer_number"]
-        if INCLUDE_ROUTING and routing:
-            out["routing"] = routing
-        if action_error:
-            out["action_error"] = action_error
-        if sess.get("pending_question"):
-            out["pending"] = sess["pending_question"]
-
         return jsonify(out)
 
+    # Not waiting — proceed with LLM to decide routing
+    convo: List[Dict[str, str]] = list(sess["messages"]) + [{"role": "user", "content": text}]
+    convo = trim_history(convo)
+
+    if not client:
+        reply = "(Backend missing OPENAI_API_KEY) — echo: " + text
+        reply = _sanitize_to_ai_reply(reply)
+        sess["messages"] = convo + [{"role": "assistant", "content": reply}]
+        return jsonify({"reply": reply})
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            temperature=TEMPERATURE,
+            messages=convo,
+        )
+        model_reply = resp.choices[0].message.content or ""
     except Exception as e:
-        log.exception("Unhandled error in /chat")
-        return jsonify({
-            "reply": "There was a system error while handling your request. Please try again.",
-            "error": str(e),
-            "trace": traceback.format_exc(limit=1),
-        }), 200
+        log.error("OpenAI error: %s", e)
+        reply = "There was an error generating a reply. Please try again."
+        reply = _sanitize_to_ai_reply(reply)
+        sess["messages"] = trim_history(convo + [{"role": "assistant", "content": reply}])
+        return jsonify({"reply": reply})
+
+    routing = extract_routing_json(model_reply)
+    if not routing and _looks_jsonish(model_reply):
+        # second attempt if reply looks JSON-ish
+        maybe = extract_routing_json(model_reply)
+        if maybe and is_valid_routing(maybe):
+            routing = maybe
+
+    dealer_result: Optional[Any] = None
+    quote_result: Optional[Any] = None
+    action_error: Optional[str] = None
+
+    if routing and is_valid_routing(routing):
+        action = routing["action"]
+        params = dict(routing.get("params") or {})
+
+        if action == "dealer_lookup":
+            dn = params.get("dealer_number")
+            if not dn:
+                user_reply = "Please provide your dealer number to begin."
+            else:
+                dealer_result, action_error = run_dealer_lookup(sess, dn)
+                user_reply = f"Dealer #{dn} verified. What would you like to quote next?" if not action_error else (
+                    "There was a system error while retrieving data. Please try again shortly. "
+                    "If the issue persists, escalate to Benjamin Luci at 615-516-8802."
+                )
+
+        elif action == "quote":
+            # fresh accum bucket for this quote
+            sess["accum_params"] = {}
+            quote_result, pending, action_error = run_quote(sess, params)
+            if action_error:
+                user_reply = ("There was a system error while retrieving data. Please try again shortly. "
+                              "If the issue persists, escalate to Benjamin Luci at 615-516-8802.")
+            elif pending:
+                sess["pending_question"] = pending
+                user_reply = _format_lettered(pending)
+            else:
+                sess["pending_question"] = None
+                user_reply = build_quote_text_from_payload(quote_result, sess.get("dealer_number"), params)
+
+        elif action == "ask":
+            user_reply = (routing.get("reply") or "What do you need next?").strip()
+
+        else:  # smalltalk
+            user_reply = (routing.get("reply") or "How can I help?").strip()
+    else:
+        routing = None
+        user_reply = model_reply.strip() or "How can I help?"
+
+    # Sanitize & persist assistant message (never show routing JSON)
+    user_reply = _sanitize_to_ai_reply(user_reply)
+    sess["messages"] = trim_history(convo + [{"role": "assistant", "content": user_reply}])
+
+    out: Dict[str, Any] = {"reply": user_reply}
+    if dealer_result is not None:
+        out["dealer"] = dealer_result
+    if quote_result is not None:
+        out["quote"] = quote_result
+    if sess.get("dealer_number"):
+        out["dealer_number"] = sess["dealer_number"]
+    if INCLUDE_ROUTING and routing:
+        out["routing"] = routing
+    if action_error:
+        out["action_error"] = action_error
+    if sess.get("pending_question"):
+        out["pending"] = sess["pending_question"]
+
+    return jsonify(out)
 
 @app.route("/health", methods=["GET"])
 def health():
-    try:
-        return jsonify({
-            "ok": True,
-            "planner": bool(client),
-            "model": OPENAI_MODEL,
-            "action_base": ACTION_BASE_URL,
-        }), 200
-    except Exception:
-        return jsonify({"ok": False, "planner": bool(client), "model": OPENAI_MODEL, "action_base": ACTION_BASE_URL}), 200
+    return jsonify({
+        "ok": True,
+        "planner": bool(client),
+        "model": OPENAI_MODEL,
+        "action_base": ACTION_BASE_URL,
+        "include_routing": INCLUDE_ROUTING,
+    }), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
