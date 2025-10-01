@@ -192,26 +192,10 @@ def on_error(e):
     return jsonify({"reply": "There was a system error while handling your request. Please try again."}), 200
 
 # -------------- Sessions (in-memory) --------------
-# Session shape:
-# {
-#   "messages": [...],
-#   "updated_at": ts,
-#   "dealer_number": str|None,
-#   "accum_params": { ... },         # sticky during an in-flight quote
-#   "pending_question": {             # stored between messages
-#       "param": "bb_duty",
-#       "question": "Which duty do you need?",
-#       "use_id": True|False,
-#       "choices": [{"letter":"A","label":"...","id":"...","value":"..."}],
-#       "raw": {...}
-#   }
-# }
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 
-# -------------- Helpers --------------
 def get_session(session_id: str) -> Dict[str, Any]:
     now = time.time()
-    # GC expired
     expired = [sid for sid, s in SESSIONS.items() if (now - s.get("updated_at", now)) > SESSION_TTL_SECONDS]
     for sid in expired:
         SESSIONS.pop(sid, None)
@@ -232,11 +216,20 @@ def trim_history(messages: List[Dict[str, str]], max_keep: int = 60) -> List[Dic
     head = messages[:1] if messages and messages[0].get("role") == "system" else []
     return head + messages[-(max_keep - len(head)) :]
 
+# ---------- Routing JSON handling ----------
 def _looks_jsonish(text: str) -> bool:
     if not isinstance(text, str):
         return False
     t = text.strip()
     return t.startswith("{") or t.startswith("[") or "```json" in t.lower()
+
+def _sanitize_to_ai_reply(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    out = re.sub(r"```json[\s\S]*?```", "", text, flags=re.IGNORECASE).strip()
+    if _looks_jsonish(out):
+        return "Got it — handled that selection. What would you like next?"
+    return out or "Okay."
 
 def extract_routing_json(text: str) -> Optional[Dict[str, Any]]:
     """Parse routing JSON even if the model wrapped it in quotes or code fences."""
@@ -244,12 +237,10 @@ def extract_routing_json(text: str) -> Optional[Dict[str, Any]]:
         return None
     t = text.strip()
 
-    # fenced ```json ... ```
     m = re.search(r"```json\s*([\s\S]*?)\s*```", t, flags=re.IGNORECASE)
     if m:
         t = m.group(1).strip()
 
-    # quoted JSON blob
     if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
         inner = t[1:-1]
         try:
@@ -257,7 +248,6 @@ def extract_routing_json(text: str) -> Optional[Dict[str, Any]]:
         except Exception:
             t = inner
 
-    # direct parse
     try:
         obj = json.loads(t)
         if isinstance(obj, dict):
@@ -269,7 +259,6 @@ def extract_routing_json(text: str) -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
-    # largest {...} chunk
     m = re.search(r"\{[\s\S]*\}", t)
     if m:
         chunk = m.group(0)
@@ -288,13 +277,18 @@ def extract_routing_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 def is_valid_routing(obj: Dict[str, Any]) -> bool:
-    return (
-        isinstance(obj, dict)
-        and obj.get("action") in {"dealer_lookup", "quote", "ask", "smalltalk"}
-        and "reply" in obj
-        and isinstance(obj.get("params"), dict)
-    )
+    """Accept actions even if 'reply' is missing; default it later."""
+    if not isinstance(obj, dict):
+        return False
+    if obj.get("action") not in {"dealer_lookup", "quote", "ask", "smalltalk"}:
+        return False
+    if not isinstance(obj.get("params"), dict):
+        obj["params"] = {}
+    if "reply" not in obj or not isinstance(obj.get("reply"), str):
+        obj["reply"] = ""
+    return True
 
+# ---------- HTTP util ----------
 def http_get_with_retry(url: str, params: Dict[str, Any], retries: int = 1, timeout: int = 30) -> Tuple[int, Any, Optional[str]]:
     try:
         r = requests.get(url, params=params, timeout=timeout)
@@ -390,10 +384,9 @@ def _guess_param_names(base_param: str, prefer_id: bool) -> List[str]:
     return list(dict.fromkeys(names))
 
 def _apply_user_answer_to_params(user_text: str, pending: Dict[str, Any], accum: Dict[str, Any]) -> Dict[str, Any]:
-    t = (user_text or "").strip()
+    t = (user_text or "").trim() if hasattr(str, "trim") else (user_text or "").strip()
     choice = None
 
-    # letter or number
     for it in pending["choices"]:
         if t.lower() == it["letter"].lower():
             choice = it
@@ -403,7 +396,6 @@ def _apply_user_answer_to_params(user_text: str, pending: Dict[str, Any], accum:
         if 0 <= idx < len(pending["choices"]):
             choice = pending["choices"][idx]
 
-    # exact / startswith label
     if not choice:
         for it in pending["choices"]:
             if t.lower() == (it["label"] or "").lower():
@@ -416,7 +408,7 @@ def _apply_user_answer_to_params(user_text: str, pending: Dict[str, Any], accum:
                     break
 
     if not choice:
-        return accum  # unchanged
+        return accum
 
     prefer_id = pending.get("use_id", False)
     names_to_try = _guess_param_names(pending["param"], prefer_id)
@@ -603,7 +595,6 @@ def chat():
                 )
 
         elif action == "quote":
-            # fresh accum bucket for this quote
             sess["accum_params"] = {}
             quote_result, pending, action_error = run_quote(sess, params)
             if action_error:
@@ -625,7 +616,6 @@ def chat():
         routing = None
         user_reply = model_reply.strip() or "How can I help?"
 
-    # Sanitize & persist assistant message (never show routing JSON)
     user_reply = _sanitize_to_ai_reply(user_reply)
     sess["messages"] = trim_history(convo + [{"role": "assistant", "content": user_reply}])
 
