@@ -479,29 +479,52 @@ def tool_woods_dealer_discount(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": status == 200, "status": status, "url": used, "body": body}
 
 def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
+    # Filter empty args
     params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
+
+    # 🔎 Log exactly what we're sending
+    log.info("QUOTE CALL params=%s", json.dumps(params, ensure_ascii=False))
+
+    # Call API
     body, status, used = http_get("/quote", params)
 
+    # 🔎 Log high-level response shape
     try:
         if status == 200 and isinstance(body, dict):
-            dealer_number = args.get("dealer_number")
+            rq = body.get("required_questions") or []
+            rq_names = [q.get("name") for q in rq]
+            log.info(
+                "QUOTE RESP status=%s mode=%s model=%s rq=%s",
+                status, body.get("mode"), body.get("model"), rq_names
+            )
+        else:
+            log.info("QUOTE RESP status=%s (non-json or error) body=%s", status, str(body)[:500])
+    except Exception as e:
+        log.warning("QUOTE RESP log error: %s", e)
+
+    # Enforce discounts from the API summary (dealer net already applied there)
+    try:
+        if status == 200 and isinstance(body, dict):
+            summary = body.get("summary", {}) or {}
+            list_total = float(summary.get("subtotal_list", 0) or 0)
+            dealer_net = float(summary.get("total", 0) or 0)
+
+            # Find dealer discount in session (stored as decimal like 0.24 per your payloads)
+            dealer_number = str(params.get("dealer_number") or "")
             dealer_discount = None
             for sess in SESS.values():
-                if sess.get("dealer", {}).get("dealer_number") == dealer_number:
-                    dealer_discount = float(sess["dealer"]["discount"])
+                d = sess.get("dealer") or {}
+                if str(d.get("dealer_number") or "") == dealer_number:
+                    try:
+                        dealer_discount = float(d.get("discount"))
+                    except Exception:
+                        dealer_discount = None
                     break
 
-            summary = body.get("summary", {})
-            list_total = float(summary.get("subtotal_list", 0))
-            dealer_net = float(summary.get("total", 0))  # already includes dealer discount
-
-            log.info("DEBUG list_total = %s", list_total)
-            log.info("DEBUG dealer_net = %s", dealer_net)
-            log.info("DEBUG dealer_discount = %s", dealer_discount) 
-
             if list_total > 0 and dealer_net > 0 and dealer_discount is not None:
+                # Full precision math, round only at the end
                 dealer_discount_amt = list_total - dealer_net
-                cash_discount_pct = 0.05 if dealer_discount == 5 else 0.12
+                cash_discount_pct = 0.05 if abs(dealer_discount - 0.05) < 1e-9 else 0.12
                 cash_discount_amt = dealer_net * cash_discount_pct
                 final_net = dealer_net - cash_discount_amt
 
@@ -509,51 +532,16 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                     "list_price_total": round(list_total, 2),
                     "dealer_discount_total": round(dealer_discount_amt, 2),
                     "cash_discount_total": round(cash_discount_amt, 2),
-                    "final_net": round(final_net, 2)
+                    "final_net": round(final_net, 2),
                 }
-    
-                log.info("Final enforced totals for %s: %s", dealer_number, json.dumps(body.get('_enforced_totals', {})))
+
+                # 🔎 Log computed totals so we can verify cash discount & final net
+                log.info("ENFORCED TOTALS %s: %s", dealer_number, json.dumps(body["_enforced_totals"]))
     except Exception as e:
         log.warning("Failed to inject _enforced_totals: %s", e)
 
     return {"ok": status == 200, "status": status, "url": used, "body": body}
 
-    # ---------------- Cash Discount Injection (Safe) ----------------
-    try:
-        if status == 200 and isinstance(body, dict):
-            dealer_number = args.get("dealer_number")
-            dealer_discount = None
-
-            # Try to find dealer discount from session or embedded dealer object
-            for sess in SESS.values():
-                if sess.get("dealer", {}).get("dealer_number") == dealer_number:
-                    dealer_discount = float(sess["dealer"]["discount"])
-                    break
-
-            # Extract list price from API totals
-            list_total = float(body.get("totals", {}).get("list_price_total", 0))
-            dealer_net = float(body.get("totals", {}).get("dealer_net_total", 0))
-
-            if list_total > 0 and dealer_net > 0 and dealer_discount is not None:
-                dealer_discount_amt = list_total - dealer_net
-
-                # Decide cash discount percentage
-                cash_discount_pct = 0.05 if dealer_discount == 5 else 0.12
-                cash_discount_amt = dealer_net * cash_discount_pct
-                final_net = dealer_net - cash_discount_amt
-
-                # Inject new field (does not overwrite anything)
-                body["_enforced_totals"] = {
-                    "list_price_total": round(list_total, 2),
-                    "dealer_discount_total": round(dealer_discount_amt, 2),
-                    "cash_discount_total": round(cash_discount_amt, 2),
-                    "final_net": round(final_net, 2)
-                }
-    except Exception as e:
-        log.warning("Failed to inject enforced_totals: %s", e)
-
-
-    return {"ok": status == 200, "status": status, "url": used, "body": body}
 
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
     body, status, used = http_get("/health", {})
@@ -675,16 +663,18 @@ def chat():
         # ---------- Session resolve + GC ----------
         now = time.time()
         sid = request.headers.get("X-Session-Id") or payload.get("session_id") or f"anon-{int(now*1000)}"
-        # GC old sessions
         for k in list(SESS.keys()):
             if now - SESS[k].get("updated_at", now) > SESSION_TTL:
                 SESS.pop(k, None)
-
         sess = SESS.setdefault(sid, {"messages": [], "dealer": None, "updated_at": now})
         sess["updated_at"] = now
 
-        # ---------- Build conversation (system → history) ----------
-        convo: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # 🔎 Context log (helps correlate runs)
+        log.info("SESSION sid=%s dealer=%s msg=%s",
+                 sid, (sess.get("dealer") or {}).get("dealer_number"), user_message)
+
+        # ---------- Build conversation ----------
+        convo: List[Dict[str, Any]] = [{"role": "system", "content": KNOWLEDGE}]
         convo.extend(sess["messages"])
 
         # ---------- Auto: Dealer detection from this message ----------
@@ -694,37 +684,21 @@ def chat():
             add_tool_exchange(convo, "woods_dealer_discount", {"dealer_number": dn_from_msg}, res)
             if res.get("ok"):
                 body = res.get("body") or {}
-                # NOTE: many APIs return discount as 0.24; store as percentage (24.0) if you prefer, but we kept as-is
                 sess["dealer"] = {
                     "dealer_number": body.get("dealer_number") or dn_from_msg,
                     "dealer_name": body.get("dealer_name") or "",
-                    "discount": body.get("discount"),  # expected 0.24 style from your examples
+                    "discount": body.get("discount"),  # e.g., 0.24 per your API
                 }
 
         # ---------- Resolve dealer number for quoting ----------
         dealer_num = None
         if sess.get("dealer", {}).get("dealer_number"):
             dealer_num = str(sess["dealer"]["dealer_number"])
-        else:
-            # scan prior tool results in this convo, newest first
-            for m in reversed(convo):
-                if m.get("role") == "tool" and m.get("name") == "woods_dealer_discount":
-                    try:
-                        payload = json.loads(m.get("content") or "{}")
-                        b = payload.get("body") or {}
-                        dn = b.get("dealer_number") or b.get("number")
-                        if dn:
-                            dealer_num = str(dn)
-                            break
-                    except Exception:
-                        pass
 
         # ---------- Auto-trigger: model OR family ----------
-        # Detect explicit model tokens (dot or series) OR map names to family slugs
         model = detect_model(user_message)
         family_slug = detect_family_slug(user_message) if not model else None
 
-        # Only trigger if we have a dealer and at least a model or family
         if dealer_num and (model or family_slug):
             args = {"dealer_number": dealer_num}
             if model:
@@ -732,7 +706,9 @@ def chat():
             if family_slug:
                 args["family"] = family_slug
 
-            # Application-level retry for rare empty JSON bodies (your GPT tool does this too)
+            # 🔎 Log what we think we're about to send
+            log.info("AUTO-TRIGGER args=%s", json.dumps(args, ensure_ascii=False))
+
             res = tool_woods_quote(args)
             add_tool_exchange(convo, "woods_quote", args, res)
 
@@ -740,14 +716,14 @@ def chat():
         convo.append({"role": "user", "content": user_message})
         reply, hist = run_ai(convo)
 
-        # ---------- Trim + persist history (keep system injected fresh every turn) ----------
+        # ---------- Persist history (trim, keep non-system) ----------
         MAX_KEEP = 80
         trimmed = [m for m in hist if m.get("role") != "system"]
         if len(trimmed) > MAX_KEEP:
             trimmed = trimmed[-MAX_KEEP:]
         sess["messages"] = trimmed
 
-        # ---------- Echo dealer badge for UI ----------
+        # ---------- Dealer badge for UI ----------
         dealer_badge = sess.get("dealer") or {}
         return jsonify({
             "reply": reply,
