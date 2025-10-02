@@ -288,11 +288,6 @@ MODEL_SERIES_RE = re.compile(r"\b([A-Za-z]{2,4}\d{2,3})\b", re.IGNORECASE)      
 
 # Some APIs label the spacing question inconsistently.
 # No matter which one comes back, we must send `dh_spacing_id` with the ID value.
-SPACING_QNAME_MAP = {
-    "dh_choice": "dh_spacing_id",
-    "dh_spacing": "dh_spacing_id",
-    "dh_spacing_choice": "dh_spacing_id",
-}
 
 def detect_model(text: str) -> str | None:
     t = text or ""
