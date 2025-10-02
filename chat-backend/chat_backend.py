@@ -486,16 +486,58 @@ def tool_woods_dealer_discount(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": status == 200, "status": status, "url": used, "body": body}
 
 def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
-    # Filter empty args
+    """
+    Calls /quote with sanitized params, logs request/response, and injects `_enforced_totals`
+    computed from API summary (dealer net already applied by API).
+    """
+    # -------- Build params (strip empty) --------
     params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
 
-    # 🔎 Log exactly what we're sending
+    # -------- Disc Harrow: param normalization (surgical, safe) --------
+    try:
+        import re
+
+        # If any Disc Harrow fields are present, we are mid-flow; don't send `model`
+        has_dh = any(k.startswith("dh_") for k in params.keys())
+        if has_dh and "model" in params:
+            params.pop("model", None)
+
+        # Ensure family is present when answering Disc Harrow questions
+        if has_dh and "family" not in params:
+            params["family"] = "disc_harrow"
+
+        # Normalize width key if it drifted (API expects dh_width_in)
+        if "width" in params and "dh_width_in" not in params:
+            params["dh_width_in"] = str(params.pop("width")).strip()
+
+        # Spacing: if an ID was provided under an alt key, move it to dh_spacing_id
+        if "dh_spacing_id" not in params:
+            for alt in ("dh_choice", "dh_spacing", "dh_spacing_choice"):
+                val = params.get(alt)
+                if not val:
+                    continue
+                # Looks like an ID? 6+ digits, optional trailing letter (e.g., 1041351N)
+                if isinstance(val, str) and re.match(r"^\d{6,}[A-Z]?$", val.strip()):
+                    params["dh_spacing_id"] = val.strip()
+                    break
+
+        # Blade: normalize shorthand to API labels
+        if "dh_blade" in params:
+            t = str(params["dh_blade"]).strip().lower()
+            if t in {"n", "notched"}:
+                params["dh_blade"] = "Notched (N)"
+            elif t in {"c", "combo"}:
+                params["dh_blade"] = "Combo (C)"
+    except Exception as _e:
+        log.warning("disc harrow normalization skipped: %s", _e)
+
+    # -------- Log request --------
     log.info("QUOTE CALL params=%s", json.dumps(params, ensure_ascii=False))
 
-    # Call API
+    # -------- HTTP call --------
     body, status, used = http_get("/quote", params)
 
-    # 🔎 Log high-level response shape
+    # -------- Log response shape --------
     try:
         if status == 200 and isinstance(body, dict):
             rq = body.get("required_questions") or []
@@ -509,18 +551,18 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.warning("QUOTE RESP log error: %s", e)
 
-    # Enforce discounts from the API summary (dealer net already applied there)
+    # -------- Enforce cash discount (round only at the end) --------
     try:
         if status == 200 and isinstance(body, dict):
             summary = body.get("summary", {}) or {}
             list_total = float(summary.get("subtotal_list", 0) or 0)
             dealer_net = float(summary.get("total", 0) or 0)
 
-            # Find dealer discount in session (stored as decimal like 0.24 per your payloads)
+            # Find dealer discount from session (stored as decimal, e.g., 0.24 or 0.05)
             dealer_number = str(params.get("dealer_number") or "")
             dealer_discount = None
-            for sess in SESS.values():
-                d = sess.get("dealer") or {}
+            for s in SESS.values():
+                d = s.get("dealer") or {}
                 if str(d.get("dealer_number") or "") == dealer_number:
                     try:
                         dealer_discount = float(d.get("discount"))
@@ -529,8 +571,8 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                     break
 
             if list_total > 0 and dealer_net > 0 and dealer_discount is not None:
-                # Full precision math, round only at the end
                 dealer_discount_amt = list_total - dealer_net
+                # Cash discount rule: 5% if dealer discount == 5%, else 12%
                 cash_discount_pct = 0.05 if abs(dealer_discount - 0.05) < 1e-9 else 0.12
                 cash_discount_amt = dealer_net * cash_discount_pct
                 final_net = dealer_net - cash_discount_amt
@@ -542,7 +584,6 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                     "final_net": round(final_net, 2),
                 }
 
-                # 🔎 Log computed totals so we can verify cash discount & final net
                 log.info("ENFORCED TOTALS %s: %s", dealer_number, json.dumps(body["_enforced_totals"]))
     except Exception as e:
         log.warning("Failed to inject _enforced_totals: %s", e)
