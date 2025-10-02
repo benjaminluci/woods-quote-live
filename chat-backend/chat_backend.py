@@ -68,22 +68,32 @@ API Error Handling
 
 ---
 Pricing Logic
-1. Retrieve list price for each part number from API
-2. Apply dealer discount from lookup
-3. Apply 12% cash discount on top of dealer discount, unless dealer discount is 5% then the cash discount is 5%
-4. Format quote as plain text, customer-ready
+1. Retrieve list price for each part number from API.
+2. Apply dealer discount from lookup.
+3. Apply 12% cash discount on top of dealer discount, unless dealer discount is 5% — then the cash discount is 5%.
+4. **These calculations are enforced on the backend and provided as `_enforced_totals` inside the API response.**
 
-⚠️ Cash discount must always be applied and taken off dealer net. Never skip this.
+🟠 Use `_enforced_totals` if it exists. Do not recalculate pricing logic yourself.
+
+---
+_enforced_totals format (example):
+- list_price_total → full list price of all items combined
+- dealer_discount_total → total discount from list price based on dealer discount
+- cash_discount_total → additional discount based on payment terms
+- final_net → amount after dealer + cash discounts ✅
 
 ---
 Quote Output Format
 - Begin with "**Woods Equipment Quote**"
 - Include the dealer name and dealer number below the title
-- Final Dealer Net shown boldly with ✅
-- Omit the "Subtotal" section
-- Include: List Price For All Pieces Individually → Total Dealer Discount of All Items Combined → Total Cash Discount of All Items Combined → Final Dealer Net
+- Show:
+  - List Price → `_enforced_totals.list_price_total`
+  - Dealer Discount → `_enforced_totals.dealer_discount_total`
+  - Cash Discount → `_enforced_totals.cash_discount_total`
+  - Final Net ✅ → `_enforced_totals.final_net`
 - Include: “Cash discount included only if paid within terms.”
-- If a model or part cannot be priced, say: “Unable to find pricing, please contact Benjamin Luci at 615-516-8802.”
+- Omit the "Subtotal" section
+- If `_enforced_totals` is missing or pricing cannot be determined, stop and say: “Unable to find pricing, please contact Benjamin Luci at 615-516-8802.”
 
 ---
 Session Handling
@@ -114,8 +124,8 @@ Interaction Style
 Example:
 Which Turf Batwing size do you need?
 
-A. 12 ft
-B. 15 ft
+A. 12 ft  
+B. 15 ft  
 C. 17 ft
 
 - Wait for user response before proceeding
@@ -135,8 +145,8 @@ Disc Harrow Fix
 ---
 Correction Enforcement
 - Do not stop quotes after dealer discount
-- If dealer discount ≠ 5%, 12% cash discount **must** be added.  If 5% then cash discount is 5%
-- If cash discount is missing from Final Dealer Net, quote is invalid and must be corrected
+- If dealer discount ≠ 5%, 12% cash discount **must** be added. If 5%, then 5% cash discount.
+- **Quotes are only valid if `_enforced_totals.final_net` is shown as Final Net. If missing, escalate.**
 """
 
 # (Optional helper synopsis for the model; harmless to include)
@@ -312,6 +322,41 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     # GET /quote with params as-is (must include model + dealer_number for reliable results)
     params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
     body, status, used = http_get("/quote", params)
+
+    # ---------------- Cash Discount Injection (Safe) ----------------
+    try:
+        if status == 200 and isinstance(body, dict):
+            dealer_number = args.get("dealer_number")
+            dealer_discount = None
+
+            # Try to find dealer discount from session or embedded dealer object
+            for sess in SESS.values():
+                if sess.get("dealer", {}).get("dealer_number") == dealer_number:
+                    dealer_discount = float(sess["dealer"]["discount"])
+                    break
+
+            # Extract list price from API totals
+            list_total = float(body.get("totals", {}).get("list_price_total", 0))
+            dealer_net = float(body.get("totals", {}).get("dealer_net_total", 0))
+
+            if list_total > 0 and dealer_net > 0 and dealer_discount is not None:
+                dealer_discount_amt = list_total - dealer_net
+
+                # Decide cash discount percentage
+                cash_discount_pct = 0.05 if dealer_discount == 5 else 0.12
+                cash_discount_amt = dealer_net * cash_discount_pct
+                final_net = dealer_net - cash_discount_amt
+
+                # Inject new field (does not overwrite anything)
+                body["_enforced_totals"] = {
+                    "list_price_total": round(list_total, 2),
+                    "dealer_discount_total": round(dealer_discount_amt, 2),
+                    "cash_discount_total": round(cash_discount_amt, 2),
+                    "final_net": round(final_net, 2)
+                }
+    except Exception as e:
+        log.warning("Failed to inject enforced_totals: %s", e)
+
     return {"ok": status == 200, "status": status, "url": used, "body": body}
 
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
