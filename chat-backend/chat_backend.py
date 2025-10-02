@@ -197,9 +197,166 @@ def http_get(path: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], int, st
 # Matches: bb60.30, bw12.40, ds8.30, mds12.40, etc.
 MODEL_RE = re.compile(r"\b([A-Za-z]{2,3}\d{1,2}\.\d{2})\b")
 
+# Canonical families (from your list), adjusted for valid Python
+FAMILY_CATALOG = [
+    {
+        "family": "disc_harrow",
+        "aliases": ["disc", "disc harrow", "harrow", "dh", "dhs", "dhm"],
+        "model_prefixes": ["DH", "DHS", "DHM"],
+    },
+    {
+        "family": "batwing",
+        "aliases": ["batwing", "bw", "flex wing"],
+        "model_prefixes": ["BW"],
+    },
+    {
+        "family": "turf_batwing",
+        "aliases": ["turf batwing", "tbw", "batwing finish mower"],
+        "model_prefixes": ["TBW"],
+    },
+    {
+        "family": "brushbull",
+        "aliases": ["brush bull", "brushbull", "bb", "bushhog", "bush hog"],
+        "model_prefixes": ["BB"],
+    },
+    {
+        "family": "box_scraper",
+        "aliases": ["box scraper", "box blade", "bs"],
+        "model_prefixes": ["BS"],
+    },
+    {
+        "family": "grading_scraper",
+        "aliases": ["grading scraper", "gs", "land plane"],
+        "model_prefixes": ["GS"],
+    },
+    {
+        "family": "landscape_rake",
+        "aliases": ["landscape rake", "lrs", "rake"],
+        "model_prefixes": ["LR"],
+    },
+    {
+        "family": "rear_blade",
+        "aliases": ["rear blade", "rb", "blade"],
+        "model_prefixes": ["RB"],
+    },
+    {
+        "family": "post_hole_digger",
+        "aliases": ["post hole digger", "phd", "posthole digger"],
+        "model_prefixes": ["PD"],
+    },
+    {
+        "family": "pallet_fork",
+        "aliases": ["pallet fork", "forks", "fork"],
+        "model_prefixes": ["PF"],
+    },
+    {
+        "family": "quick_hitch",
+        "aliases": ["quick hitch", "hitch"],
+        "model_prefixes": ["TQH"],
+    },
+    {
+        "family": "stump_grinder",
+        "aliases": ["stump grinder"],
+        "model_prefixes": ["TSG"],
+    },
+    {
+        "family": "bale_spear",
+        "aliases": ["bale spear", "spear"],
+        "model_prefixes": ["BS"],
+    },
+    {
+        "family": "tiller",
+        "aliases": ["tiller", "db", "rt", "rtr"],
+        "model_prefixes": ["DB", "RT", "RTR"],
+    },
+    {
+        "family": "finish_mower",
+        "aliases": ["finish mower", "rd990x", "tk", "tkp", "grooming mower"],
+        "model_prefixes": ["RD", "TK", "TKP"],
+    },
+    {
+        "family": "dual_spindle",
+        "aliases": ["dual spindle", "ds", "mds"],
+        "model_prefixes": ["DS", "MDS"],
+    },
+]
+
+
+# Model detectors
+MODEL_DOT_RE = re.compile(r"\b([A-Za-z]{2,4}\d{1,2}\.\d{2})\b", re.IGNORECASE)   # e.g., BB72.30
+MODEL_SERIES_RE = re.compile(r"\b([A-Za-z]{2,4}\d{2,3})\b", re.IGNORECASE)       # e.g., DHS64, BW12, DS8
+
 def detect_model(text: str) -> str | None:
-    m = MODEL_RE.search(text or "")
-    return m.group(1).upper() if m else None
+    t = text or ""
+    m = MODEL_DOT_RE.search(t)
+    if m:
+        return m.group(1).upper()
+    m = MODEL_SERIES_RE.search(t)
+    if m:
+        return m.group(1).upper()
+    return None
+
+
+# Build alias/prefix indexes from FAMILY_CATALOG
+_alias_patterns: List[Tuple[re.Pattern, str]] = []
+_prefix_to_families: Dict[str, List[str]] = {}
+
+for entry in FAMILY_CATALOG:
+    fam = entry["family"]
+    # compile aliases to whole-word-ish regexes
+    for a in entry.get("aliases", []):
+        # allow matches anywhere but prefer word-ish boundaries
+        rx = re.compile(rf"(?:^|\b){re.escape(a)}(?:\b|$)", re.IGNORECASE)
+        _alias_patterns.append((rx, fam))
+    # collect model prefixes
+    for p in entry.get("model_prefixes", []):
+        _prefix_to_families.setdefault(p.upper(), []).append(fam)
+
+# order alias patterns by longest alias first (helps disambiguate like "batwing finish mower" vs "batwing")
+_alias_patterns.sort(key=lambda ap: len(ap[0].pattern), reverse=True)
+
+
+def _disambiguate_bs(text: str) -> str | None:
+    """Special disambiguation for the 'BS' prefix collision (box_scraper vs bale_spear)."""
+    t = (text or "").lower()
+    if "spear" in t or "bale spear" in t:
+        return "bale_spear"
+    if "box" in t or "blade" in t:
+        return "box_scraper"
+    return None
+
+
+def detect_family_slug(text: str) -> str | None:
+    t = text or ""
+
+    # 1) Alias wins (most reliable)
+    for rx, fam in _alias_patterns:
+        if rx.search(t):
+            return fam
+
+    # 2) If we see a model-like token, try its prefix (e.g., DHS64 → DHS)
+    m = MODEL_SERIES_RE.search(t)
+    if m:
+        token = m.group(1).upper()  # e.g., DHS64
+        # try 4, 3, then 2 letter prefixes
+        for L in (4, 3, 2):
+            if len(token) >= L:
+                prefix = token[:L]
+                fams = _prefix_to_families.get(prefix)
+                if fams:
+                    if len(fams) == 1:
+                        return fams[0]
+                    # ambiguous: handle BS special-case
+                    if prefix == "BS":
+                        resolved = _disambiguate_bs(t)
+                        if resolved:
+                            return resolved
+                    # more-than-one family for this prefix: bail (let model path proceed)
+                    break
+
+    # 3) No alias/prefix found
+    return None
+
 
 # ---------------- Tools (function schemas) ----------------
 TOOLS = [
@@ -515,7 +672,7 @@ def chat():
         if not user_message:
             return jsonify({"error": "Missing message"}), 400
 
-        # session resolve + GC
+        # ---------- Session resolve + GC ----------
         now = time.time()
         sid = request.headers.get("X-Session-Id") or payload.get("session_id") or f"anon-{int(now*1000)}"
         # GC old sessions
@@ -526,28 +683,30 @@ def chat():
         sess = SESS.setdefault(sid, {"messages": [], "dealer": None, "updated_at": now})
         sess["updated_at"] = now
 
-        # Build fresh conversation: system → history → (auto tool results) → user
+        # ---------- Build conversation (system → history) ----------
         convo: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         convo.extend(sess["messages"])
 
-        # -------- Auto: Dealer detection --------
+        # ---------- Auto: Dealer detection from this message ----------
         dn_from_msg = extract_dealer(user_message)
         if dn_from_msg:
             res = tool_woods_dealer_discount({"dealer_number": dn_from_msg})
             add_tool_exchange(convo, "woods_dealer_discount", {"dealer_number": dn_from_msg}, res)
             if res.get("ok"):
                 body = res.get("body") or {}
+                # NOTE: many APIs return discount as 0.24; store as percentage (24.0) if you prefer, but we kept as-is
                 sess["dealer"] = {
                     "dealer_number": body.get("dealer_number") or dn_from_msg,
                     "dealer_name": body.get("dealer_name") or "",
-                    "discount": body.get("discount"),
+                    "discount": body.get("discount"),  # expected 0.24 style from your examples
                 }
 
-        # Determine dealer for quoting (session first, else scan convo)
+        # ---------- Resolve dealer number for quoting ----------
         dealer_num = None
         if sess.get("dealer", {}).get("dealer_number"):
             dealer_num = str(sess["dealer"]["dealer_number"])
         else:
+            # scan prior tool results in this convo, newest first
             for m in reversed(convo):
                 if m.get("role") == "tool" and m.get("name") == "woods_dealer_discount":
                     try:
@@ -555,34 +714,48 @@ def chat():
                         b = payload.get("body") or {}
                         dn = b.get("dealer_number") or b.get("number")
                         if dn:
-                            dealer_num = str(dn); break
+                            dealer_num = str(dn)
+                            break
                     except Exception:
                         pass
 
-        # -------- Auto: Quote trigger ONLY if a model is detected AND we have dealer --------
+        # ---------- Auto-trigger: model OR family ----------
+        # Detect explicit model tokens (dot or series) OR map names to family slugs
         model = detect_model(user_message)
-        if model and dealer_num:
-            args = {"model": model, "dealer_number": dealer_num}
+        family_slug = detect_family_slug(user_message) if not model else None
+
+        # Only trigger if we have a dealer and at least a model or family
+        if dealer_num and (model or family_slug):
+            args = {"dealer_number": dealer_num}
+            if model:
+                args["model"] = model
+            if family_slug:
+                args["family"] = family_slug
+
+            # Application-level retry for rare empty JSON bodies (your GPT tool does this too)
             res = tool_woods_quote(args)
             add_tool_exchange(convo, "woods_quote", args, res)
 
-        # Append user and run planner
+        # ---------- Append user and run planner ----------
         convo.append({"role": "user", "content": user_message})
         reply, hist = run_ai(convo)
 
-        # trim + persist (keep system at the front next time by regenerating)
+        # ---------- Trim + persist history (keep system injected fresh every turn) ----------
         MAX_KEEP = 80
-        # drop explicit system cards from stored history; we'll re-inject next turn
         trimmed = [m for m in hist if m.get("role") != "system"]
         if len(trimmed) > MAX_KEEP:
             trimmed = trimmed[-MAX_KEEP:]
         sess["messages"] = trimmed
 
-        # echo dealer badge for UI (optional)
+        # ---------- Echo dealer badge for UI ----------
         dealer_badge = sess.get("dealer") or {}
-
-        return jsonify({"reply": reply, "dealer": {"dealer_number": dealer_badge.get("dealer_number"),
-                                                   "dealer_name": dealer_badge.get("dealer_name")}})
+        return jsonify({
+            "reply": reply,
+            "dealer": {
+                "dealer_number": dealer_badge.get("dealer_number"),
+                "dealer_name": dealer_badge.get("dealer_name"),
+            }
+        })
     except Exception as e:
         logging.exception("chat error")
         return jsonify({
