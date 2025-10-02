@@ -349,6 +349,8 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                     "cash_discount_total": round(cash_discount_amt, 2),
                     "final_net": round(final_net, 2)
                 }
+
+      log.info("Final enforced totals for %s: %s", dealer_number, json.dumps(body.get('_enforced_totals', {})))
     except Exception as e:
         log.warning("Failed to inject _enforced_totals: %s", e)
 
@@ -388,7 +390,6 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.warning("Failed to inject enforced_totals: %s", e)
 
-    log.info("Final enforced totals for %s: %s", dealer_number, json.dumps(body.get('_enforced_totals', {})))
 
     return {"ok": status == 200, "status": status, "url": used, "body": body}
 
