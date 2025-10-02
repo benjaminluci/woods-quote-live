@@ -675,18 +675,16 @@ def chat():
         # ---------- Session resolve + GC ----------
         now = time.time()
         sid = request.headers.get("X-Session-Id") or payload.get("session_id") or f"anon-{int(now*1000)}"
+        # GC old sessions
         for k in list(SESS.keys()):
             if now - SESS[k].get("updated_at", now) > SESSION_TTL:
                 SESS.pop(k, None)
+
         sess = SESS.setdefault(sid, {"messages": [], "dealer": None, "updated_at": now})
         sess["updated_at"] = now
 
-        # 🔎 Context log (helps correlate runs)
-        log.info("SESSION sid=%s dealer=%s msg=%s",
-                 sid, (sess.get("dealer") or {}).get("dealer_number"), user_message)
-
-        # ---------- Build conversation ----------
-        convo: List[Dict[str, Any]] = [{"role": "system", "content": KNOWLEDGE}]
+        # ---------- Build conversation (system → history) ----------
+        convo: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         convo.extend(sess["messages"])
 
         # ---------- Auto: Dealer detection from this message ----------
@@ -696,21 +694,37 @@ def chat():
             add_tool_exchange(convo, "woods_dealer_discount", {"dealer_number": dn_from_msg}, res)
             if res.get("ok"):
                 body = res.get("body") or {}
+                # NOTE: many APIs return discount as 0.24; store as percentage (24.0) if you prefer, but we kept as-is
                 sess["dealer"] = {
                     "dealer_number": body.get("dealer_number") or dn_from_msg,
                     "dealer_name": body.get("dealer_name") or "",
-                    "discount": body.get("discount"),  # e.g., 0.24 per your API
+                    "discount": body.get("discount"),  # expected 0.24 style from your examples
                 }
 
         # ---------- Resolve dealer number for quoting ----------
         dealer_num = None
         if sess.get("dealer", {}).get("dealer_number"):
             dealer_num = str(sess["dealer"]["dealer_number"])
+        else:
+            # scan prior tool results in this convo, newest first
+            for m in reversed(convo):
+                if m.get("role") == "tool" and m.get("name") == "woods_dealer_discount":
+                    try:
+                        payload = json.loads(m.get("content") or "{}")
+                        b = payload.get("body") or {}
+                        dn = b.get("dealer_number") or b.get("number")
+                        if dn:
+                            dealer_num = str(dn)
+                            break
+                    except Exception:
+                        pass
 
         # ---------- Auto-trigger: model OR family ----------
+        # Detect explicit model tokens (dot or series) OR map names to family slugs
         model = detect_model(user_message)
         family_slug = detect_family_slug(user_message) if not model else None
 
+        # Only trigger if we have a dealer and at least a model or family
         if dealer_num and (model or family_slug):
             args = {"dealer_number": dealer_num}
             if model:
@@ -718,9 +732,7 @@ def chat():
             if family_slug:
                 args["family"] = family_slug
 
-            # 🔎 Log what we think we're about to send
-            log.info("AUTO-TRIGGER args=%s", json.dumps(args, ensure_ascii=False))
-
+            # Application-level retry for rare empty JSON bodies (your GPT tool does this too)
             res = tool_woods_quote(args)
             add_tool_exchange(convo, "woods_quote", args, res)
 
@@ -728,14 +740,14 @@ def chat():
         convo.append({"role": "user", "content": user_message})
         reply, hist = run_ai(convo)
 
-        # ---------- Persist history (trim, keep non-system) ----------
+        # ---------- Trim + persist history (keep system injected fresh every turn) ----------
         MAX_KEEP = 80
         trimmed = [m for m in hist if m.get("role") != "system"]
         if len(trimmed) > MAX_KEEP:
             trimmed = trimmed[-MAX_KEEP:]
         sess["messages"] = trimmed
 
-        # ---------- Dealer badge for UI ----------
+        # ---------- Echo dealer badge for UI ----------
         dealer_badge = sess.get("dealer") or {}
         return jsonify({
             "reply": reply,
