@@ -493,43 +493,67 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     # -------- Build params (strip empty) --------
     params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
 
-    # -------- Disc Harrow: param normalization (surgical, safe) --------
+    # -------- Family-specific param normalization (surgical, safe) --------
     try:
         import re
 
-        # If any Disc Harrow fields are present, we are mid-flow; don't send `model`
+        # ===================== Disc Harrow =====================
         has_dh = any(k.startswith("dh_") for k in params.keys())
-        if has_dh and "model" in params:
+        if has_dh:
+            # Mid-flow: don't send model (e.g., "DHS64")
+            params.pop("model", None)
+            # Ensure family present
+            params.setdefault("family", "disc_harrow")
+
+            # Normalize width alias -> dh_width_in
+            if "width" in params and "dh_width_in" not in params:
+                params["dh_width_in"] = str(params.pop("width")).strip()
+
+            # Spacing: move ID from alt keys to dh_spacing_id
+            if "dh_spacing_id" not in params:
+                for alt in ("dh_choice", "dh_spacing", "dh_spacing_choice"):
+                    val = params.get(alt)
+                    if not val:
+                        continue
+                    if isinstance(val, str) and re.match(r"^\d{6,}[A-Z]?$", val.strip()):
+                        params["dh_spacing_id"] = val.strip()
+                        break
+
+            # Blade shorthand -> API label
+            if "dh_blade" in params:
+                t = str(params["dh_blade"]).strip().lower()
+                if t in {"n", "notched"}:
+                    params["dh_blade"] = "Notched (N)"
+                elif t in {"c", "combo"}:
+                    params["dh_blade"] = "Combo (C)"
+
+        # ===================== Bale Spear =====================
+        # Signals we are in/after Bale Spear question:
+        has_bs_flow = (
+            "balespear_choice" in params
+            or ("model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BS"))
+            or "part_id" in params  # sometimes LLM sends the part directly
+        )
+        if has_bs_flow:
+            # Anchor family and drop model mid-flow (model/part_id calls 500 on API)
+            params.setdefault("family", "bale_spear")
             params.pop("model", None)
 
-        # Ensure family is present when answering Disc Harrow questions
-        if has_dh and "family" not in params:
-            params["family"] = "disc_harrow"
+            # If the selection came as part_id and looks like an ID, use it as the answer to the question
+            # The API expects the answer under the question field name (balespear_choice), not 'part_id'
+            if "balespear_choice" not in params:
+                # Try to lift from part_id if it looks like an ID (e.g., 1037171)
+                pid = params.get("part_id")
+                if isinstance(pid, str) and re.match(r"^\d{6,}[A-Z]?$", pid.strip()):
+                    params["balespear_choice"] = pid.strip()
+                    # You can keep part_id or drop it; keeping it is usually harmless,
+                    # but if the API is strict, uncomment next line to remove:
+                    # params.pop("part_id", None)
 
-        # Normalize width key if it drifted (API expects dh_width_in)
-        if "width" in params and "dh_width_in" not in params:
-            params["dh_width_in"] = str(params.pop("width")).strip()
-
-        # Spacing: if an ID was provided under an alt key, move it to dh_spacing_id
-        if "dh_spacing_id" not in params:
-            for alt in ("dh_choice", "dh_spacing", "dh_spacing_choice"):
-                val = params.get(alt)
-                if not val:
-                    continue
-                # Looks like an ID? 6+ digits, optional trailing letter (e.g., 1041351N)
-                if isinstance(val, str) and re.match(r"^\d{6,}[A-Z]?$", val.strip()):
-                    params["dh_spacing_id"] = val.strip()
-                    break
-
-        # Blade: normalize shorthand to API labels
-        if "dh_blade" in params:
-            t = str(params["dh_blade"]).strip().lower()
-            if t in {"n", "notched"}:
-                params["dh_blade"] = "Notched (N)"
-            elif t in {"c", "combo"}:
-                params["dh_blade"] = "Combo (C)"
+            # If they sent the choice label, fine; if it looks like an ID, that's fine too.
+            # No further mapping is needed here because the API will accept the ID for balespear_choice.
     except Exception as _e:
-        log.warning("disc harrow normalization skipped: %s", _e)
+        log.warning("param normalization skipped: %s", _e)
 
     # -------- Log request --------
     log.info("QUOTE CALL params=%s", json.dumps(params, ensure_ascii=False))
