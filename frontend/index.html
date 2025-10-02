@@ -167,14 +167,14 @@
       div.className = 'msg ' + who;
       div.textContent = '';
       chat.appendChild(div);
-      chat.scrollTop = chat.scrollHeight;
-
       let i = 0;
       function type() {
         if (i < text.length) {
           div.textContent += text.charAt(i);
+          chat.scrollTop = chat.scrollHeight;
           i++;
-          setTimeout(type, 15);
+          const delay = Math.floor(Math.random() * 30) + 10; // 10–40ms delay
+          setTimeout(type, delay);
         }
       }
       type();
@@ -198,7 +198,7 @@
 
       const thinking = document.createElement('div');
       thinking.className = 'typing-indicator';
-      thinking.textContent = 'Typing...';
+      thinking.textContent = 'Thinking...';
       chat.appendChild(thinking);
       chat.scrollTop = chat.scrollHeight;
 
@@ -239,4 +239,3 @@
   </script>
 </body>
 </html>
-
