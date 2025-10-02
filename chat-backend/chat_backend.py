@@ -388,6 +388,8 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.warning("Failed to inject enforced_totals: %s", e)
 
+    log.info("Final enforced totals for %s: %s", dealer_number, json.dumps(body.get('_enforced_totals', {})))
+
     return {"ok": status == 200, "status": status, "url": used, "body": body}
 
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
