@@ -337,6 +337,11 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
             list_total = float(body.get("totals", {}).get("list_price_total", 0))
             dealer_net = float(body.get("totals", {}).get("dealer_net_total", 0))
 
+     log.info("DEBUG list_total = %s", list_total)
+     log.info("DEBUG dealer_net = %s", dealer_net)
+     log.info("DEBUG dealer_discount = %s", dealer_discount)
+
+
             if list_total > 0 and dealer_net > 0 and dealer_discount is not None:
                 dealer_discount_amt = list_total - dealer_net
                 cash_discount_pct = 0.05 if dealer_discount == 5 else 0.12
