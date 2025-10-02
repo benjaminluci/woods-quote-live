@@ -334,8 +334,9 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                     dealer_discount = float(sess["dealer"]["discount"])
                     break
 
-            list_total = float(body.get("totals", {}).get("list_price_total", 0))
-            dealer_net = float(body.get("totals", {}).get("dealer_net_total", 0))
+            summary = body.get("summary", {})
+            list_total = float(summary.get("subtotal_list", 0))
+            dealer_net = float(summary.get("total", 0))  # already includes dealer discount
 
             log.info("DEBUG list_total = %s", list_total)
             log.info("DEBUG dealer_net = %s", dealer_net)
