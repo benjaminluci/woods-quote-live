@@ -191,7 +191,7 @@
           div.textContent += text.charAt(i);
           chat.scrollTop = chat.scrollHeight;
           i++;
-          const delay = Math.floor(Math.random() * 15) + 5; // 5–20ms delay
+          const delay = Math.floor(Math.random() * 15) + 5;
           setTimeout(type, delay);
         }
       }
@@ -238,8 +238,10 @@
         const reply = data?.reply || JSON.stringify(data, null, 2);
         add(reply, 'bot');
 
-        if (data.dealer_name && data.dealer_number) {
-          dealerInfo.textContent = `${data.dealer_name} (#${data.dealer_number})`;
+        const nameMatch = reply.match(/Dealer Name:\s*(.*)/i);
+        const numberMatch = reply.match(/Dealer Number:\s*(\w+)/i);
+        if (nameMatch && numberMatch) {
+          dealerInfo.textContent = `${nameMatch[1]} (#${numberMatch[1]})`;
         }
 
       } catch (e) {
