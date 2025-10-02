@@ -286,6 +286,14 @@ FAMILY_CATALOG = [
 MODEL_DOT_RE = re.compile(r"\b([A-Za-z]{2,4}\d{1,2}\.\d{2})\b", re.IGNORECASE)   # e.g., BB72.30
 MODEL_SERIES_RE = re.compile(r"\b([A-Za-z]{2,4}\d{2,3})\b", re.IGNORECASE)       # e.g., DHS64, BW12, DS8
 
+# Some APIs label the spacing question inconsistently.
+# No matter which one comes back, we must send `dh_spacing_id` with the ID value.
+SPACING_QNAME_MAP = {
+    "dh_choice": "dh_spacing_id",
+    "dh_spacing": "dh_spacing_id",
+    "dh_spacing_choice": "dh_spacing_id",
+}
+
 def detect_model(text: str) -> str | None:
     t = text or ""
     m = MODEL_DOT_RE.search(t)
@@ -359,78 +367,7 @@ def detect_family_slug(text: str) -> str | None:
 
 # ---------------- Conversation Helpers -----------------
 
-def last_quote_state(messages: List[Dict[str, Any]]) -> Dict[str, Any] | None:
-    """
-    Return the most recent woods_quote tool body from the conversation, or None.
-    Used to detect whether we're in 'questions' mode and what the next question is.
-    """
-    for m in reversed(messages):
-        if m.get("role") == "tool" and m.get("name") == "woods_quote":
-            try:
-                payload = json.loads(m.get("content") or "{}")
-                return payload.get("body") or {}
-            except Exception:
-                return None
-    return None
 
-
-def build_next_args_from_answer(prev_quote_body: Dict[str, Any], user_text: str) -> Dict[str, Any]:
-    """
-    Given the last /quote response (with required_questions[0]) and the user's reply,
-    produce { <question_name>: <value or id> }:
-      - If the user replies with A/B/C..., map to the corresponding choice index.
-      - If the question name ends with *_id and choices_with_ids are present, send the ID.
-      - Otherwise, send the exact label from choices.
-    """
-    args: Dict[str, Any] = {}
-    if not isinstance(prev_quote_body, dict):
-        return args
-
-    rq = prev_quote_body.get("required_questions") or []
-    if not rq:
-        return args
-
-    q = rq[0]
-    qname = q.get("name")                # e.g., "dh_width_in", "dh_blade", "dh_spacing_id"
-    choices = q.get("choices") or []     # list[str]
-    cwids = q.get("choices_with_ids") or []  # list[{"id","label"}]
-
-    if not qname:
-        return args
-
-    reply = (user_text or "").strip()
-
-    # Letter A/B/C → index
-    if len(reply) == 1 and reply.isalpha():
-        idx = ord(reply.upper()) - ord('A')
-        if 0 <= idx < len(choices):
-            label = choices[idx]
-            if qname.endswith("_id") and cwids and idx < len(cwids):
-                args[qname] = cwids[idx].get("id")
-            else:
-                args[qname] = label
-            return args
-
-    # Exact label match
-    if choices and reply in choices:
-        label = reply
-        if qname.endswith("_id") and cwids:
-            for ci in cwids:
-                if ci.get("label") == label:
-                    args[qname] = ci.get("id")
-                    break
-            else:
-                args[qname] = label
-        else:
-            args[qname] = label
-        return args
-
-    # If they pasted an ID and *_id is expected
-    if qname.endswith("_id") and reply:
-        args[qname] = reply
-        return args
-
-    return args
 
 
 # ---------------- Tools (function schemas) ----------------
@@ -735,6 +672,7 @@ def chat():
         if not user_message:
             return jsonify({"error": "Missing message"}), 400
 
+        # ---------- Session resolve + GC ----------
         now = time.time()
         sid = request.headers.get("X-Session-Id") or payload.get("session_id") or f"anon-{int(now*1000)}"
         for k in list(SESS.keys()):
@@ -743,13 +681,15 @@ def chat():
         sess = SESS.setdefault(sid, {"messages": [], "dealer": None, "updated_at": now})
         sess["updated_at"] = now
 
+        # 🔎 Context log (helps correlate runs)
         log.info("SESSION sid=%s dealer=%s msg=%s",
                  sid, (sess.get("dealer") or {}).get("dealer_number"), user_message)
 
+        # ---------- Build conversation ----------
         convo: List[Dict[str, Any]] = [{"role": "system", "content": KNOWLEDGE}]
         convo.extend(sess["messages"])
 
-        # Dealer detection
+        # ---------- Auto: Dealer detection from this message ----------
         dn_from_msg = extract_dealer(user_message)
         if dn_from_msg:
             res = tool_woods_dealer_discount({"dealer_number": dn_from_msg})
@@ -759,69 +699,43 @@ def chat():
                 sess["dealer"] = {
                     "dealer_number": body.get("dealer_number") or dn_from_msg,
                     "dealer_name": body.get("dealer_name") or "",
-                    "discount": body.get("discount"),
+                    "discount": body.get("discount"),  # e.g., 0.24 per your API
                 }
 
-        dealer_num = str((sess.get("dealer") or {}).get("dealer_number") or "")
+        # ---------- Resolve dealer number for quoting ----------
+        dealer_num = None
+        if sess.get("dealer", {}).get("dealer_number"):
+            dealer_num = str(sess["dealer"]["dealer_number"])
 
-        # Check if we are mid-questions already
-        prev_quote = last_quote_state(convo)
-        pending = bool(prev_quote and prev_quote.get("mode") == "questions" and prev_quote.get("required_questions"))
+        # ---------- Auto-trigger: model OR family ----------
+        model = detect_model(user_message)
+        family_slug = detect_family_slug(user_message) if not model else None
 
-        if dealer_num:
-            if pending:
-                # We are answering the next required question:
-                next_args = {"dealer_number": dealer_num}
-                # Always keep using family flow while answering (don't set model mid-questions)
-                if prev_quote.get("category"):
-                    # If previous quote body carried a category/family, we can keep family for safety
-                    # For Disc Harrow the API expects family='disc_harrow'
-                    # You may store the exact family slug from the first call; here we'll re-detect
-                    fam = detect_family_slug(user_message) or detect_family_slug(prev_quote.get("category", ""))
-                    # If we can't infer from this line, reuse the last used family if you stored it; otherwise skip
-                    if fam:
-                        next_args["family"] = fam
-                    else:
-                        # Try to infer from the last call you made (if you log/track it)
-                        pass
+        if dealer_num and (model or family_slug):
+            args = {"dealer_number": dealer_num}
+            if model:
+                args["model"] = model
+            if family_slug:
+                args["family"] = family_slug
 
-                # Build only the next param from user's reply using the last question
-                fill = build_next_args_from_answer(prev_quote, user_message)
-                next_args.update(fill)
+            # 🔎 Log what we think we're about to send
+            log.info("AUTO-TRIGGER args=%s", json.dumps(args, ensure_ascii=False))
 
-                if len(fill) > 0:
-                    log.info("AUTO-ANSWER args=%s", json.dumps(next_args, ensure_ascii=False))
-                    res = tool_woods_quote(next_args)
-                    add_tool_exchange(convo, "woods_quote", next_args, res)
-                else:
-                    # Could not resolve their reply to a valid param; let GPT ask to clarify
-                    pass
+            res = tool_woods_quote(args)
+            add_tool_exchange(convo, "woods_quote", args, res)
 
-            else:
-                # No pending question: allow model or family to seed the first quote
-                model = detect_model(user_message)
-                family_slug = detect_family_slug(user_message) if not model else None
-
-                if model or family_slug:
-                    args = {"dealer_number": dealer_num}
-                    if model:
-                        args["model"] = model
-                    if family_slug:
-                        args["family"] = family_slug
-                    log.info("AUTO-TRIGGER args=%s", json.dumps(args, ensure_ascii=False))
-                    res = tool_woods_quote(args)
-                    add_tool_exchange(convo, "woods_quote", args, res)
-
-        # Continue with the planner
+        # ---------- Append user and run planner ----------
         convo.append({"role": "user", "content": user_message})
         reply, hist = run_ai(convo)
 
+        # ---------- Persist history (trim, keep non-system) ----------
         MAX_KEEP = 80
         trimmed = [m for m in hist if m.get("role") != "system"]
         if len(trimmed) > MAX_KEEP:
             trimmed = trimmed[-MAX_KEEP:]
         sess["messages"] = trimmed
 
+        # ---------- Dealer badge for UI ----------
         dealer_badge = sess.get("dealer") or {}
         return jsonify({
             "reply": reply,
