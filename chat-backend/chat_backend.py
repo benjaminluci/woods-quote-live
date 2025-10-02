@@ -2,9 +2,8 @@
 # - Uses GET /quote?model=...&dealer_number=... (+ options)
 # - Detects models like bb60.30, bw12.40, ds8.30 → normalized to uppercase
 # - Stores dealer after dealer-discount and auto-injects dealer_number into quote calls
-# - FULL KNOWLEDGE prompt included (verbatim)
+# - Full knowledge prompt included (verbatim)
 # - Tool schema includes a comprehensive set of option fields (+ additionalProperties=True)
-# - NEW: Server-side cash-discount enforcement (5% cash if dealer discount == 5%, else 12%)
 
 from __future__ import annotations
 import os, re, json, time, logging, traceback
@@ -71,8 +70,10 @@ API Error Handling
 Pricing Logic
 1. Retrieve list price for each part number from API
 2. Apply dealer discount from lookup
-3. Use _enforce_cash_totals to see final calculations and cash discount totals
+3. Unless the dealer discount is exactly 5%, apply an additional 12% cash discount
 4. Format quote as plain text, customer-ready
+
+⚠️ Cash discount must always be applied unless dealer discount is exactly 5%. Never skip this.
 
 ---
 Quote Output Format
@@ -80,7 +81,7 @@ Quote Output Format
 - Include the dealer name and dealer number below the title
 - Final Dealer Net shown boldly with ✅
 - Omit the "Subtotal" section
-- Include: List Price of Each Item → Total Dealer Discount → Total Cash Discount → Final Dealer Net
+- Include: List Price → Discount → Cash Discount → Final Net
 - Include: “Cash discount included only if paid within terms.”
 - If a model or part cannot be priced, say: “Unable to find pricing... contact Benjamin Luci at 615-516-8802.”
 
@@ -131,6 +132,11 @@ Disc Harrow Fix
   - Say: “The system is stuck on a required disc spacing selection. Please escalate to Benjamin Luci at 615-516-8802.”
   - Do not retry endlessly
 
+---
+Correction Enforcement
+- Do not stop quotes after dealer discount
+- If dealer discount ≠ 5%, 12% cash discount **must** be shown
+- If cash discount is missing from final output, quote is invalid and must be corrected
 """
 
 # (Optional helper synopsis for the model; harmless to include)
@@ -152,15 +158,7 @@ Guide (only if /quote does not already ask):
 - Stump Grinder: hydraulics_id.
 """
 
-ENFORCER_NOTE = r"""
----
-Server Enforcement
-If a tool result contains an "_enforced_totals" object, you must use those numbers when presenting:
-- List total, Dealer Discount amount, Cash Discount amount, and the Final Net.
-Do not recompute these yourself; use the provided values.
-"""
-
-SYSTEM_PROMPT = KNOWLEDGE + "\n\n--- CONFIG GUIDE ---\n" + FAMILY_GUIDE + ENFORCER_NOTE
+SYSTEM_PROMPT = KNOWLEDGE + "\n\n--- CONFIG GUIDE ---\n" + FAMILY_GUIDE
 
 # ---------------- HTTP helper ----------------
 def http_get(path: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], int, str]:
@@ -304,77 +302,6 @@ TOOLS = [
     },
 ]
 
-# ---------------- Helpers for cash-discount enforcement ----------------
-def _num(x):
-    try:
-        if isinstance(x, (int, float)): return float(x)
-        if isinstance(x, str): return float(x.replace(",", "").strip())
-    except Exception:
-        return None
-    return None
-
-def _sum_list_total(body: dict) -> float | None:
-    # 1) totals shortcut
-    totals = body.get("totals") if isinstance(body, dict) else None
-    if isinstance(totals, dict):
-        lt = _num(totals.get("list_total"))
-        if lt is not None:
-            return lt
-    # 2) items/line_items
-    for key in ("items", "line_items"):
-        arr = body.get(key)
-        if isinstance(arr, list) and arr:
-            s, any_found = 0.0, False
-            for it in arr:
-                if not isinstance(it, dict): continue
-                price = (_num(it.get("list_price")) or _num(it.get("list"))
-                         or (_num(it.get("list_price_cents")) or 0) / 100.0)
-                qty = _num(it.get("qty")) or _num(it.get("quantity")) or 1.0
-                if price is not None:
-                    any_found = True
-                    s += price * float(qty)
-            if any_found:
-                return s
-    # 3) single object
-    lt = _num(body.get("list_price")) or _num(body.get("list"))
-    return lt
-
-def _enforce_cash_totals(body: dict, dealer_discount: float | None) -> dict | None:
-    """
-    Compute correct totals:
-      - net_after_dealer = list_total * (1 - dealer_discount)
-      - cash_rate = 0.05 if dealer_discount == 0.05 else 0.12
-      - final_net = net_after_dealer * (1 - cash_rate)
-    Returns a dict or None if we can't compute.
-    """
-    # infer dealer_discount from body if not provided
-    if dealer_discount is None:
-        dealer_discount = _num((body.get("dealer") or {}).get("discount")) \
-                          or _num(body.get("dealer_discount"))
-
-    list_total = _sum_list_total(body)
-    if list_total is None or dealer_discount is None:
-        return None
-
-    dd = float(dealer_discount)
-    net_after_dealer = list_total * (1.0 - dd)
-    # YOUR RULE: if dealer discount is exactly 5%, cash discount is 5%; otherwise 12%
-    cash_rate = 0.05 if abs(dd - 0.05) < 1e-9 else 0.12
-    cash_amount = net_after_dealer * cash_rate
-    final_net = net_after_dealer * (1.0 - cash_rate)
-
-    r2 = lambda x: float(f"{x:.2f}")
-    return {
-        "list_total": r2(list_total),
-        "dealer_discount_rate": r2(dd),
-        "dealer_discount_amount": r2(list_total * dd),
-        "net_after_dealer": r2(net_after_dealer),
-        "cash_discount_rate": r2(cash_rate),
-        "cash_discount_amount": r2(cash_amount),
-        "final_net_enforced": r2(final_net),
-        "note": "Cash discount is 5% when dealer discount is 5%, otherwise 12%.",
-    }
-
 # ---------------- Tool implementations ----------------
 def tool_woods_dealer_discount(args: Dict[str, Any]) -> Dict[str, Any]:
     dealer_number = str(args.get("dealer_number") or "").strip()
@@ -382,20 +309,9 @@ def tool_woods_dealer_discount(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": status == 200, "status": status, "url": used, "body": body}
 
 def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
-    # Build query for API. DO NOT send dealer_discount upstream (internal only).
-    params = {k: v for k, v in (args or {}).items() if v not in (None, "") and k != "dealer_discount"}
+    # GET /quote with params as-is (must include model + dealer_number for reliable results)
+    params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
     body, status, used = http_get("/quote", params)
-
-    # Attach enforced totals for the assistant to use
-    try:
-        if status == 200 and isinstance(body, dict):
-            dd_local = args.get("dealer_discount")
-            enforced = _enforce_cash_totals(body, _num(dd_local) if dd_local is not None else None)
-            if enforced:
-                body["_enforced_totals"] = enforced
-    except Exception as e:
-        log.warning("enforcer failed: %s", e)
-
     return {"ok": status == 200, "status": status, "url": used, "body": body}
 
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -444,30 +360,22 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
             except Exception:
                 args = {}
 
-            # ALWAYS inject dealer_number and dealer_discount for woods_quote if the model forgot
-            if name == "woods_quote":
-                # find last dealer lookup
-                dn = args.get("dealer_number")
-                dd_rate = args.get("dealer_discount")
+            # ALWAYS inject dealer_number for woods_quote if the model forgot it
+            if name == "woods_quote" and not args.get("dealer_number"):
+                # scan history for the last dealer lookup
+                dn = None
                 for m in reversed(history):
-                    if dn and dd_rate is not None:
-                        break
                     if m.get("role") == "tool" and m.get("name") == "woods_dealer_discount":
                         try:
                             payload = json.loads(m.get("content") or "{}")
                             b = payload.get("body") or {}
-                            if not dn:
-                                dn0 = b.get("dealer_number") or b.get("number")
-                                if dn0: dn = str(dn0)
-                            if dd_rate is None and (b.get("discount") is not None):
-                                try: dd_rate = float(b.get("discount"))
-                                except Exception: pass
+                            dn = b.get("dealer_number") or b.get("number")
+                            if dn:
+                                break
                         except Exception:
                             pass
-                if dn and not args.get("dealer_number"):
-                    args["dealer_number"] = dn
-                if (dd_rate is not None) and (args.get("dealer_discount") is None):
-                    args["dealer_discount"] = dd_rate
+                if dn:
+                    args["dealer_number"] = str(dn)
 
             if name == "woods_dealer_discount":
                 result = tool_woods_dealer_discount(args)
@@ -559,8 +467,8 @@ def chat():
             for m in reversed(convo):
                 if m.get("role") == "tool" and m.get("name") == "woods_dealer_discount":
                     try:
-                        payload2 = json.loads(m.get("content") or "{}")
-                        b = payload2.get("body") or {}
+                        payload = json.loads(m.get("content") or "{}")
+                        b = payload.get("body") or {}
                         dn = b.get("dealer_number") or b.get("number")
                         if dn:
                             dealer_num = str(dn); break
@@ -571,12 +479,6 @@ def chat():
         model = detect_model(user_message)
         if model and dealer_num:
             args = {"model": model, "dealer_number": dealer_num}
-            # If we already know the dealer discount, attach for server math (not sent to API)
-            if sess.get("dealer", {}).get("discount") is not None:
-                try:
-                    args["dealer_discount"] = float(sess["dealer"]["discount"])
-                except Exception:
-                    pass
             res = tool_woods_quote(args)
             add_tool_exchange(convo, "woods_quote", args, res)
 
