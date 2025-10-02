@@ -4,65 +4,180 @@
   <meta charset="UTF-8" />
   <title>Woods Quoting Assistant</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500&display=swap" rel="stylesheet">
   <style>
-    html,body { height:100%; margin:0; }
-    body { font-family: system-ui, Arial, sans-serif; background:#f6f7f9; display:flex; flex-direction:column; }
-    header { padding:12px 16px; background:#111827; color:#fff; display:flex; align-items:center; gap:12px; }
-    header small { opacity:.8; font-size:.8rem; }
-    #chat { flex:1; overflow:auto; padding:16px; }
-    .msg { max-width: 720px; margin: 8px auto; padding: 12px 14px; border-radius: 12px; white-space: pre-wrap; line-height: 1.45; }
-    .user { background:#2563eb; color:#fff; margin-left:auto; }
-    .bot { background:#fff; border:1px solid #e5e7eb; margin-right:auto; }
-    footer { display:flex; gap:8px; padding:12px; background:#fff; border-top:1px solid #e5e7eb; position:sticky; bottom:0; }
-    input { flex:1; padding:10px 12px; border-radius:10px; border:1px solid #cbd5e1; outline:none; }
-    input:focus { border-color:#111827; }
-    button { padding:10px 14px; border-radius:10px; border:1px solid #111827; background:#111827; color:#fff; cursor:pointer; }
-    button:disabled { opacity:.6; cursor:not-allowed; }
-    .row { display:flex; align-items:center; gap:10px; }
-    .pill { background:#fff; color:#111827; border:1px solid #e5e7eb; padding:4px 8px; border-radius:999px; font-size:.75rem; }
+    :root {
+      --bg-color: #1a1a1d;
+      --input-bg: #2b2b2e;
+      --user-msg-bg: #10a37f;
+      --bot-msg-bg: #2d2d30;
+      --accent: #f97316;
+      --text-color: #ececf1;
+      --placeholder-color: #c7c7cd;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      font-family: 'Roboto', sans-serif;
+      background-color: var(--bg-color);
+      color: var(--text-color);
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      background: #0f0f10;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 24px;
+      border-bottom: 1px solid #2c2d30;
+    }
+    header .left {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    header img {
+      height: 44px;
+    }
+    header h1 {
+      font-size: 1.8rem;
+      font-weight: 500;
+    }
+    header .dealer-info {
+      font-size: 1rem;
+      color: #d1d5db;
+    }
+    #chat {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .msg {
+      max-width: 700px;
+      padding: 14px 18px;
+      border-radius: 10px;
+      white-space: pre-wrap;
+      line-height: 1.5;
+      word-wrap: break-word;
+    }
+    .user {
+      background-color: var(--user-msg-bg);
+      color: white;
+      align-self: flex-end;
+      border-bottom-right-radius: 0;
+    }
+    .bot {
+      background-color: var(--bot-msg-bg);
+      color: white;
+      align-self: flex-start;
+      border-bottom-left-radius: 0;
+    }
+    .typing-indicator {
+      font-style: italic;
+      font-size: 0.95rem;
+      color: var(--accent);
+      animation: blink 1.4s infinite;
+    }
+    @keyframes blink {
+      0%, 100% { opacity: 0.2; }
+      50% { opacity: 1; }
+    }
+    footer {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 16px;
+      background: #0f0f10;
+      border-top: 1px solid #2c2d30;
+    }
+    input {
+      flex: 1;
+      background: var(--input-bg);
+      color: white;
+      border: 1px solid #555;
+      border-radius: 8px;
+      padding: 12px;
+      outline: none;
+      font-size: 1rem;
+    }
+    input::placeholder {
+      color: var(--placeholder-color);
+    }
+    input:focus {
+      border-color: var(--accent);
+    }
+    button {
+      background: var(--accent);
+      border: none;
+      border-radius: 50%;
+      width: 44px;
+      height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      color: white;
+      font-size: 1.3rem;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
   </style>
 </head>
 <body>
   <header>
-    <div>Woods Quoting Assistant</div>
-    <small id="env"></small>
+    <div class="left">
+      <img src="https://woodsequipment.com/wp-content/uploads/woods-transparent.png" alt="Woods Logo" />
+      <h1>Quoting Assistant</h1>
+    </div>
+    <div class="dealer-info" id="dealerInfo"></div>
   </header>
+
   <div id="chat" aria-live="polite"></div>
+
   <footer>
-    <input id="inp" placeholder="Please Enter Dealer Number To Begin Quoting" autocomplete="off" />
-    <button id="send">Send</button>
+    <input id="inp" placeholder="Enter Dealer Number To Begin Quoting" autocomplete="off" />
+    <button id="send">&#8593;</button>
   </footer>
 
   <script>
-    // ====== CONFIG ======
-    // Your AI bot endpoint (NOT the Woods Pricing API). This is the server that proxies tools to your app.py API.
     const CHAT_BACKEND = 'https://woods-quote-backend.onrender.com/chat';
-    const HEALTH_BACKEND = 'https://woods-quote-backend.onrender.com/health'
+    const HEALTH_BACKEND = 'https://woods-quote-backend.onrender.com/health';
 
-    // ====== ELEMENTS ======
     const chat = document.getElementById('chat');
     const inp  = document.getElementById('inp');
     const btn  = document.getElementById('send');
-    const env  = document.getElementById('env');
+    const dealerInfo = document.getElementById('dealerInfo');
 
-    // ====== SESSION (sticky across page loads) ======
     const SID_KEY = 'woods_sid';
     let sessionId = localStorage.getItem(SID_KEY);
     if (!sessionId) {
-      sessionId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
+      sessionId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
       localStorage.setItem(SID_KEY, sessionId);
     }
 
-    // Show quick env info in header for troubleshooting
-    env.textContent = `session: ${sessionId.slice(0,8)}… · backend: ${new URL(CHAT_BACKEND).host}`;
-
-    // ====== UI helpers ======
     function add(text, who) {
       const div = document.createElement('div');
-      div.className = `msg ${who}`;
-      div.textContent = text;
+      div.className = 'msg ' + who;
+      div.textContent = '';
       chat.appendChild(div);
       chat.scrollTop = chat.scrollHeight;
+
+      let i = 0;
+      function type() {
+        if (i < text.length) {
+          div.textContent += text.charAt(i);
+          i++;
+          setTimeout(type, 15);
+        }
+      }
+      type();
     }
 
     function setBusy(state) {
@@ -70,22 +185,23 @@
       inp.disabled = state;
     }
 
-    // ====== Warm-up (pre-ping backend so upstream Render isn't sleepy) ======
     async function warmUp() {
-      try { await fetch(HEALTH_BACKEND, { method: 'GET', cache: 'no-store' }); }
-      catch (_) { /* ignore */ }
+      try { await fetch(HEALTH_BACKEND); } catch (_) {}
     }
-    // fire and forget
     warmUp();
 
-    // ====== Send message ======
     async function send() {
       const text = inp.value.trim();
       if (!text) return;
       inp.value = '';
       add(text, 'user');
-      add('…', 'bot');
-      const thinking = chat.lastChild;
+
+      const thinking = document.createElement('div');
+      thinking.className = 'typing-indicator';
+      thinking.textContent = 'Typing...';
+      chat.appendChild(thinking);
+      chat.scrollTop = chat.scrollHeight;
+
       setBusy(true);
 
       try {
@@ -93,18 +209,21 @@
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'X-Session-Id': sessionId  // CRITICAL: same session every turn
+            'X-Session-Id': sessionId
           },
           body: JSON.stringify({ message: text })
         });
+
         const data = await r.json();
         thinking.remove();
-        add((data && data.reply) ? data.reply : JSON.stringify(data, null, 2), 'bot');
 
-        // If we hit a connector error on the first real quote, try warming again silently.
-        if (typeof data?.reply === 'string' && data.reply.includes('system error while retrieving data')) {
-          warmUp();
+        const reply = data?.reply || JSON.stringify(data, null, 2);
+        add(reply, 'bot');
+
+        if (data?.dealer_name && data?.dealer_number) {
+          dealerInfo.textContent = `${data.dealer_name} (#${data.dealer_number})`;
         }
+
       } catch (e) {
         thinking.remove();
         add('Error: ' + (e?.message || e), 'bot');
@@ -116,8 +235,6 @@
 
     btn.addEventListener('click', send);
     inp.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
-
-    // Focus input on load
     window.addEventListener('load', () => inp.focus(), { once: true });
   </script>
 </body>
