@@ -70,10 +70,10 @@ API Error Handling
 Pricing Logic
 1. Retrieve list price for each part number from API
 2. Apply dealer discount from lookup
-3. Unless the dealer discount is exactly 5%, apply an additional 12% cash discount
+3. Apply 12% cash discount on top of dealer discount, unless dealer discount is 5% then the cash discount is 5%
 4. Format quote as plain text, customer-ready
 
-⚠️ Cash discount must always be applied unless dealer discount is exactly 5%. Never skip this.
+⚠️ Cash discount must always be applied and taken off dealer net. Never skip this.
 
 ---
 Quote Output Format
@@ -81,9 +81,9 @@ Quote Output Format
 - Include the dealer name and dealer number below the title
 - Final Dealer Net shown boldly with ✅
 - Omit the "Subtotal" section
-- Include: List Price → Discount → Cash Discount → Final Net
+- Include: List Price For All Pieces Individually → Total Dealer Discount of All Items Combined → Total Cash Discount of All Items Combined → Final Dealer Net
 - Include: “Cash discount included only if paid within terms.”
-- If a model or part cannot be priced, say: “Unable to find pricing... contact Benjamin Luci at 615-516-8802.”
+- If a model or part cannot be priced, say: “Unable to find pricing, please contact Benjamin Luci at 615-516-8802.”
 
 ---
 Session Handling
@@ -135,8 +135,8 @@ Disc Harrow Fix
 ---
 Correction Enforcement
 - Do not stop quotes after dealer discount
-- If dealer discount ≠ 5%, 12% cash discount **must** be shown
-- If cash discount is missing from final output, quote is invalid and must be corrected
+- If dealer discount ≠ 5%, 12% cash discount **must** be added.  If 5% then cash discount is 5%
+- If cash discount is missing from Final Dealer Net, quote is invalid and must be corrected
 """
 
 # (Optional helper synopsis for the model; harmless to include)
