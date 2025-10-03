@@ -155,6 +155,7 @@ Correction Enforcement
 # (Optional helper synopsis for the model; harmless to include)
 FAMILY_GUIDE = r"""
 Guide (only if /quote does not already ask):
+- BrushFighter: bf_choice, bf_choice_id, drive.
 - BrushBull: bb_shielding, bb_tailwheel (sometimes).
 - Batwing: bw_duty, bw_driveline (540/1000), shielding_rows, deck_rings, bw_tire_qty.
 - Dual Spindle (DS/MDS): ds_mount, ds_shielding, ds_driveline (540/1000), tire_id, tire_qty.
