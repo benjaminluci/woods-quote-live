@@ -633,6 +633,7 @@ def tool_woods_quote(args: dict) -> dict:
     return {"ok": False, "status": status, "url": url,
             "body": body if isinstance(body, dict) else {"raw_text": body}}
 
+
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
     body, status, used = http_get("/health", {})
     return {"ok": status == 200, "status": status, "url": used, "body": body}
@@ -802,7 +803,7 @@ def chat():
         if dealer_num and (model or family_slug):
             args = {"dealer_number": dealer_num}
             if model:
-                args["model"] = model       # tool will drop if a menu flow begins
+                args["model"] = model
             if family_slug:
                 args["family"] = family_slug
 
@@ -811,7 +812,7 @@ def chat():
             else:
                 res = tool_woods_quote(args)
 
-                # Auto-reset from API (rare)
+                # Honor API's auto-reset
                 if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
                     sess["messages"] = []
                     sess["quote_ctx"] = {"family": None, "answers": {}}
@@ -825,61 +826,70 @@ def chat():
                         }
                     })
 
-                # >>> NEW: remember family on follow-ups; clear on success
-                body = (res or {}).get("body") or {}
-                if isinstance(body, dict) and body.get("mode") == "questions":
-                    fam = args.get("family")
-                    if fam:
-                        sess["quote_ctx"]["family"] = fam
-                if isinstance(body, dict) and body.get("mode") == "quote":
-                    sess["quote_ctx"] = {"family": None, "answers": {}}
-                    sess["err_count"] = 0
-                # <<<
-
                 add_tool_exchange(convo, "woods_quote", args, res)
 
-        # ---------- Follow-up branch ----------
-        elif dealer_num:
-            args = {"dealer_number": dealer_num}
-            qc = sess.get("quote_ctx") or {}
-            if qc.get("family"):
-                args["family"] = qc["family"]
-
-            if set(args) == {"dealer_number"}:
-                log.info("Skip /quote: only dealer_number present (follow-up)")
-            else:
-                res = tool_woods_quote(args)
-
-                # Auto-reset from API
-                if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
-                    sess["messages"] = []
-                    sess["quote_ctx"] = {"family": None, "answers": {}}
-                    sess["err_count"] = 0
-                    dealer_badge = sess.get("dealer") or {}
-                    return jsonify({
-                        "reply": res["body"]["message"],
-                        "dealer": {
-                            "dealer_number": dealer_badge.get("dealer_number"),
-                            "dealer_name": dealer_badge.get("dealer_name"),
-                        }
-                    })
-
-                # >>> NEW: remember family on follow-ups; clear on success
-                body = (res or {}).get("body") or {}
-                if isinstance(body, dict) and body.get("mode") == "questions":
-                    fam = args.get("family")
-                    if fam:
-                        sess["quote_ctx"]["family"] = fam
-                if isinstance(body, dict) and body.get("mode") == "quote":
-                    sess["quote_ctx"] = {"family": None, "answers": {}}
-                    sess["err_count"] = 0
-                # <<<
-
-                add_tool_exchange(convo, "woods_quote", args, res)
-
-        # ---------- Send to planner ----------
+        # ---------- Send to planner (no proactive follow-up calls) ----------
         convo.append({"role": "user", "content": user_message})
         reply, hist = run_ai(convo)
+
+        # ---------- Inspect latest woods_quote tool response to set/clear context ----------
+        def _latest_tool_body(history: List[Dict[str, Any]], name: str) -> tuple[dict, dict]:
+            """
+            Returns (body, args_dict) of the most recent tool message with given name.
+            We expect add_tool_exchange to store a JSON blob with {'args': ..., 'body': ...}
+            but we handle plain body too.
+            """
+            for m in reversed(history):
+                if m.get("role") == "tool" and m.get("name") == name:
+                    try:
+                        blob = json.loads(m.get("content") or "{}") or {}
+                        body = blob.get("body") if isinstance(blob, dict) else {}
+                        args = blob.get("args") if isinstance(blob, dict) else {}
+                        if not body and isinstance(blob, dict):
+                            body = blob  # sometimes content is body directly
+                        return (body or {}), (args or {})
+                    except Exception:
+                        return {}, {}
+            return {}, {}
+
+        body, tool_args = _latest_tool_body(hist, "woods_quote")
+        if body:
+            mode = body.get("mode")
+            if mode == "questions":
+                # Persist family from tool args if present; otherwise infer from required question name
+                fam = tool_args.get("family")
+                if not fam:
+                    rq = body.get("required_questions") or []
+                    fam_map = {
+                        "pf_": "pallet_fork",
+                        "balespear_": "bale_spear",
+                        "qh_": "quick_hitch",
+                        "finish_": "rear_finish",
+                        "rb_": "rear_blade",
+                        "lrs_": "landscape_rake",
+                        "gs_": "grading_scraper",
+                        "pd_": "post_hole_digger",
+                        "dh_": "disc_harrow",
+                        "tiller_": "tiller",
+                        "bw": "batwing",
+                        "bb": "brushbull",
+                        "tbw": "turf_batwing",
+                        "ds": "dual_spindle",
+                        "mds": "dual_spindle",
+                        "bf": "brushfighter",
+                    }
+                    if rq:
+                        name = (rq[0].get("name") or "").lower()
+                        for pfx, fam_name in fam_map.items():
+                            if name.startswith(pfx):
+                                fam = fam_name
+                                break
+                if fam:
+                    sess["quote_ctx"]["family"] = fam
+            elif mode == "quote":
+                # Clear per-quote context (keep dealer)
+                sess["quote_ctx"] = {"family": None, "answers": {}}
+                sess["err_count"] = 0
 
         # ---------- Persist history (trim) ----------
         MAX_KEEP = 80
