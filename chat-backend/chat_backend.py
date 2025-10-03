@@ -493,33 +493,37 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     # -------- Build params (strip empty) --------
     params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
 
-    # -------- Family-specific param normalization (surgical, safe) --------
+    # -------- Inject last-known family/model if missing --------
+    dealer_number = str(params.get("dealer_number") or "")
+    sess = None
+    for s in SESS.values():
+        d = s.get("dealer") or {}
+        if str(d.get("dealer_number") or "") == dealer_number:
+            sess = s
+            break
+
+    if sess:
+        if "family" not in params and sess.get("last_family"):
+            params["family"] = sess["last_family"]
+        if "model" not in params and sess.get("last_model"):
+            params["model"] = sess["last_model"]
+
+    # -------- Family-specific param normalization --------
     try:
         import re
 
-        # ===================== Disc Harrow =====================
         has_dh = any(k.startswith("dh_") for k in params.keys())
         if has_dh:
-            # Mid-flow: don't send model (e.g., "DHS64")
             params.pop("model", None)
-            # Ensure family present
             params.setdefault("family", "disc_harrow")
-
-            # Normalize width alias -> dh_width_in
             if "width" in params and "dh_width_in" not in params:
                 params["dh_width_in"] = str(params.pop("width")).strip()
-
-            # Spacing: move ID from alt keys to dh_spacing_id
             if "dh_spacing_id" not in params:
                 for alt in ("dh_choice", "dh_spacing", "dh_spacing_choice"):
                     val = params.get(alt)
-                    if not val:
-                        continue
                     if isinstance(val, str) and re.match(r"^\d{6,}[A-Z]?$", val.strip()):
                         params["dh_spacing_id"] = val.strip()
                         break
-
-            # Blade shorthand -> API label
             if "dh_blade" in params:
                 t = str(params["dh_blade"]).strip().lower()
                 if t in {"n", "notched"}:
@@ -527,35 +531,21 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                 elif t in {"c", "combo"}:
                     params["dh_blade"] = "Combo (C)"
 
-        # ===================== Bale Spear =====================
-        # Signals we are in/after Bale Spear question:
         has_bs_flow = (
             "balespear_choice" in params
             or ("model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BS"))
-            or "part_id" in params  # sometimes LLM sends the part directly
+            or "part_id" in params
         )
         if has_bs_flow:
-            # Anchor family and drop model mid-flow (model/part_id calls 500 on API)
             params.setdefault("family", "bale_spear")
             params.pop("model", None)
-
-            # If the selection came as part_id and looks like an ID, use it as the answer to the question
-            # The API expects the answer under the question field name (balespear_choice), not 'part_id'
             if "balespear_choice" not in params:
-                # Try to lift from part_id if it looks like an ID (e.g., 1037171)
                 pid = params.get("part_id")
                 if isinstance(pid, str) and re.match(r"^\d{6,}[A-Z]?$", pid.strip()):
                     params["balespear_choice"] = pid.strip()
-                    # You can keep part_id or drop it; keeping it is usually harmless,
-                    # but if the API is strict, uncomment next line to remove:
-                    # params.pop("part_id", None)
-
-            # If they sent the choice label, fine; if it looks like an ID, that's fine too.
-            # No further mapping is needed here because the API will accept the ID for balespear_choice.
     except Exception as _e:
         log.warning("param normalization skipped: %s", _e)
 
-    # -------- Log request --------
     log.info("QUOTE CALL params=%s", json.dumps(params, ensure_ascii=False))
 
     # -------- HTTP call --------
@@ -575,28 +565,22 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.warning("QUOTE RESP log error: %s", e)
 
-    # -------- Enforce cash discount (round only at the end) --------
+    # -------- Enforce cash discount --------
     try:
         if status == 200 and isinstance(body, dict):
             summary = body.get("summary", {}) or {}
             list_total = float(summary.get("subtotal_list", 0) or 0)
             dealer_net = float(summary.get("total", 0) or 0)
 
-            # Find dealer discount from session (stored as decimal, e.g., 0.24 or 0.05)
-            dealer_number = str(params.get("dealer_number") or "")
             dealer_discount = None
-            for s in SESS.values():
-                d = s.get("dealer") or {}
-                if str(d.get("dealer_number") or "") == dealer_number:
-                    try:
-                        dealer_discount = float(d.get("discount"))
-                    except Exception:
-                        dealer_discount = None
-                    break
+            if sess:
+                try:
+                    dealer_discount = float(sess.get("dealer", {}).get("discount"))
+                except Exception:
+                    pass
 
             if list_total > 0 and dealer_net > 0 and dealer_discount is not None:
                 dealer_discount_amt = list_total - dealer_net
-                # Cash discount rule: 5% if dealer discount == 5%, else 12%
                 cash_discount_pct = 0.05 if abs(dealer_discount - 0.05) < 1e-9 else 0.12
                 cash_discount_amt = dealer_net * cash_discount_pct
                 final_net = dealer_net - cash_discount_amt
@@ -607,13 +591,11 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                     "cash_discount_total": round(cash_discount_amt, 2),
                     "final_net": round(final_net, 2),
                 }
-
                 log.info("ENFORCED TOTALS %s: %s", dealer_number, json.dumps(body["_enforced_totals"]))
     except Exception as e:
         log.warning("Failed to inject _enforced_totals: %s", e)
 
     return {"ok": status == 200, "status": status, "url": used, "body": body}
-
 
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
     body, status, used = http_get("/health", {})
