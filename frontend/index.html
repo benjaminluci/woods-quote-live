@@ -195,7 +195,8 @@
           div.textContent += text.charAt(i);
           chat.scrollTop = chat.scrollHeight;
           i++;
-          const delay = Math.floor(Math.random() * 15) + 5;
+          const baseDelay = Math.max(4, 120 / text.length);
+          const delay = Math.floor(Math.random() * baseDelay) + 2;
           setTimeout(type, delay);
         }
       }
@@ -263,4 +264,3 @@
   </script>
 </body>
 </html>
-
