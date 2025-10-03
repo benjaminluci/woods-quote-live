@@ -95,6 +95,8 @@ Quote Output Format
   - Cash Discount → `_enforced_totals.cash_discount_total`
   - Final Net ✅ → `_enforced_totals.final_net`
 - Include: “Cash discount included only if paid within terms.”
+- Please include $ sign in front of money values
+- Please show each line item that is included in the quote on the final output
 - Omit the "Subtotal" section
 - If `_enforced_totals` is missing or pricing cannot be determined, stop and say: “Unable to find pricing, please contact Benjamin Luci at 615-516-8802.”
 
@@ -409,6 +411,12 @@ TOOLS = [
                     "width_ft": {"type": "string"},
                     "width_in": {"type": "string"},
 
+                    # -------- BRUSHFIGHTER (BF) ------
+                    "bf_choice": {"type": "string"},
+                    "bf_choice_id": {"type": "string"},
+                    "drive": {"type": "string", "description": "hydraulic/gear/pto if applicable"},
+                    "bf_drive": {"type": "string"},
+  
                     # -------- BRUSHBULL (BB) --------
                     "bb_shielding": {"type": "string", "description": "Belt or Chain"},
                     "bb_tailwheel": {"type": "string", "description": "Single or Dual, if applicable"},
@@ -540,6 +548,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     # -------- Family-agnostic Q&A guard: drop model if we’re clearly mid-questions --------
     QUESTION_KEYS = {
         "width", "width_ft", "width_in", "quantity", "part_id", "accessory_id", "choice_id",
+        "bf_choice","bf_choice_id","drive","bf_drive",
         "bb_shielding","bb_tailwheel",
         "bw_duty","bw_driveline","bw_tire_qty","shielding_rows","deck_rings",
         "tbw_duty","front_rollers","chains",
