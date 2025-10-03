@@ -508,7 +508,9 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     """
     Calls /quote with sanitized params, logs request/response, and injects `_enforced_totals`.
     Uses a per-session quote context ("quote_ctx") to resend all known answers every turn.
-    Also prevents stale `model` polluting family Q&A, and normalizes family-specific params.
+    Prevents stale `model` polluting family Q&A, and normalizes some family-specific params.
+    Also handles BrushFighter label/letter → id mapping using the last seen options to prevent loops.
+    Auto-resets session (keeps dealer) after 2 consecutive API errors.
     """
     # -------- Build params (strip empty) --------
     params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
@@ -541,7 +543,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         elif not qc["family"]:
             qc["family"] = params["family"]
 
-    # If this is a model-first start, remember it for THIS quote only
+    # If this is a model-first start, remember it for THIS quote only (crumb _model_first)
     if "model" in params and not qc["answers"].get("_model_first") and not params.get("family"):
         qc["answers"]["_model_first"] = params["model"]
 
@@ -549,13 +551,12 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     merged = {"dealer_number": dealer_number}
     if qc["family"]:
         merged["family"] = qc["family"]
-    merged.update(qc.get("answers", {}))
+    merged.update(qc.get("answers", {}))  # carries previous concrete answers
     for k, v in params.items():
         if k != "dealer_number":
             merged[k] = v
 
-    # If we began model-first in this quote and caller didn't send model now (and not in a family flow),
-    # keep including the model until the quote completes.
+    # Keep model if we began model-first for this quote (and not in a family flow)
     if merged.get("_model_first") and "model" not in merged and not merged.get("family"):
         merged["model"] = merged["_model_first"]
 
@@ -600,7 +601,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
             params.pop("model", None)
         # else keep model (model-first path)
 
-    # -------- Family-specific param normalization --------
+    # -------- Family-specific param normalization (BrushFighter, Disc Harrow, Bale Spear, Pallet Fork) --------
     try:
         import re
 
@@ -628,28 +629,46 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                 if x is None: return False
                 s = str(x).strip()
                 if len(s) <= 3: return False
-                return bool(re.match(r"^(BF|[A-Za-z0-9]{5,})", s))  # e.g., 639920A, BF...
+                return bool(re.match(r"^\d{5,}[A-Z]?$", s))  # e.g., 639920A
 
-            # First step expects width_ft; map letter/number to width_ft
+            # width_ft normalization from letter/number
             if "width_ft" not in params:
                 wf = _pick_to_ft(params.get("bf_choice")) or _pick_to_ft(params.get("bf_choice_id")) or _pick_to_ft(params.get("width"))
                 if wf:
                     params["width_ft"] = wf
 
-            # Only pass a REAL bf_choice_id; otherwise drop it
+            # Try to resolve bf_choice → bf_choice_id using options we saw last turn
+            if "bf_choice_id" not in params and "bf_choice" in params and sess:
+                last_opts = (((sess.get("quote_ctx") or {}).get("answers") or {}).get("_last_options") or {})
+                bf_opts = last_opts.get("bf_choice") or []
+                if bf_opts:
+                    # Accept A/B/C (1-based) or full label match
+                    pick = str(params.get("bf_choice")).strip()
+                    if pick.lower() in {"a","b","c","d","e","f","g"}:
+                        idx = "abcdefg".index(pick.lower())
+                        if 0 <= idx < len(bf_opts):
+                            params["bf_choice_id"] = bf_opts[idx].get("id")
+                            params["bf_choice"] = bf_opts[idx].get("label")
+                    else:
+                        for opt in bf_opts:
+                            if opt.get("label","").strip().lower() == pick.lower():
+                                params["bf_choice_id"] = opt.get("id")
+                                params["bf_choice"]  = opt.get("label")
+                                break
+
+            # If bf_choice_id looks bogus, drop it
             if "bf_choice_id" in params and not _looks_like_part_id(params.get("bf_choice_id")):
                 params.pop("bf_choice_id", None)
 
-            # If we don't (yet) have a real choice id, drop the label too so API must ask (shear/slip)
+            # If we *still* don't have a real id, drop the label so API will re-ask (fallback)
             if "bf_choice_id" not in params:
                 params.pop("bf_choice", None)
 
-            # Normalize drive name
+            # Normalize drive name if present
             if "bf_drive" in params and "drive" not in params:
-                params["drive"] = params["bf_drive"]
-                params.pop("bf_drive", None)
+                params["drive"] = params.pop("bf_drive")
 
-        # ===================== Disc Harrow =====================
+        # ===================== Disc Harrow (DH) =====================
         has_dh = any(k.startswith("dh_") for k in params.keys()) or params.get("family") == "disc_harrow"
         if has_dh:
             params.setdefault("family", "disc_harrow")
@@ -731,6 +750,30 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.warning("QUOTE RESP log error: %s", e)
 
+    # -------- Persist last options (labels+ids) for mapping next turn --------
+    try:
+        if sess and status == 200 and isinstance(body, dict) and (body.get("mode") or "").lower() == "questions":
+            rq = body.get("required_questions") or []
+            last_opts = {}
+            for q in rq:
+                opts = q.get("choices_with_ids")
+                if isinstance(opts, list) and opts and all(isinstance(x, dict) for x in opts):
+                    row = []
+                    for x in opts:
+                        lab = (x.get("label") or "").strip()
+                        _id = (x.get("id") or "").strip()
+                        if lab and _id:
+                            row.append({"label": lab, "id": _id})
+                    if row:
+                        last_opts[q.get("name")] = row
+            if last_opts:
+                ans = qc.get("answers") or {}
+                ans["_last_options"] = last_opts
+                qc["answers"] = ans
+                sess["quote_ctx"] = qc
+    except Exception as e:
+        log.warning("failed to persist last options: %s", e)
+
     # -------- Error safeguard: auto-reset after 2 consecutive errors --------
     try:
         is_api_error = (
@@ -797,7 +840,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.warning("quote_ctx persist/clear failed: %s", e)
 
-    # -------- Enforce cash discount (unchanged) --------
+    # -------- Enforce cash discount totals (unchanged) --------
     try:
         if status == 200 and isinstance(body, dict):
             summary = body.get("summary", {}) or {}
