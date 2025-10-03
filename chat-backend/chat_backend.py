@@ -220,6 +220,11 @@ FAMILY_CATALOG = [
         "model_prefixes": ["BB"],
     },
     {
+        "family": "brushfighter",
+        "aliases": ["brushfighter", "brush fighter", "bf"],
+        "model_prefixes": ["BF"],
+    },
+    {
         "family": "box_scraper",
         "aliases": ["box scraper", "box blade", "bs"],
         "model_prefixes": ["BS"],
