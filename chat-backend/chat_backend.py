@@ -91,11 +91,16 @@ Quote Output Format
 - Show:
   - Show:
   - List Price → `_enforced_totals.list_price_total`
+
   - Dealer Discount → `_enforced_totals.dealer_discount_total`
+
   - Cash Discount → `_enforced_totals.cash_discount_total`
+
+
   - Final Net ✅ → `_enforced_totals.final_net`
 - Include: “Cash discount included only if paid within terms.”
-- Please include $ sign in front of money values
+- Please make Final Net in bold and bigger text than the other items
+- Please include $ sign in front of money values and add proper commas and decimals
 - Please show each line item that is included in the quote on the final output
 - Omit the "Subtotal" section
 - If `_enforced_totals` is missing or pricing cannot be determined, stop and say: “Unable to find pricing, please contact Benjamin Luci at 615-516-8802.”
