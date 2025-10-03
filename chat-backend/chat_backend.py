@@ -506,9 +506,10 @@ def tool_woods_dealer_discount(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def tool_woods_quote(args: dict) -> dict:
     """
-    Calls the Pricing API /quote endpoint with smart normalization so follow-ups
-    carry the proper `family` for ALL families and generic choice_id is promoted
-    when needed.
+    Call the Pricing API /quote with robust normalization:
+    - trims all string params
+    - preserves/infers `family` across ALL families
+    - promotes generic `choice_id` -> family-scoped key (pf_/qh_/balespear_/finish_)
     """
     params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
 
@@ -517,13 +518,12 @@ def tool_woods_quote(args: dict) -> dict:
         if isinstance(v, str):
             params[k] = v.strip()
 
-    # 1) If the planner sent a generic choice_id AND we already know the family,
-    #    promote it to that family's scoped key (works for PF/QH/etc.)
+    # 1) Promote generic choice_id when family is already known
     FAMILY_TO_PREFIX = {
         "pallet_fork": "pf",
         "bale_spear": "balespear",
         "quick_hitch": "qh",
-        "rear_finish": "finish",  # finish mowers use 'finish_choice'
+        "rear_finish": "finish",   # finish mowers use finish_choice/finish_choice_id
         "disc_harrow": "dh",
         "rear_blade": "rb",
         "landscape_rake": "lrs",
@@ -533,26 +533,20 @@ def tool_woods_quote(args: dict) -> dict:
         "brushbull": "bb",
         "batwing": "bw",
         "turf_batwing": "tbw",
-        "dual_spindle": "ds",   # some models also appear as mds; handled below
+        "dual_spindle": "ds",      # some models also appear as mds
         "brushfighter": "bf",
     }
-
     fam = params.get("family")
     if fam and "choice_id" in params:
         pfx = FAMILY_TO_PREFIX.get(fam)
         if pfx:
-            scoped_key = f"{pfx}_choice_id"
-            # finish mowers use 'finish_choice' / 'finish_choice_id'
             if fam == "rear_finish":
-                # API reads finish_choice/finish_choice_id; promote to id if you only have id
-                if "finish_choice_id" not in params:
-                    params["finish_choice_id"] = params["choice_id"]
-            elif scoped_key not in params:
-                params[scoped_key] = params["choice_id"]
+                params.setdefault("finish_choice_id", params["choice_id"])
+            else:
+                params.setdefault(f"{pfx}_choice_id", params["choice_id"])
 
-    # 2) If no explicit family, infer it from the presence of family-scoped keys.
+    # 2) If no explicit family, infer from family-scoped keys
     if "family" not in params:
-        # map param prefixes -> family
         PREFIX_TO_FAMILY = {
             "bf_": "brushfighter",
             "bb_": "brushbull",
@@ -580,13 +574,12 @@ def tool_woods_quote(args: dict) -> dict:
             if inferred:
                 break
 
-        # Special-case: finish mowers have distinctive keys
+        # Finish mowers: distinctive keys
         if not inferred and any(k in params for k in ("finish_choice", "finish_choice_id", "finish_type", "rollers", "width_ft")):
             inferred = "rear_finish"
 
-        # Fallback: if only a generic choice_id is present, assume a menu flow and try best-effort families
+        # Last-resort: generic choice_id present → assume a menu family
         if not inferred and "choice_id" in params:
-            # Prefer menu-style families that commonly send choice_id
             for candidate in ("pallet_fork", "quick_hitch", "bale_spear", "rear_finish"):
                 inferred = candidate
                 break
@@ -595,11 +588,11 @@ def tool_woods_quote(args: dict) -> dict:
             params["family"] = inferred
             fam = inferred
 
-    # 3) If we’re in a menu-style flow, drop a lingering model to avoid conflicts
+    # 3) Menu-like flows: drop lingering model (API chooses item from choice fields)
     if fam in ("pallet_fork", "bale_spear", "quick_hitch", "rear_finish", "disc_harrow"):
         params.pop("model", None)
 
-    # 4) Promote generic choice_id to the now-inferred family's scoped key (if not done yet)
+    # 4) Promote generic choice_id after inference too (if not done yet)
     if "choice_id" in params and fam:
         pfx = FAMILY_TO_PREFIX.get(fam)
         if pfx:
@@ -608,43 +601,37 @@ def tool_woods_quote(args: dict) -> dict:
             else:
                 params.setdefault(f"{pfx}_choice_id", params["choice_id"])
 
-    # 5) Finish mower convenience: accept finish_type → finish_choice
+    # 5) Convenience: finish_type -> finish_choice
     if "finish_type" in params and "finish_choice" not in params:
         params["finish_choice"] = params["finish_type"]
 
-    # 6) Log and call the API
+    # Log (masked dealer)
     try:
         safe_params = dict(params)
-        # mask sensitive dealer number in logs
         if "dealer_number" in safe_params:
             dn = str(safe_params["dealer_number"])
             safe_params["dealer_number"] = (dn[:3] + "…") if len(dn) > 3 else dn
-
         log.info("QUOTE CALL params=%s", json.dumps(safe_params, ensure_ascii=False))
     except Exception:
         pass
 
     body, status, url = http_get("/quote", params)
 
-    # Shape the tool return (preserve your current structure)
     if isinstance(body, dict) and ("error" not in body):
         mode = body.get("mode") or ("quote" if "summary" in body else "questions")
-        log_line = f"QUOTE RESP status={status} mode={mode} model={body.get('model','')} rq={body.get('required_questions', [])}"
         try:
-            log.info(log_line)
+            log.info("QUOTE RESP status=%s mode=%s model=%s rq=%s",
+                     status, mode, body.get("model", ""), body.get("required_questions", []))
         except Exception:
             pass
-
-        # If you compute enforced totals client-side elsewhere, you can still do that after return.
         return {"ok": True, "status": status, "url": url, "body": body}
 
-    # Non-JSON or error html
     try:
         log.info("QUOTE RESP status=%s (non-json or error) body=%s", status, body)
     except Exception:
         pass
-    # Uniform error shape
-    return {"ok": False, "status": status, "url": url, "body": body if isinstance(body, dict) else {"raw_text": body}}
+    return {"ok": False, "status": status, "url": url,
+            "body": body if isinstance(body, dict) else {"raw_text": body}}
 
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
     body, status, used = http_get("/health", {})
@@ -766,24 +753,20 @@ def chat():
         # ---------- Session resolve + GC ----------
         now = time.time()
         sid = request.headers.get("X-Session-Id") or payload.get("session_id") or f"anon-{int(now*1000)}"
-        # GC old sessions
         for k in list(SESS.keys()):
             if now - SESS[k].get("updated_at", now) > SESSION_TTL:
                 SESS.pop(k, None)
 
         sess = SESS.setdefault(sid, {"messages": [], "dealer": None, "updated_at": now})
         sess["updated_at"] = now
-        # Ensure quote_ctx exists (per-quote "notebook")
-        if "quote_ctx" not in sess:
-            sess["quote_ctx"] = {"family": None, "answers": {}}
-        if "err_count" not in sess:
-            sess["err_count"] = 0
+        sess.setdefault("quote_ctx", {"family": None, "answers": {}})
+        sess.setdefault("err_count", 0)
 
-        # ---------- Build conversation (system → history) ----------
+        # ---------- Build conversation ----------
         convo: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         convo.extend(sess["messages"])
 
-        # ---------- Auto: Dealer detection from this message ----------
+        # ---------- Auto: Dealer detection ----------
         dn_from_msg = extract_dealer(user_message)
         if dn_from_msg:
             res = tool_woods_dealer_discount({"dealer_number": dn_from_msg})
@@ -801,15 +784,14 @@ def chat():
         if sess.get("dealer", {}).get("dealer_number"):
             dealer_num = str(sess["dealer"]["dealer_number"])
         else:
+            # fallback: last dealer tool body
             for m in reversed(convo):
                 if m.get("role") == "tool" and m.get("name") == "woods_dealer_discount":
                     try:
-                        payload2 = json.loads(m.get("content") or "{}")
-                        b = payload2.get("body") or {}
+                        b = (json.loads(m.get("content") or "{}") or {}).get("body") or {}
                         dn = b.get("dealer_number") or b.get("number")
                         if dn:
-                            dealer_num = str(dn)
-                            break
+                            dealer_num = str(dn); break
                     except Exception:
                         pass
 
@@ -820,24 +802,20 @@ def chat():
         if dealer_num and (model or family_slug):
             args = {"dealer_number": dealer_num}
             if model:
-                args["model"] = model   # quote tool will drop it mid-flow if needed
+                args["model"] = model       # tool will drop if a menu flow begins
             if family_slug:
                 args["family"] = family_slug
 
-            # If only dealer_number somehow, skip preflight
-            if set(args.keys()) == {"dealer_number"}:
+            if set(args) == {"dealer_number"}:
                 log.info("Skip /quote: only dealer_number present (auto-trigger)")
             else:
                 res = tool_woods_quote(args)
 
-                # ---- EARLY RETURN if tool requested an auto-reset ----
+                # Auto-reset from API (rare)
                 if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
-                    try:
-                        sess["messages"] = []
-                        sess["quote_ctx"] = {"family": None, "answers": {}}
-                        sess["err_count"] = 0
-                    except Exception:
-                        pass
+                    sess["messages"] = []
+                    sess["quote_ctx"] = {"family": None, "answers": {}}
+                    sess["err_count"] = 0
                     dealer_badge = sess.get("dealer") or {}
                     return jsonify({
                         "reply": res["body"]["message"],
@@ -847,46 +825,36 @@ def chat():
                         }
                     })
 
-                # ---- Persist active family on follow-up prompts ----
-                try:
-                    body = (res or {}).get("body") or {}
-                    if isinstance(body, dict) and body.get("mode") == "questions":
-                        fam = args.get("family")
-                        if fam:
-                            qc = sess.setdefault("quote_ctx", {"family": None, "answers": {}})
-                            qc["family"] = fam
-                    # ---- Clear per-quote context on success ----
-                    if isinstance(body, dict) and body.get("mode") == "quote":
-                        sess["quote_ctx"] = {"family": None, "answers": {}}
-                        sess["err_count"] = 0
-                except Exception:
-                    pass
+                # >>> NEW: remember family on follow-ups; clear on success
+                body = (res or {}).get("body") or {}
+                if isinstance(body, dict) and body.get("mode") == "questions":
+                    fam = args.get("family")
+                    if fam:
+                        sess["quote_ctx"]["family"] = fam
+                if isinstance(body, dict) and body.get("mode") == "quote":
+                    sess["quote_ctx"] = {"family": None, "answers": {}}
+                    sess["err_count"] = 0
+                # <<<
 
                 add_tool_exchange(convo, "woods_quote", args, res)
 
-        # ---------- Handle follow-up (e.g., "15", "A", "pin", etc.) ----------
+        # ---------- Follow-up branch ----------
         elif dealer_num:
             args = {"dealer_number": dealer_num}
-
-            # Prefer active quote_ctx (family set there)
             qc = sess.get("quote_ctx") or {}
             if qc.get("family"):
                 args["family"] = qc["family"]
 
-            # If we only have dealer_number, don't ping /quote yet — let the planner ask next
-            if set(args.keys()) == {"dealer_number"}:
+            if set(args) == {"dealer_number"}:
                 log.info("Skip /quote: only dealer_number present (follow-up)")
             else:
                 res = tool_woods_quote(args)
 
-                # ---- EARLY RETURN if tool requested an auto-reset ----
+                # Auto-reset from API
                 if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
-                    try:
-                        sess["messages"] = []
-                        sess["quote_ctx"] = {"family": None, "answers": {}}
-                        sess["err_count"] = 0
-                    except Exception:
-                        pass
+                    sess["messages"] = []
+                    sess["quote_ctx"] = {"family": None, "answers": {}}
+                    sess["err_count"] = 0
                     dealer_badge = sess.get("dealer") or {}
                     return jsonify({
                         "reply": res["body"]["message"],
@@ -896,28 +864,24 @@ def chat():
                         }
                     })
 
-                # ---- Persist active family on follow-up prompts ----
-                try:
-                    body = (res or {}).get("body") or {}
-                    if isinstance(body, dict) and body.get("mode") == "questions":
-                        fam = args.get("family")
-                        if fam:
-                            qc = sess.setdefault("quote_ctx", {"family": None, "answers": {}})
-                            qc["family"] = fam
-                    # ---- Clear per-quote context on success ----
-                    if isinstance(body, dict) and body.get("mode") == "quote":
-                        sess["quote_ctx"] = {"family": None, "answers": {}}
-                        sess["err_count"] = 0
-                except Exception:
-                    pass
+                # >>> NEW: remember family on follow-ups; clear on success
+                body = (res or {}).get("body") or {}
+                if isinstance(body, dict) and body.get("mode") == "questions":
+                    fam = args.get("family")
+                    if fam:
+                        sess["quote_ctx"]["family"] = fam
+                if isinstance(body, dict) and body.get("mode") == "quote":
+                    sess["quote_ctx"] = {"family": None, "answers": {}}
+                    sess["err_count"] = 0
+                # <<<
 
                 add_tool_exchange(convo, "woods_quote", args, res)
 
-        # ---------- Append user and run planner ----------
+        # ---------- Send to planner ----------
         convo.append({"role": "user", "content": user_message})
         reply, hist = run_ai(convo)
 
-        # ---------- Trim + persist history ----------
+        # ---------- Persist history (trim) ----------
         MAX_KEEP = 80
         trimmed = [m for m in hist if m.get("role") != "system"]
         if len(trimmed) > MAX_KEEP:
@@ -933,7 +897,7 @@ def chat():
             }
         })
     except Exception as e:
-        logging.exception("chat error")
+        log.exception("chat error")
         return jsonify({
             "reply": ("There was a system error while retrieving data. Please try again shortly. "
                       "If the issue persists, escalate to Benjamin Luci at 615-516-8802."),
