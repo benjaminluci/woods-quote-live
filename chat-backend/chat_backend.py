@@ -515,7 +515,6 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     # -------- Menu-family guard (pallet_fork / bale_spear / quick_hitch) --------
     try:
         fam = str(params.get("family") or "").strip().lower()
-
         MENU_FAMILIES = {"pallet_fork", "bale_spear", "quick_hitch"}
         FAMILY_PREFIX = {
             "pallet_fork": "pf",
@@ -523,28 +522,75 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
             "quick_hitch": "qh",
         }
 
+        # (A) If explicit family is set and it's a menu family, normalize keys and drop model
         if fam in MENU_FAMILIES:
             prefix = FAMILY_PREFIX[fam]
-
-            # Promote generic IDs (choice_id/part_id/part_no/<prefix>_id) -> <prefix>_choice_id
             choice_id_key = f"{prefix}_choice_id"
+            choice_label_key = f"{prefix}_choice"
+
+            # Promote generic IDs -> <prefix>_choice_id
             if choice_id_key not in params:
                 for alt in ("choice_id", "part_id", "part_no", f"{prefix}_id"):
                     if params.get(alt):
                         params[choice_id_key] = str(params[alt]).strip()
                         break
 
-            # Promote generic labels (choice/choice_label) -> <prefix>_choice
-            choice_label_key = f"{prefix}_choice"
+            # Promote generic labels -> <prefix>_choice
             if choice_label_key not in params:
                 for alt in ("choice", "choice_label"):
                     if params.get(alt):
                         params[choice_label_key] = str(params[alt]).strip()
                         break
 
-            # If we now have either an ID or a label, remove stray 'model' for menu flows
+            # If we have a choice id/label, do not send model during menu flow
             if params.get(choice_id_key) or params.get(choice_label_key):
                 params.pop("model", None)
+
+        # (B) If family is missing, try to infer it from scoped keys or part_id heuristic
+        else:
+            # 1) Keys themselves declare the family
+            key_to_family = [
+                ("pf_choice_id", "pallet_fork"),
+                ("pf_choice", "pallet_fork"),
+                ("balespear_choice_id", "bale_spear"),
+                ("balespear_choice", "bale_spear"),
+                ("qh_choice_id", "quick_hitch"),
+                ("qh_choice", "quick_hitch"),
+            ]
+            inferred_family = None
+            for k, fam_name in key_to_family:
+                if k in params:
+                    inferred_family = fam_name
+                    break
+
+            # 2) Bare part_id heuristic based on the ID ranges seen in your logs
+            if not inferred_family and "part_id" in params:
+                pid = str(params.get("part_id") or "").strip()
+                # Pallet fork examples: 640020..640024
+                if re.match(r"^64\d{4}$", pid):
+                    inferred_family = "pallet_fork"
+                    params["pf_choice_id"] = pid
+                # Bale spear example you showed: 1037170
+                elif re.match(r"^103\d{4,}$", pid):
+                    inferred_family = "bale_spear"
+                    params["balespear_choice_id"] = pid
+
+            if inferred_family:
+                params["family"] = inferred_family
+                # Also remove model in menu flows once we have a choice id/label
+                if inferred_family in MENU_FAMILIES:
+                    params.pop("model", None)
+
+            # Finally, if we still only have a generic label, try to map it
+            fam2prefix = FAMILY_PREFIX
+            for fam_name, prefix in fam2prefix.items():
+                choice_id_key = f"{prefix}_choice_id"
+                choice_label_key = f"{prefix}_choice"
+                if choice_label_key in params and "family" not in params:
+                    params["family"] = fam_name
+                    params.pop("model", None)
+                    break
+
     except Exception as _e:
         log.warning("menu-family normalization skipped: %s", _e)
 
