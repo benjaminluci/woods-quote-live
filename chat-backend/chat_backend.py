@@ -508,17 +508,36 @@ def tool_woods_quote(args: dict) -> dict:
     """
     Call the Pricing API /quote with robust normalization:
     - trims all string params
-    - preserves/infers `family` across ALL families
-    - promotes generic `choice_id` -> family-scoped key (pf_/qh_/balespear_/finish_)
+    - restores missing `family` from the active session
+    - infers `family` from family-scoped keys if needed
+    - promotes generic `choice_id` or `part_id` -> family-scoped key (pf_/qh_/balespear_/finish_)
+    - drops `model` during menu flows to avoid conflicts
     """
-    params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
+    from flask import request as _flask_req  # local import to avoid circulars
 
-    # 0) Normalize strings (trim whitespace)
+    # ---- 0) Base params & trim ----
+    params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
     for k, v in list(params.items()):
         if isinstance(v, str):
             params[k] = v.strip()
 
-    # 1) Promote generic choice_id when family is already known
+    # ---- 1) Recover active family from session if planner forgot it ----
+    fam = params.get("family")
+    try:
+        # reconstruct session id in the same way /chat does
+        now_sid = (
+            _flask_req.headers.get("X-Session-Id")
+            or (_flask_req.get_json(silent=True) or {}).get("session_id")
+        )
+        if not fam and now_sid and now_sid in SESS:
+            qc = (SESS.get(now_sid) or {}).get("quote_ctx") or {}
+            if qc.get("family"):
+                fam = qc["family"]
+                params["family"] = fam
+    except Exception:
+        pass
+
+    # ---- 2) Family maps ----
     FAMILY_TO_PREFIX = {
         "pallet_fork": "pf",
         "bale_spear": "balespear",
@@ -533,37 +552,29 @@ def tool_woods_quote(args: dict) -> dict:
         "brushbull": "bb",
         "batwing": "bw",
         "turf_batwing": "tbw",
-        "dual_spindle": "ds",      # some models also appear as mds
+        "dual_spindle": "ds",
         "brushfighter": "bf",
     }
-    fam = params.get("family")
-    if fam and "choice_id" in params:
-        pfx = FAMILY_TO_PREFIX.get(fam)
-        if pfx:
-            if fam == "rear_finish":
-                params.setdefault("finish_choice_id", params["choice_id"])
-            else:
-                params.setdefault(f"{pfx}_choice_id", params["choice_id"])
+    PREFIX_TO_FAMILY = {
+        "bf_": "brushfighter",
+        "bb_": "brushbull",
+        "bw_": "batwing",
+        "tbw_": "turf_batwing",
+        "ds_": "dual_spindle",
+        "mds_": "dual_spindle",
+        "rb_": "rear_blade",
+        "lrs_": "landscape_rake",
+        "gs_": "grading_scraper",
+        "pd_": "post_hole_digger",
+        "dh_": "disc_harrow",
+        "tiller_": "tiller",
+        "balespear_": "bale_spear",
+        "pf_": "pallet_fork",
+        "qh_": "quick_hitch",
+    }
 
-    # 2) If no explicit family, infer from family-scoped keys
-    if "family" not in params:
-        PREFIX_TO_FAMILY = {
-            "bf_": "brushfighter",
-            "bb_": "brushbull",
-            "bw_": "batwing",
-            "tbw_": "turf_batwing",
-            "ds_": "dual_spindle",
-            "mds_": "dual_spindle",
-            "rb_": "rear_blade",
-            "lrs_": "landscape_rake",
-            "gs_": "grading_scraper",
-            "pd_": "post_hole_digger",
-            "dh_": "disc_harrow",
-            "tiller_": "tiller",
-            "balespear_": "bale_spear",
-            "pf_": "pallet_fork",
-            "qh_": "quick_hitch",
-        }
+    # ---- 3) If still no explicit family, infer from keys present ----
+    if not fam:
         inferred = None
         for k in params.keys():
             kl = k.lower()
@@ -573,27 +584,17 @@ def tool_woods_quote(args: dict) -> dict:
                     break
             if inferred:
                 break
-
-        # Finish mowers: distinctive keys
         if not inferred and any(k in params for k in ("finish_choice", "finish_choice_id", "finish_type", "rollers", "width_ft")):
             inferred = "rear_finish"
-
-        # Last-resort: generic choice_id present → assume a menu family
         if not inferred and "choice_id" in params:
             for candidate in ("pallet_fork", "quick_hitch", "bale_spear", "rear_finish"):
-                inferred = candidate
-                break
-
+                inferred = candidate; break
         if inferred:
-            params["family"] = inferred
             fam = inferred
+            params["family"] = fam
 
-    # 3) Menu-like flows: drop lingering model (API chooses item from choice fields)
-    if fam in ("pallet_fork", "bale_spear", "quick_hitch", "rear_finish", "disc_harrow"):
-        params.pop("model", None)
-
-    # 4) Promote generic choice_id after inference too (if not done yet)
-    if "choice_id" in params and fam:
+    # ---- 4) Promote generic choice_id when family is known ----
+    if fam and "choice_id" in params:
         pfx = FAMILY_TO_PREFIX.get(fam)
         if pfx:
             if fam == "rear_finish":
@@ -601,11 +602,23 @@ def tool_woods_quote(args: dict) -> dict:
             else:
                 params.setdefault(f"{pfx}_choice_id", params["choice_id"])
 
-    # 5) Convenience: finish_type -> finish_choice
+    # ---- 5) CRITICAL: If planner sent only part_id during a menu flow, promote it ----
+    # This fixes logs like: QUOTE CALL params={"dealer_number":"…","part_id":"640022"}
+    if fam in ("pallet_fork", "bale_spear", "quick_hitch") and "part_id" in params:
+        pfx = FAMILY_TO_PREFIX.get(fam)
+        if pfx:
+            key = f"{pfx}_choice_id"
+            params.setdefault(key, params["part_id"])
+
+    # ---- 6) Convenience: finish_type -> finish_choice ----
     if "finish_type" in params and "finish_choice" not in params:
         params["finish_choice"] = params["finish_type"]
 
-    # Log (masked dealer)
+    # ---- 7) Menu-like flows: drop lingering model to avoid conflicts ----
+    if fam in ("pallet_fork", "bale_spear", "quick_hitch", "rear_finish", "disc_harrow"):
+        params.pop("model", None)
+
+    # ---- 8) Log (mask dealer) & call API ----
     try:
         safe_params = dict(params)
         if "dealer_number" in safe_params:
@@ -632,6 +645,7 @@ def tool_woods_quote(args: dict) -> dict:
         pass
     return {"ok": False, "status": status, "url": url,
             "body": body if isinstance(body, dict) else {"raw_text": body}}
+
 
 
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
