@@ -514,11 +514,11 @@ PARAM_ALIASES = {
     "balespear_choice":    ["balespear_choice", "choice", "choice_label"],
 
     # Pallet Fork
-    "pf_choice_id": ["pf_choice_id", "part_id", "part_no"],
+    "pf_choice_id": ["pf_choice_id", "part_id", "part_no", "choice_id"],
     "pf_choice":    ["pf_choice", "choice", "choice_label"],
 
     # Quick Hitch
-    "qh_choice_id": ["qh_choice_id", "part_id", "part_no"],
+    "qh_choice_id": ["qh_choice_id", "part_id", "part_no", "choice_id"],
     "qh_choice":    ["qh_choice", "choice", "choice_label"],
 
     # Stump Grinder
