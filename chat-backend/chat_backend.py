@@ -506,26 +506,24 @@ def tool_woods_dealer_discount(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Call /quote with a merged view of ALL known params for the in-progress quote.
-    On every turn:
-      - Merge previously remembered params for this session+family.
-      - Overlay any newly provided params (newest wins).
-      - Send the full merged param set to the API.
-
-    After response:
-      - If mode == "questions": remember the merged param set for this family.
-      - If mode == "quote": clear per-quote memory (keep dealer info).
+    Quote helper that:
+      - Remembers all params for the active quote (per-session).
+      - Sends the full merged parameter set on every turn.
+      - Normalizes Disc Harrow fields.
+      - Normalizes menu families (pallet_fork, bale_spear, quick_hitch) and promotes choice → *_choice_id,
+        including when the user provides the raw ID itself.
+      - On family change, drops keys from prior families (no cross-contamination).
+      - Clears per-quote memory on completion (keeps dealer info).
+      - Enforces cash discount totals for UI.
     """
     import re
     from flask import request as _flask_req
 
-    # --- helpers --------------------------------------------------------------
-
+    # ---------------- helpers ----------------
     def _clean_params(d: Dict[str, Any]) -> Dict[str, Any]:
-        """Drop empty values; coerce simple strings."""
         out = {}
         for k, v in (d or {}).items():
-            if v in (None, "", []):  # treat [] as empty too
+            if v in (None, "", []):
                 continue
             if isinstance(v, str):
                 v = v.strip()
@@ -535,9 +533,8 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         return out
 
     def _infer_family_from_keys(p: Dict[str, Any]) -> Optional[str]:
-        """Best-effort family inference from key prefixes or known fields."""
         keys = {k.lower() for k in p.keys()}
-        for fam, pfx in {
+        pref = {
             "pallet_fork": "pf_",
             "bale_spear": "balespear_",
             "quick_hitch": "qh_",
@@ -549,110 +546,253 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
             "grading_scraper": "gs_",
             "post_hole_digger": "pd_",
             "tiller": "tiller_",
-        }.items():
+        }
+        for fam, pfx in pref.items():
             if any(k.startswith(pfx) for k in keys):
                 return fam
-        # some families use unprefixed selector fields
         if "width_ft" in keys:
             return "batwing"
         return None
 
-    # --- build params for this turn ------------------------------------------
+    def _family_prefix(fam: str) -> Optional[str]:
+        return {
+            "pallet_fork": "pf",
+            "bale_spear": "balespear",
+            "quick_hitch": "qh",
+            "rear_finish": "finish",
+            "disc_harrow": "dh",
+            "batwing": "bw",
+            "rear_blade": "rb",
+            "landscape_rake": "lrs",
+            "grading_scraper": "gs",
+            "post_hole_digger": "pd",
+            "tiller": "tiller",
+        }.get((fam or "").lower())
 
-    # 1) start with only the non-empty incoming args
+    # Choice key overrides (API expects these specific id field names)
+    CHOICE_ID_KEY_OVERRIDES = {
+        "dh_choice": "dh_spacing_id",  # Disc Harrow
+    }
+
+    MENU_FAMILIES = {"pallet_fork", "bale_spear", "quick_hitch"}
+
+    # ---------------- build params ----------------
     turn_params = _clean_params(args or {})
-
-    # 2) get session + per-quote context
     sid = (
         _flask_req.headers.get("X-Session-Id")
         or (_flask_req.get_json(silent=True) or {}).get("session_id")
     )
     sess_entry = SESS.setdefault(sid, {}) if sid else {}
-    qc = sess_entry.setdefault("quote_ctx", {"family": None, "answers": {}})
+    # quote_ctx: per-quote state for this session
+    qc = sess_entry.setdefault("quote_ctx", {"family": None, "answers": {}, "choice_map": {}})
 
-    # 3) determine active family: prefer incoming, else remembered, else infer
+    # Decide family
     fam = (turn_params.get("family") or qc.get("family") or _infer_family_from_keys(turn_params))
     if fam:
         turn_params["family"] = fam
+    fam_lower = (fam or "").lower()
 
-    # 4) merge previously remembered params for this family
-    #    (only if it's the same family; never mix families)
-    merged = {}
-    # always include dealer_number if present (from this turn or remembered)
-    dealer_number = turn_params.get("dealer_number") or (qc.get("answers") or {}).get("dealer_number")
+    old_fam = qc.get("family")
+    old_answers = qc.get("answers") or {}
+    choice_map = qc.get("choice_map") or {}
+
+    # Start merged payload with dealer_number (from now or remembered)
+    merged: Dict[str, Any] = {}
+    dealer_number = turn_params.get("dealer_number") or old_answers.get("dealer_number")
     if dealer_number:
         merged["dealer_number"] = dealer_number
 
-    if fam and qc.get("family") == fam and isinstance(qc.get("answers"), dict):
-        # start from remembered answers
-        for k, v in qc["answers"].items():
-            if k == "dealer_number":  # already handled
+    # If we're still on the same family, include remembered answers first
+    if fam and old_fam == fam and isinstance(old_answers, dict):
+        for k, v in old_answers.items():
+            if k == "dealer_number":
                 continue
             merged[k] = v
 
-    # overlay current turn params (newest answers win)
+    # Overlay current turn params (newest wins)
     for k, v in turn_params.items():
         merged[k] = v
 
-    # 5) safety: avoid sending 'model' while we are still answering menus
-    #    (some families derive model later; sending early can cause 404/drift)
-    fam_lower = (fam or "").lower()
+    # ------------- if family changed, drop keys from the previous family -------------
+    if fam and old_fam and old_fam != fam:
+        old_prefix = _family_prefix(old_fam)
+        if old_prefix:
+            # remove any keys starting with "<oldprefix>_" or "dh_" etc.
+            keys_to_drop = [k for k in list(merged.keys()) if k.startswith(old_prefix + "_")]
+            for k in keys_to_drop:
+                if k not in ("dealer_number", "family"):
+                    merged.pop(k, None)
+        # also drop the choice_map of the old family (avoid mismapping)
+        choice_map = {}
+
+    # ---------------- family-specific normalization ----------------
+
+    # Disc Harrow normalization
+    try:
+        has_dh = any(k.startswith("dh_") for k in merged.keys())
+        if fam_lower == "disc_harrow" or has_dh:
+            merged.setdefault("family", "disc_harrow")
+            # Normalize width alias
+            if "width" in merged and "dh_width_in" not in merged:
+                merged["dh_width_in"] = str(merged.pop("width")).strip()
+            # Blade shorthand → compact code (or change to long label if your API needs it)
+            if "dh_blade" in merged:
+                t = str(merged["dh_blade"]).strip().lower()
+                if t in {"n", "notched"}:
+                    merged["dh_blade"] = "N"  # or "Notched (N)"
+                elif t in {"c", "combo", "combination"}:
+                    merged["dh_blade"] = "C"  # or "Combo (C)"
+            # If dh_choice already looks like an ID, promote to dh_spacing_id
+            if "dh_choice" in merged and "dh_spacing_id" not in merged:
+                val = str(merged.get("dh_choice") or "").strip()
+                if re.match(r"^\d{6,}[A-Z]?$", val):
+                    merged["dh_spacing_id"] = val
+                    # merged.pop("dh_choice", None)  # optional
+    except Exception as _e:
+        log.warning("disc harrow normalization skipped: %s", _e)
+
+    # Menu family normalization (PF / Bale Spear / Quick Hitch)
+    try:
+        if fam_lower in MENU_FAMILIES:
+            prefix = _family_prefix(fam_lower)  # 'pf', 'balespear', 'qh'
+            choice_field = f"{prefix}_choice"          # e.g., pf_choice
+            choice_id_field = f"{prefix}_choice_id"    # e.g., pf_choice_id
+
+            # Promote generic ids into the exact *_choice_id field
+            if choice_id_field not in merged:
+                for alt in ("choice_id", "part_id", "part_no", f"{prefix}_id"):
+                    if merged.get(alt):
+                        merged[choice_id_field] = str(merged[alt]).strip()
+                        break
+
+            # If the user gave the choice value under the question name,
+            # promote it to *_choice_id when it's clearly an ID
+            if choice_id_field not in merged and merged.get(choice_field):
+                raw = str(merged[choice_field]).strip()
+                # Treat pure ids as ids (digits or digits+suffix like 1039976F)
+                if re.match(r"^\d{6,}[A-Z]?$", raw):
+                    merged[choice_id_field] = raw
+
+            # If we now have either id or label, suppress model mid-flow
+            if merged.get(choice_id_field) or merged.get(choice_field):
+                merged.pop("model", None)
+    except Exception as _e:
+        log.warning("menu-family normalization skipped: %s", _e)
+
+    # ---------------- Generic choice→ID promotion using cached maps ----------------
+    try:
+        cmap = choice_map or {}
+        for qname, maps in list(cmap.items()):
+            # Which ID key should this map to?
+            expected_id_key = CHOICE_ID_KEY_OVERRIDES.get(
+                qname,
+                (qname if qname.endswith("_id") else f"{qname}_id")
+            )
+            if merged.get(expected_id_key):
+                continue
+            val = merged.get(qname)
+            if not val:
+                continue
+            sval = str(val).strip()
+            vlow = sval.lower()
+
+            # 1) If the user already gave an exact ID-looking token, accept it directly
+            if re.match(r"^\d{6,}[A-Z]?$", sval):
+                merged[expected_id_key] = sval
+                if expected_id_key != qname:
+                    merged.pop(qname, None)
+                continue
+
+            # 2) Map letters/labels/model tokens via cached choices_with_ids
+            _id = (
+                (maps.get("by_letter") or {}).get(vlow)
+                or (maps.get("by_label") or {}).get(vlow)
+                or (maps.get("by_model") or {}).get(vlow)
+            )
+            if _id:
+                merged[expected_id_key] = _id
+                if expected_id_key != qname:
+                    merged.pop(qname, None)
+    except Exception as _e:
+        log.warning("generic choice-id promotion skipped: %s", _e)
+
+    # ---------------- safety: don’t send model mid-questions ----------------
     if fam_lower in {"pallet_fork", "bale_spear", "quick_hitch", "rear_finish", "disc_harrow", "batwing"}:
         merged.pop("model", None)
 
-    # 6) log and call API
+    # ---------------- call API ----------------
     log.info("QUOTE CALL params=%s", json.dumps(merged, ensure_ascii=False))
     body, status, used = http_get("/quote", merged)
 
-    # --- log response shape ---------------------------------------------------
+    # ---------------- log response ----------------
     try:
         if status == 200 and isinstance(body, dict):
             rq = body.get("required_questions") or []
             rq_names = [q.get("name") for q in rq]
-            log.info(
-                "QUOTE RESP status=%s mode=%s model=%s rq=%s",
-                status, body.get("mode"), body.get("model"), rq_names
-            )
+            log.info("QUOTE RESP status=%s mode=%s model=%s rq=%s",
+                     status, body.get("mode"), body.get("model"), rq_names)
         else:
             log.info("QUOTE RESP status=%s (non-json or error) body=%s", status, str(body)[:500])
     except Exception as e:
         log.warning("QUOTE RESP log error: %s", e)
 
-    # --- persist/clear per-quote memory --------------------------------------
+    # ---------------- persist/clear memory ----------------
     try:
         if sid and isinstance(body, dict):
             mode = body.get("mode")
-
             if mode == "questions":
-                # remember family and ALL current merged params for this family
+                # Remember family and ALL current merged params for this family
                 if fam:
                     qc["family"] = fam
-                # Store everything except transient fields we never want to carry forever.
-                # We *do* keep choice labels/ids, quantities, etc. Dealer number is kept outside.
                 answers = qc.setdefault("answers", {})
                 for k, v in merged.items():
                     if k == "dealer_number":
                         continue
                     answers[k] = v
 
+                # Cache choice maps for ALL questions with choices_with_ids
+                rqs = body.get("required_questions") or []
+                choice_map = qc.setdefault("choice_map", {})
+                for q in rqs:
+                    qname = (q.get("name") or "").strip()
+                    cwids = q.get("choices_with_ids") or []
+                    if not qname or not cwids:
+                        continue
+                    by_letter, by_label, by_model = {}, {}, {}
+                    for idx, item in enumerate(cwids):
+                        _id = str(item.get("id") or "").strip()
+                        _label = str(item.get("label") or "").strip()
+                        if not _id or not _label:
+                            continue
+                        by_letter[chr(ord("a") + idx)] = _id
+                        by_label[_label.lower()] = _id
+                        # first token before " —" is often the model
+                        model_tok = _label.split(" —", 1)[0].split()[0].strip().lower()
+                        if model_tok:
+                            by_model[model_tok] = _id
+                    choice_map[qname] = {
+                        "by_letter": by_letter,
+                        "by_label": by_label,
+                        "by_model": by_model,
+                    }
+
             elif mode == "quote":
-                # quote finished: clear per-quote memory, keep dealer info
-                dealer = sess_entry.get("dealer")  # preserved elsewhere
-                sess_entry["quote_ctx"] = {"family": None, "answers": {}}
+                # finished — clear per-quote state; keep dealer
+                dealer = sess_entry.get("dealer")
+                sess_entry["quote_ctx"] = {"family": None, "answers": {}, "choice_map": {}}
                 sess_entry["err_count"] = 0
                 if dealer:
-                    sess_entry["dealer"] = dealer  # explicit (likely redundant, but safe)
+                    sess_entry["dealer"] = dealer
     except Exception as e:
         log.warning("quote memory persist/clear failed: %s", e)
 
-    # --- compute client-side enforced totals (unchanged) ----------------------
+    # ---------------- enforce client-side totals (unchanged) ----------------
     try:
         if status == 200 and isinstance(body, dict):
             summary = body.get("summary", {}) or {}
             list_total = float(summary.get("subtotal_list", 0) or 0)
             dealer_net = float(summary.get("total", 0) or 0)
 
-            # Find dealer discount from session (stored as decimal, e.g., 0.24 or 0.05)
             dealer_number = str(merged.get("dealer_number") or "")
             dealer_discount = None
             for s in SESS.values():
@@ -666,11 +806,9 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
 
             if list_total > 0 and dealer_net > 0 and dealer_discount is not None:
                 dealer_discount_amt = list_total - dealer_net
-                # Cash discount rule: 5% if dealer discount == 5%, else 12%
                 cash_discount_pct = 0.05 if abs(dealer_discount - 0.05) < 1e-9 else 0.12
                 cash_discount_amt = dealer_net * cash_discount_pct
                 final_net = dealer_net - cash_discount_amt
-
                 body["_enforced_totals"] = {
                     "list_price_total": round(list_total, 2),
                     "dealer_discount_total": round(dealer_discount_amt, 2),
@@ -692,11 +830,13 @@ def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
 def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
     if not client:
         return "Planner unavailable (missing OPENAI_API_KEY).", messages
+
     completion = client.chat.completions.create(
         model=OPENAI_MODEL, temperature=0.2, messages=messages, tools=TOOLS, tool_choice="auto"
     )
     history = messages[:]
     rounds = 0
+
     while True:
         rounds += 1
         if rounds > 8:
@@ -713,16 +853,10 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
         history.append({
             "role": "assistant",
             "content": msg.content or "",
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {"name": tc.function.name, "arguments": tc.function.arguments or "{}"},
-                } for tc in tool_calls
-            ]
+            "tool_calls": [tc.model_dump() for tc in tool_calls],
         })
 
-        # execute each tool
+        # execute tool calls and append tool results
         for tc in tool_calls:
             name = tc.function.name
             try:
@@ -730,9 +864,9 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
             except Exception:
                 args = {}
 
-            # ALWAYS inject dealer_number for woods_quote if the model forgot it
-            if name == "woods_quote" and not args.get("dealer_number"):
-                # scan history for the last dealer lookup
+            # Make sure dealer_number is always available when possible
+            if "dealer_number" not in args:
+                # scan history for last dealer tool result
                 dn = None
                 for m in reversed(history):
                     if m.get("role") == "tool" and m.get("name") == "woods_dealer_discount":
@@ -763,36 +897,64 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
                 "content": json.dumps(result),
             })
 
+        # continue the tool loop
         completion = client.chat.completions.create(
             model=OPENAI_MODEL, temperature=0.2, messages=history, tools=TOOLS, tool_choice="auto"
         )
 
-# ---------------- Utilities ----------------
-DEALER_NUM_RE = re.compile(r"\b(\d{5,9})\b")
 
-def extract_dealer(text: str) -> str | None:
-    m = DEALER_NUM_RE.search(text or "")
-    return m.group(1) if m else None
+# ---------------- Quote context helpers ----------------
+def _qc_get(sess: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure a quote_ctx exists and return it."""
+    qc = sess.setdefault("quote_ctx", {"family": None, "answers": {}})
+    if "answers" not in qc or not isinstance(qc["answers"], dict):
+        qc["answers"] = {}
+    return qc
 
-def add_tool_exchange(convo: List[Dict[str, Any]], name: str, args: Dict[str, Any], result: Dict[str, Any]) -> None:
-    call_id = f"{name}-{int(time.time()*1000)}"
-    convo.append({
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [{
-            "id": call_id,
-            "type": "function",
-            "function": {"name": name, "arguments": json.dumps(args)},
-        }]
-    })
-    convo.append({
-        "role": "tool",
-        "tool_call_id": call_id,
-        "name": name,
-        "content": json.dumps(result),
-    })
+def _qc_clear(sess: Dict[str, Any]) -> None:
+    """Reset per-quote memory (keep dealer badge)."""
+    sess["quote_ctx"] = {"family": None, "answers": {}}
 
-# ---------------- Routes ----------------
+def _qc_merge_and_build_args(sess: Dict[str, Any], base_args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge stored quote answers with new args. New args win. Always includes dealer_number if known.
+    """
+    qc = _qc_get(sess)
+    # If a different family is explicitly requested, reset the answers (new quote)
+    new_family = (base_args.get("family") or "").strip().lower() if base_args else ""
+    if new_family and new_family != (qc.get("family") or ""):
+        qc["family"] = new_family
+        qc["answers"] = {}
+
+    # Start with everything we remembered last time
+    merged = {}
+    merged.update(qc["answers"])
+
+    # Add/override with the new inputs
+    for k, v in (base_args or {}).items():
+        if v in (None, ""):
+            continue
+        merged[k] = v
+
+    # Ensure family is present if we have one in qc
+    if "family" not in merged and qc.get("family"):
+        merged["family"] = qc["family"]
+
+    # Attach dealer_number from badge if we have it
+    dealer_num = (sess.get("dealer") or {}).get("dealer_number")
+    if dealer_num and "dealer_number" not in merged:
+        merged["dealer_number"] = str(dealer_num)
+
+    # Write back: keep everything except dealer_number
+    qc["answers"].update({k: v for k, v in merged.items() if k != "dealer_number"})
+    if merged.get("family"):
+        qc["family"] = merged["family"]
+    sess["quote_ctx"] = qc
+
+    return merged
+
+
+# ---------------- HTTP Routes ----------------
 @app.post("/chat")
 def chat():
     try:
@@ -812,10 +974,10 @@ def chat():
         sess = SESS.setdefault(sid, {"messages": [], "dealer": None, "updated_at": now})
         sess["updated_at"] = now
         # Ensure quote_ctx exists (per-quote "notebook")
-        sess.setdefault("quote_ctx", {"family": None, "answers": {}})
+        _qc_get(sess)  # creates if missing
         sess.setdefault("err_count", 0)
 
-        # ---------- Build conversation (system â†’ history) ----------
+        # ---------- Build conversation (system → history) ----------
         convo: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         convo.extend(sess["messages"])
 
@@ -854,23 +1016,25 @@ def chat():
         family_slug = detect_family_slug(user_message) if not model else None
 
         if dealer_num and (model or family_slug):
-            args = {"dealer_number": dealer_num}
+            base_args = {"dealer_number": dealer_num}
             if model:
-                args["model"] = model   # allow first-call model; quote tool will drop it mid-flow if needed
+                base_args["model"] = model   # allow first-call model; quote tool will drop it mid-flow if needed
             if family_slug:
-                args["family"] = family_slug
+                base_args["family"] = family_slug
 
             # If only dealer_number somehow, skip preflight
-            if set(args.keys()) == {"dealer_number"}:
+            if set(base_args.keys()) == {"dealer_number"}:
                 log.info("Skip /quote: only dealer_number present (auto-trigger)")
             else:
+                # >>> Merge with remembered per-quote answers <<<
+                args = _qc_merge_and_build_args(sess, base_args)
                 res = tool_woods_quote(args)
 
                 # ---- EARLY RETURN if tool requested an auto-reset ----
                 if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
                     try:
                         sess["messages"] = []
-                        sess["quote_ctx"] = {"family": None, "answers": {}}
+                        _qc_clear(sess)
                         sess["err_count"] = 0
                     except Exception:
                         pass
@@ -887,24 +1051,27 @@ def chat():
 
         # ---------- Handle follow-up (e.g., "15", "A", "pin", etc.) ----------
         elif dealer_num:
-            args = {"dealer_number": dealer_num}
+            # Start with *only* the new info parsed by the planner later; here we just ensure dealer is known
+            base_args = {"dealer_number": dealer_num}
 
             # Prefer active quote_ctx (family set there)
-            qc = sess.get("quote_ctx") or {}
+            qc = _qc_get(sess)
             if qc.get("family"):
-                args["family"] = qc["family"]
+                base_args["family"] = qc["family"]
 
-            # If we only have dealer_number, don't ping /quote yet â€” let the planner ask next
-            if set(args.keys()) == {"dealer_number"}:
+            # If we only have dealer_number, don't ping /quote yet — let the planner ask next
+            if set(base_args.keys()) == {"dealer_number"}:
                 log.info("Skip /quote: only dealer_number present (follow-up)")
             else:
+                # >>> Merge with remembered per-quote answers <<<
+                args = _qc_merge_and_build_args(sess, base_args)
                 res = tool_woods_quote(args)
 
                 # ---- EARLY RETURN if tool requested an auto-reset ----
                 if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
                     try:
                         sess["messages"] = []
-                        sess["quote_ctx"] = {"family": None, "answers": {}}
+                        _qc_clear(sess)
                         sess["err_count"] = 0
                     except Exception:
                         pass
@@ -929,6 +1096,17 @@ def chat():
         if len(trimmed) > MAX_KEEP:
             trimmed = trimmed[-MAX_KEEP:]
         sess["messages"] = trimmed
+
+        # If the last quote tool produced a final quote, clear quote_ctx (keep dealer)
+        try:
+            last_tool = next((m for m in reversed(trimmed) if m.get("role") == "tool" and m.get("name") == "woods_quote"), None)
+            if last_tool:
+                payload = json.loads(last_tool.get("content") or "{}")
+                body = payload.get("body") or {}
+                if isinstance(body, dict) and body.get("mode") == "quote":
+                    _qc_clear(sess)
+        except Exception:
+            pass
 
         dealer_badge = sess.get("dealer") or {}
         return jsonify({
