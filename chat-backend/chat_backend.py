@@ -754,19 +754,17 @@ def chat():
             add_tool_exchange(convo, "woods_dealer_discount", {"dealer_number": dn_from_msg}, res)
             if res.get("ok"):
                 body = res.get("body") or {}
-                # NOTE: many APIs return discount as 0.24; store as percentage (24.0) if you prefer, but we kept as-is
                 sess["dealer"] = {
                     "dealer_number": body.get("dealer_number") or dn_from_msg,
                     "dealer_name": body.get("dealer_name") or "",
-                    "discount": body.get("discount"),  # expected 0.24 style from your examples
+                    "discount": body.get("discount"),
                 }
 
-        # ---------- Resolve dealer number for quoting ----------
+        # ---------- Resolve dealer number ----------
         dealer_num = None
         if sess.get("dealer", {}).get("dealer_number"):
             dealer_num = str(sess["dealer"]["dealer_number"])
         else:
-            # scan prior tool results in this convo, newest first
             for m in reversed(convo):
                 if m.get("role") == "tool" and m.get("name") == "woods_dealer_discount":
                     try:
@@ -780,19 +778,32 @@ def chat():
                         pass
 
         # ---------- Auto-trigger: model OR family ----------
-        # Detect explicit model tokens (dot or series) OR map names to family slugs
         model = detect_model(user_message)
         family_slug = detect_family_slug(user_message) if not model else None
 
-        # Only trigger if we have a dealer and at least a model or family
         if dealer_num and (model or family_slug):
             args = {"dealer_number": dealer_num}
             if model:
                 args["model"] = model
+                sess["last_model"] = model
             if family_slug:
                 args["family"] = family_slug
+                sess["last_family"] = family_slug
 
-            # Application-level retry for rare empty JSON bodies (your GPT tool does this too)
+            res = tool_woods_quote(args)
+            add_tool_exchange(convo, "woods_quote", args, res)
+
+        # ---------- Handle follow-up (e.g., "15", "A", etc.) ----------
+        elif dealer_num:
+            args = {"dealer_number": dealer_num}
+
+            # Restore model/family if they existed from earlier
+            if sess.get("last_model"):
+                args["model"] = sess["last_model"]
+            if sess.get("last_family"):
+                args["family"] = sess["last_family"]
+
+            # Let OpenAI decide rest via planner; but restore context here
             res = tool_woods_quote(args)
             add_tool_exchange(convo, "woods_quote", args, res)
 
@@ -800,14 +811,13 @@ def chat():
         convo.append({"role": "user", "content": user_message})
         reply, hist = run_ai(convo)
 
-        # ---------- Trim + persist history (keep system injected fresh every turn) ----------
+        # ---------- Trim + persist history ----------
         MAX_KEEP = 80
         trimmed = [m for m in hist if m.get("role") != "system"]
         if len(trimmed) > MAX_KEEP:
             trimmed = trimmed[-MAX_KEEP:]
         sess["messages"] = trimmed
 
-        # ---------- Echo dealer badge for UI ----------
         dealer_badge = sess.get("dealer") or {}
         return jsonify({
             "reply": reply,
