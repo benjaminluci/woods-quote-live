@@ -826,15 +826,134 @@ def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
     body, status, used = http_get("/health", {})
     return {"ok": status == 200, "status": status, "url": used, "body": body}
 
+# ---------------- Tool-message sanitizer ----------------
+def _sanitize_messages_for_tools(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Keep only tool messages that directly respond to the most recent assistant tool_calls.
+    Prevents: "messages with role 'tool' must be a response..."
+    """
+    out: List[Dict[str, Any]] = []
+    valid_tool_ids: set = set()
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant":
+            # reset valid set to only the latest assistant tool calls
+            valid_tool_ids = set()
+            for tc in (m.get("tool_calls") or []):
+                tc_id = (tc.get("id") or tc.get("tool_call_id") or "").strip()
+                if tc_id:
+                    valid_tool_ids.add(tc_id)
+            out.append(m)
+        elif role == "tool":
+            tcid = (m.get("tool_call_id") or "").strip()
+            if tcid and tcid in valid_tool_ids:
+                out.append(m)
+            else:
+                # drop orphan tool message
+                continue
+        else:
+            out.append(m)
+    return out
+
+
+# ---------------- Safe helper shims (use your originals if present) ----------------
+def _safe_extract_dealer(text: str) -> Optional[str]:
+    # Prefer user's extract_dealer if defined
+    fn = globals().get("extract_dealer")
+    if callable(fn):
+        try:
+            return fn(text)
+        except Exception:
+            pass
+    # Fallback: grab a 5-7 digit sequence
+    m = re.search(r"\b(\d{5,7})\b", text or "")
+    return m.group(1) if m else None
+
+def _safe_detect_model(text: str) -> Optional[str]:
+    fn = globals().get("detect_model")
+    if callable(fn):
+        try:
+            return fn(text)
+        except Exception:
+            pass
+    # Very light fallback: model-ish tokens with letters+digits (allow dot)
+    m = re.search(r"\b([A-Z]{1,4}\d{2,}[A-Z0-9\.]*)\b", (text or "").upper())
+    return m.group(1) if m else None
+
+def _safe_detect_family_slug(text: str) -> Optional[str]:
+    fn = globals().get("detect_family_slug")
+    if callable(fn):
+        try:
+            return fn(text)
+        except Exception:
+            pass
+    t = (text or "").lower()
+    # Minimal fallback mapping; your original may be richer
+    if "pallet" in t and "fork" in t: return "pallet_fork"
+    if "bale" in t and "spear" in t: return "bale_spear"
+    if "quick" in t and "hitch" in t: return "quick_hitch"
+    if "batwing" in t: return "batwing"
+    if "brush bull" in t or "brushbull" in t: return "brushbull"
+    if "brushfighter" in t or "brush fighter" in t: return "brushfighter"
+    if "rear finish" in t or "finish mower" in t: return "rear_finish"
+    if "landscape rake" in t or "lrs" in t: return "landscape_rake"
+    if "disc harrow" in t or "dh" in t: return "disc_harrow"
+    return None
+
+
+# ---------------- Quote context helpers ----------------
+def _qc_get(sess: Dict[str, Any]) -> Dict[str, Any]:
+    qc = sess.setdefault("quote_ctx", {"family": None, "answers": {}})
+    if "answers" not in qc or not isinstance(qc["answers"], dict):
+        qc["answers"] = {}
+    return qc
+
+def _qc_clear(sess: Dict[str, Any]) -> None:
+    sess["quote_ctx"] = {"family": None, "answers": {}}
+
+def _qc_merge_and_build_args(sess: Dict[str, Any], base_args: Dict[str, Any]) -> Dict[str, Any]:
+    qc = _qc_get(sess)
+
+    new_family = (base_args.get("family") or "").strip().lower() if base_args else ""
+    if new_family and new_family != (qc.get("family") or ""):
+        # new quote; reset per-quote answers but keep dealer badge
+        qc["family"] = new_family
+        qc["answers"] = {}
+
+    merged = {}
+    merged.update(qc["answers"])
+    for k, v in (base_args or {}).items():
+        if v not in (None, ""):
+            merged[k] = v
+
+    if "family" not in merged and qc.get("family"):
+        merged["family"] = qc["family"]
+
+    dealer_num = (sess.get("dealer") or {}).get("dealer_number")
+    if dealer_num and "dealer_number" not in merged:
+        merged["dealer_number"] = str(dealer_num)
+
+    # Persist (but not dealer_number)
+    qc["answers"].update({k: v for k, v in merged.items() if k != "dealer_number"})
+    if merged.get("family"):
+        qc["family"] = merged["family"]
+    sess["quote_ctx"] = qc
+
+    # Helpful debug line (keep or remove):
+    log.info("QUOTE MERGED args=%s", json.dumps(merged, ensure_ascii=False))
+    return merged
+
+
 # ---------------- Planner ----------------
 def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
     if not client:
         return "Planner unavailable (missing OPENAI_API_KEY).", messages
 
+    msgs = _sanitize_messages_for_tools(messages)
     completion = client.chat.completions.create(
-        model=OPENAI_MODEL, temperature=0.2, messages=messages, tools=TOOLS, tool_choice="auto"
+        model=OPENAI_MODEL, temperature=0.2, messages=msgs, tools=TOOLS, tool_choice="auto"
     )
-    history = messages[:]
+    history = msgs[:]
     rounds = 0
 
     while True:
@@ -864,10 +983,10 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
             except Exception:
                 args = {}
 
-            # Make sure dealer_number is always available when possible
+            # Ensure dealer_number is present when we can infer it
             if "dealer_number" not in args:
-                # scan history for last dealer tool result
                 dn = None
+                # try dealer badge in session tool messages (present in history)
                 for m in reversed(history):
                     if m.get("role") == "tool" and m.get("name") == "woods_dealer_discount":
                         try:
@@ -898,60 +1017,10 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
             })
 
         # continue the tool loop
+        history = _sanitize_messages_for_tools(history)
         completion = client.chat.completions.create(
             model=OPENAI_MODEL, temperature=0.2, messages=history, tools=TOOLS, tool_choice="auto"
         )
-
-
-# ---------------- Quote context helpers ----------------
-def _qc_get(sess: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure a quote_ctx exists and return it."""
-    qc = sess.setdefault("quote_ctx", {"family": None, "answers": {}})
-    if "answers" not in qc or not isinstance(qc["answers"], dict):
-        qc["answers"] = {}
-    return qc
-
-def _qc_clear(sess: Dict[str, Any]) -> None:
-    """Reset per-quote memory (keep dealer badge)."""
-    sess["quote_ctx"] = {"family": None, "answers": {}}
-
-def _qc_merge_and_build_args(sess: Dict[str, Any], base_args: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Merge stored quote answers with new args. New args win. Always includes dealer_number if known.
-    """
-    qc = _qc_get(sess)
-    # If a different family is explicitly requested, reset the answers (new quote)
-    new_family = (base_args.get("family") or "").strip().lower() if base_args else ""
-    if new_family and new_family != (qc.get("family") or ""):
-        qc["family"] = new_family
-        qc["answers"] = {}
-
-    # Start with everything we remembered last time
-    merged = {}
-    merged.update(qc["answers"])
-
-    # Add/override with the new inputs
-    for k, v in (base_args or {}).items():
-        if v in (None, ""):
-            continue
-        merged[k] = v
-
-    # Ensure family is present if we have one in qc
-    if "family" not in merged and qc.get("family"):
-        merged["family"] = qc["family"]
-
-    # Attach dealer_number from badge if we have it
-    dealer_num = (sess.get("dealer") or {}).get("dealer_number")
-    if dealer_num and "dealer_number" not in merged:
-        merged["dealer_number"] = str(dealer_num)
-
-    # Write back: keep everything except dealer_number
-    qc["answers"].update({k: v for k, v in merged.items() if k != "dealer_number"})
-    if merged.get("family"):
-        qc["family"] = merged["family"]
-    sess["quote_ctx"] = qc
-
-    return merged
 
 
 # ---------------- HTTP Routes ----------------
@@ -966,26 +1035,38 @@ def chat():
         # ---------- Session resolve + GC ----------
         now = time.time()
         sid = request.headers.get("X-Session-Id") or payload.get("session_id") or f"anon-{int(now*1000)}"
-        # GC old sessions
         for k in list(SESS.keys()):
             if now - SESS[k].get("updated_at", now) > SESSION_TTL:
                 SESS.pop(k, None)
 
         sess = SESS.setdefault(sid, {"messages": [], "dealer": None, "updated_at": now})
         sess["updated_at"] = now
-        # Ensure quote_ctx exists (per-quote "notebook")
-        _qc_get(sess)  # creates if missing
+        _qc_get(sess)  # ensure quote_ctx exists
         sess.setdefault("err_count", 0)
 
-        # ---------- Build conversation (system → history) ----------
+        # ---------- Build conversation ----------
         convo: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         convo.extend(sess["messages"])
 
-        # ---------- Auto: Dealer detection from this message ----------
-        dn_from_msg = extract_dealer(user_message)
+        # ---------- Dealer detection from this message (safe shim) ----------
+        dn_from_msg = _safe_extract_dealer(user_message)
         if dn_from_msg:
             res = tool_woods_dealer_discount({"dealer_number": dn_from_msg})
-            add_tool_exchange(convo, "woods_dealer_discount", {"dealer_number": dn_from_msg}, res)
+            # helper existed in your file; keep using if present, else inline append
+            if "add_tool_exchange" in globals() and callable(globals()["add_tool_exchange"]):
+                add_tool_exchange(convo, "woods_dealer_discount", {"dealer_number": dn_from_msg}, res)
+            else:
+                convo.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": f"auto_dealer_{int(time.time()*1000)}",
+                        "type": "function",
+                        "function": {"name": "woods_dealer_discount", "arguments": json.dumps({"dealer_number": dn_from_msg})}
+                    }]
+                })
+                convo.append({"role": "tool", "tool_call_id": convo[-1]["tool_calls"][0]["id"], "name": "woods_dealer_discount", "content": json.dumps(res)})
+
             if res.get("ok"):
                 body = res.get("body") or {}
                 sess["dealer"] = {
@@ -1012,32 +1093,27 @@ def chat():
                         pass
 
         # ---------- Auto-trigger: model OR family in user message ----------
-        model = detect_model(user_message)
-        family_slug = detect_family_slug(user_message) if not model else None
+        model = _safe_detect_model(user_message)
+        family_slug = _safe_detect_family_slug(user_message) if not model else None
 
         if dealer_num and (model or family_slug):
             base_args = {"dealer_number": dealer_num}
             if model:
-                base_args["model"] = model   # allow first-call model; quote tool will drop it mid-flow if needed
+                base_args["model"] = model
             if family_slug:
                 base_args["family"] = family_slug
 
-            # If only dealer_number somehow, skip preflight
             if set(base_args.keys()) == {"dealer_number"}:
                 log.info("Skip /quote: only dealer_number present (auto-trigger)")
             else:
-                # >>> Merge with remembered per-quote answers <<<
                 args = _qc_merge_and_build_args(sess, base_args)
                 res = tool_woods_quote(args)
 
-                # ---- EARLY RETURN if tool requested an auto-reset ----
+                # auto-reset support
                 if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
-                    try:
-                        sess["messages"] = []
-                        _qc_clear(sess)
-                        sess["err_count"] = 0
-                    except Exception:
-                        pass
+                    sess["messages"] = []
+                    _qc_clear(sess)
+                    sess["err_count"] = 0
                     dealer_badge = sess.get("dealer") or {}
                     return jsonify({
                         "reply": res["body"]["message"],
@@ -1047,34 +1123,37 @@ def chat():
                         }
                     })
 
-                add_tool_exchange(convo, "woods_quote", args, res)
+                if "add_tool_exchange" in globals() and callable(globals()["add_tool_exchange"]):
+                    add_tool_exchange(convo, "woods_quote", args, res)
+                else:
+                    convo.append({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": f"auto_quote_{int(time.time()*1000)}",
+                            "type": "function",
+                            "function": {"name": "woods_quote", "arguments": json.dumps(args)}
+                        }]
+                    })
+                    convo.append({"role": "tool", "tool_call_id": convo[-1]["tool_calls"][0]["id"], "name": "woods_quote", "content": json.dumps(res)})
 
-        # ---------- Handle follow-up (e.g., "15", "A", "pin", etc.) ----------
+        # ---------- Follow-up (no new model/family in text) ----------
         elif dealer_num:
-            # Start with *only* the new info parsed by the planner later; here we just ensure dealer is known
             base_args = {"dealer_number": dealer_num}
-
-            # Prefer active quote_ctx (family set there)
             qc = _qc_get(sess)
             if qc.get("family"):
                 base_args["family"] = qc["family"]
 
-            # If we only have dealer_number, don't ping /quote yet — let the planner ask next
             if set(base_args.keys()) == {"dealer_number"}:
                 log.info("Skip /quote: only dealer_number present (follow-up)")
             else:
-                # >>> Merge with remembered per-quote answers <<<
                 args = _qc_merge_and_build_args(sess, base_args)
                 res = tool_woods_quote(args)
 
-                # ---- EARLY RETURN if tool requested an auto-reset ----
                 if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
-                    try:
-                        sess["messages"] = []
-                        _qc_clear(sess)
-                        sess["err_count"] = 0
-                    except Exception:
-                        pass
+                    sess["messages"] = []
+                    _qc_clear(sess)
+                    sess["err_count"] = 0
                     dealer_badge = sess.get("dealer") or {}
                     return jsonify({
                         "reply": res["body"]["message"],
@@ -1084,7 +1163,19 @@ def chat():
                         }
                     })
 
-                add_tool_exchange(convo, "woods_quote", args, res)
+                if "add_tool_exchange" in globals() and callable(globals()["add_tool_exchange"]):
+                    add_tool_exchange(convo, "woods_quote", args, res)
+                else:
+                    convo.append({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": f"auto_quote_{int(time.time()*1000)}",
+                            "type": "function",
+                            "function": {"name": "woods_quote", "arguments": json.dumps(args)}
+                        }]
+                    })
+                    convo.append({"role": "tool", "tool_call_id": convo[-1]["tool_calls"][0]["id"], "name": "woods_quote", "content": json.dumps(res)})
 
         # ---------- Append user and run planner ----------
         convo.append({"role": "user", "content": user_message})
@@ -1097,13 +1188,13 @@ def chat():
             trimmed = trimmed[-MAX_KEEP:]
         sess["messages"] = trimmed
 
-        # If the last quote tool produced a final quote, clear quote_ctx (keep dealer)
+        # Clear per-quote memory after a final quote
         try:
             last_tool = next((m for m in reversed(trimmed) if m.get("role") == "tool" and m.get("name") == "woods_quote"), None)
             if last_tool:
-                payload = json.loads(last_tool.get("content") or "{}")
-                body = payload.get("body") or {}
-                if isinstance(body, dict) and body.get("mode") == "quote":
+                payload3 = json.loads(last_tool.get("content") or "{}")
+                body3 = payload3.get("body") or {}
+                if isinstance(body3, dict) and body3.get("mode") == "quote":
                     _qc_clear(sess)
         except Exception:
             pass
@@ -1122,7 +1213,6 @@ def chat():
             "reply": ("There was a system error while retrieving data. Please try again shortly. "
                       "If the issue persists, escalate to Benjamin Luci at 615-516-8802."),
             "error": str(e),
-            "trace": traceback.format_exc(limit=1),
         }), 200
 
 @app.get("/health")
