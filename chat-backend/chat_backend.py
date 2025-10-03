@@ -512,6 +512,42 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     # -------- Build params (strip empty) --------
     params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
 
+    # -------- Menu-family guard (pallet_fork / bale_spear / quick_hitch) --------
+    try:
+        fam = str(params.get("family") or "").strip().lower()
+
+        MENU_FAMILIES = {"pallet_fork", "bale_spear", "quick_hitch"}
+        FAMILY_PREFIX = {
+            "pallet_fork": "pf",
+            "bale_spear": "balespear",
+            "quick_hitch": "qh",
+        }
+
+        if fam in MENU_FAMILIES:
+            prefix = FAMILY_PREFIX[fam]
+
+            # Promote generic IDs (choice_id/part_id/part_no/<prefix>_id) -> <prefix>_choice_id
+            choice_id_key = f"{prefix}_choice_id"
+            if choice_id_key not in params:
+                for alt in ("choice_id", "part_id", "part_no", f"{prefix}_id"):
+                    if params.get(alt):
+                        params[choice_id_key] = str(params[alt]).strip()
+                        break
+
+            # Promote generic labels (choice/choice_label) -> <prefix>_choice
+            choice_label_key = f"{prefix}_choice"
+            if choice_label_key not in params:
+                for alt in ("choice", "choice_label"):
+                    if params.get(alt):
+                        params[choice_label_key] = str(params[alt]).strip()
+                        break
+
+            # If we now have either an ID or a label, remove stray 'model' for menu flows
+            if params.get(choice_id_key) or params.get(choice_label_key):
+                params.pop("model", None)
+    except Exception as _e:
+        log.warning("menu-family normalization skipped: %s", _e)
+
     # -------- Disc Harrow: param normalization (surgical, safe) --------
     try:
         import re
