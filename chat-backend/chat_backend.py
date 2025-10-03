@@ -502,8 +502,8 @@ def tool_woods_dealer_discount(args: Dict[str, Any]) -> Dict[str, Any]:
 def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     """
     Calls /quote with sanitized params, logs request/response, and injects `_enforced_totals`.
-    Adds a small per-session quote context so we always resend all known answers each turn,
-    and avoids stale `model` pollution during Q&A.
+    Uses a per-session quote context ("quote_ctx") to resend all known answers every turn.
+    Also prevents stale `model` polluting family Q&A, and normalizes family-specific params.
     """
     # -------- Build params (strip empty) --------
     params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
@@ -526,7 +526,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     else:
         qc = {"family": None, "answers": {}}
 
-    # -------- Lock/track family in this flow (do NOT persist across quotes) --------
+    # -------- Lock/track family for this flow (do NOT persist across quotes) --------
     if params.get("family"):
         if qc["family"] and qc["family"] != params["family"]:
             # Switching families mid-flow: reset flow memory
@@ -548,30 +548,87 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     # -------- Family-agnostic Q&A guard: drop model if we’re clearly mid-questions --------
     QUESTION_KEYS = {
         "width", "width_ft", "width_in", "quantity", "part_id", "accessory_id", "choice_id",
-        "bf_choice","bf_choice_id","drive","bf_drive",
+        # BrushBull
         "bb_shielding","bb_tailwheel",
+        # Batwing / TBW
         "bw_duty","bw_driveline","bw_tire_qty","shielding_rows","deck_rings",
         "tbw_duty","front_rollers","chains",
+        # Dual Spindle
         "ds_mount","ds_shielding","ds_driveline","tire_id","tire_qty",
+        # Disc Harrow
         "dh_width_in","dh_duty","dh_spacing_id",
+        # Box / Grading Scrapers
         "bs_width_in","bs_duty","bs_choice_id",
         "gs_width_in","gs_choice_id",
+        # Landscape Rake
         "lrs_width_in","lrs_grade","lrs_choice_id",
+        # Rear Blade
         "rb_width_in","rb_duty","rb_choice_id",
+        # Post Hole Digger
         "pd_model","auger_id",
+        # Tillers
         "tiller_series","tiller_width_in","tiller_rotation","tiller_choice_id",
+        # Finish Mowers
         "finish_choice","rollers",
+        # PF / Bale Spear / misc
         "pf_choice","balespear_choice","hydraulics_id",
+        # BrushFighter (added)
+        "bf_choice","bf_choice_id","drive","bf_drive",
     }
     if "model" in params and any(k in params for k in QUESTION_KEYS):
         params.pop("model", None)
 
-    # -------- Family-specific param normalization (keep your existing logic) --------
+    # -------- Family-specific param normalization --------
     try:
         import re
 
+        # ===================== BrushFighter (BF) =====================
+        has_bf_flow = (
+            params.get("family") == "brushfighter"
+            or "bf_choice" in params
+            or "bf_choice_id" in params
+            or ("model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BF"))
+        )
+        if has_bf_flow:
+            params.setdefault("family", "brushfighter")
+            # avoid model short-circuit mid-flow
+            params.pop("model", None)
+
+            # Helper: A/B/C or 4/5/6 or "5 ft" -> "4"/"5"/"6"
+            def _pick_to_ft(v):
+                if v is None: return None
+                s = str(v).strip().lower()
+                if s in {"a","b","c"}:
+                    return {"a":"4","b":"5","c":"6"}[s]
+                m = re.match(r"^\s*(\d{1,2})(?:\s*ft)?\s*$", s)
+                return m.group(1) if m else None
+
+            # Helper: does it look like a real part id (e.g., 639920A, BF..., 6+ alnum)
+            def _looks_like_part_id(x):
+                if x is None: return False
+                s = str(x).strip()
+                if len(s) <= 3: return False
+                return bool(re.match(r"^(BF|[A-Za-z0-9]{5,})", s))
+
+            # Step 1: first question expects width_ft
+            if "width_ft" not in params:
+                wf = _pick_to_ft(params.get("bf_choice")) or _pick_to_ft(params.get("bf_choice_id")) or _pick_to_ft(params.get("width"))
+                if wf:
+                    params["width_ft"] = wf
+                    # prevent misinterpreting "5" as a part id
+                    params.pop("bf_choice", None)
+                    params.pop("bf_choice_id", None)
+
+            # Step 2: only pass bf_choice_id if it looks like a real id
+            if "bf_choice_id" in params and not _looks_like_part_id(params.get("bf_choice_id")):
+                params.pop("bf_choice_id", None)
+
+            # Normalize drive key
+            if "bf_drive" in params and "drive" not in params:
+                params["drive"] = params["bf_drive"]
+
         # ===================== Disc Harrow =====================
-        has_dh = any(k.startswith("dh_") for k in params.keys())
+        has_dh = any(k.startswith("dh_") for k in params.keys()) or params.get("family") == "disc_harrow"
         if has_dh:
             # Mid-flow: the API expects param questions, not a model guess
             params.pop("model", None)
