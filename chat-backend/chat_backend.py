@@ -504,185 +504,134 @@ def tool_woods_dealer_discount(args: Dict[str, Any]) -> Dict[str, Any]:
     body, status, used = http_get("/dealer-discount", {"dealer_number": dealer_number})
     return {"ok": status == 200, "status": status, "url": used, "body": body}
 
-def tool_woods_quote(params: Dict[str, Any]) -> Dict[str, Any]:
+def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Wrapper around GET /quote with a few guardrails:
-      - strips internal keys (anything starting with "_") so we don't leak them to the API
-      - family-agnostic 'mid-question' guard (drop model if we're clearly in Q&A)
-      - BrushFighter mapping: map "a/b/c", "pin/clutch", or label → real bf_choice_id
-      - remembers last options (choices_with_ids) in session state for the next turn
-      - tracks consecutive quote errors and auto-resets the session after 2 errors
+    Calls /quote with sanitized params, logs request/response, and injects `_enforced_totals`
+    computed from API summary (dealer net already applied by API).
     """
-    from flask import request
+    # -------- Build params (strip empty) --------
+    params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
 
-    # ---- Resolve session ----
-    sid = request.headers.get("X-Session-Id") or request.json.get("session_id") if request.is_json else None
-    now = time.time()
-    sess = SESS.setdefault(sid or f"anon-{int(now*1000)}", {"messages": [], "dealer": None, "updated_at": now})
-    sess["updated_at"] = now
-    sess.setdefault("quote_ctx", {"family": None, "answers": {}})
-    sess.setdefault("err_count", 0)
-
-    # Work on a copy; never mutate caller's dict
-    params = dict(params or {})
-    qc = sess["quote_ctx"]
-    qc.setdefault("answers", {})
-
-    # -------- Family-agnostic Q&A guard: drop model if we’re clearly mid-questions --------
-    QUESTION_KEYS = {
-        "width", "width_ft", "width_in", "quantity", "part_id", "accessory_id", "choice_id",
-        "bb_shielding","bb_tailwheel",
-        "bw_duty","bw_driveline","bw_tire_qty","shielding_rows","deck_rings",
-        "tbw_duty","front_rollers","chains",
-        "ds_mount","ds_shielding","ds_driveline","tire_id","tire_qty",
-        "dh_width_in","dh_duty","dh_spacing_id",
-        "bs_width_in","bs_duty","bs_choice_id",
-        "gs_width_in","gs_choice_id",
-        "lrs_width_in","lrs_grade","lrs_choice_id",
-        "rb_width_in","rb_duty","rb_choice_id",
-        "pd_model","auger_id",
-        "tiller_series","tiller_width_in","tiller_rotation","tiller_choice_id",
-        "finish_choice","rollers",
-        "pf_choice","balespear_choice","hydraulics_id",
-        # BrushFighter follow-ups
-        "bf_choice", "bf_choice_id", "drive",
-    }
-    mid_qa = any(k in params for k in QUESTION_KEYS)
-    if mid_qa and "model" in params:
-        # Let the API drive the next question; 'model' can cause short-circuiting
-        params.pop("model", None)
-
-    # -------- Don’t leak internal crumbs to the API (anything starting with "_") --------
-    for k in list(params.keys()):
-        if str(k).startswith("_"):
-            params.pop(k, None)
-
-    # ===================== BrushFighter specific mapping =====================
-    has_bf = (
-        params.get("family") == "brushfighter"
-        or "bf_choice" in params
-        or "bf_choice_id" in params
-        or ("model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BF"))
-    )
-    if has_bf:
-        params.setdefault("family", "brushfighter")
-        params.pop("model", None)  # avoid model short-circuit mid-flow
-
-        import re
-        def _pick_to_ft(v):
-            if v is None: return None
-            s = str(v).strip().lower()
-            if s in {"a","b","c"}:  # A/B/C → 4/5/6
-                return {"a":"4","b":"5","c":"6"}[s]
-            m = re.match(r"^\s*(\d{1,2})(?:\s*ft)?\s*$", s)  # "5", "5 ft"
-            return m.group(1) if m else None
-
-        def _looks_like_part_id(x):
-            if x is None: return False
-            s = str(x).strip()
-            if len(s) <= 3: return False
-            return bool(re.match(r"^\d{5,}[A-Z]?$", s))  # e.g., 639920A
-
-        # width_ft from letter/number if missing
-        if "width_ft" not in params:
-            wf = _pick_to_ft(params.get("bf_choice")) or _pick_to_ft(params.get("bf_choice_id")) or _pick_to_ft(params.get("width"))
-            if wf:
-                params["width_ft"] = wf
-
-        # Try resolve bf_choice → bf_choice_id from last turn options we cached
-        bf_opts = []
-        last_opts = (qc.get("answers") or {}).get("_last_options") or {}
-        bf_opts = last_opts.get("bf_choice") or []
-
-        if "bf_choice_id" not in params:
-            raw = params.get("bf_choice")
-            pick = str(raw).strip().lower() if raw is not None else ""
-            picked = None
-
-            if bf_opts:
-                # Letter picks
-                if pick in {"a","b","c","d","e","f","g"}:
-                    idx = "abcdefg".index(pick)
-                    if 0 <= idx < len(bf_opts):
-                        picked = bf_opts[idx]
-                else:
-                    # Keyword shortcuts
-                    if any(t in pick for t in ["pin", "shear"]):
-                        picked = next((o for o in bf_opts if "shear" in (o.get("label","").lower())), None)
-                    elif any(t in pick for t in ["slip", "clutch"]):
-                        picked = next((o for o in bf_opts if ("slip" in o.get("label","").lower()) or ("clutch" in o.get("label","").lower())), None)
-                    # Exact label match
-                    if not picked and pick:
-                        picked = next((o for o in bf_opts if o.get("label","").strip().lower() == pick), None)
-
-                if picked:
-                    params["bf_choice_id"] = picked.get("id")
-                    params["bf_choice"]    = picked.get("label")
-
-        # If id looks bogus, drop so API will re-ask
-        if "bf_choice_id" in params and not _looks_like_part_id(params.get("bf_choice_id")):
-            params.pop("bf_choice_id", None)
-        # If still no id, drop label too to force a clean re-ask
-        if "bf_choice_id" not in params:
-            params.pop("bf_choice", None)
-
-    # -------- Call the API --------
-    log.info("QUOTE CALL params=%s", json.dumps(params, ensure_ascii=False))
-    body, status, url = http_get("/quote", params)
-
-    # -------- Error tracking + auto-reset after 2 errors --------
-    is_errorish = (
-        status >= 400
-        or (isinstance(body, dict) and (body.get("mode") == "error" or body.get("found") is False))
-        or not isinstance(body, dict)
-    )
-    if is_errorish:
-        sess["err_count"] = int(sess.get("err_count") or 0) + 1
-        log.warning("QUOTE ERROR #%s for dealer %s", sess["err_count"], (sess.get("dealer") or {}).get("dealer_number"))
-        if sess["err_count"] >= 2:
-            # Preserve dealer, wipe the rest
-            dealer_keep = sess.get("dealer")
-            SESS[sid] = {
-                "messages": [],
-                "dealer": dealer_keep,
-                "updated_at": time.time(),
-                "quote_ctx": {"family": None, "answers": {}},
-                "err_count": 0,
-            }
-            log.error("AUTO RESET after 2 errors (dealer %s). Clearing session state.", (dealer_keep or {}).get("dealer_number"))
-            return {
-                "ok": True,
-                "body": {
-                    "_auto_reset": True,
-                    "message": "There was a system error while retrieving data. I've reset this session so we can start fresh. Please tell me the family or model you’d like to quote.",
-                }
-            }
-    else:
-        # Successful call resets error counter
-        sess["err_count"] = 0
-
-    # -------- Stash choices_with_ids so the next turn can resolve letters/keywords --------
+    # -------- Family-specific param normalization (surgical, safe) --------
     try:
-        if isinstance(body, dict) and body.get("mode") == "questions":
-            rq = body.get("required_questions") or []
-            last_options: Dict[str, Any] = {}
-            for q in rq:
-                nm = q.get("name")
-                cids = q.get("choices_with_ids")
-                if nm and cids:
-                    last_options.setdefault(nm, [])
-                    for opt in cids:
-                        # keep only id + label to keep memory light
-                        last_options[nm].append({"label": opt.get("label"), "id": opt.get("id")})
-            if last_options:
-                qc["answers"]["_last_options"] = last_options
-        elif isinstance(body, dict) and body.get("mode") == "quote":
-            # Clear last_options after a finished quote
-            qc["answers"].pop("_last_options", None)
-    except Exception:
-        pass
+        import re
 
-    return {"ok": (status == 200), "body": body, "status": status, "url": url}
+        # ===================== Disc Harrow =====================
+        has_dh = any(k.startswith("dh_") for k in params.keys())
+        if has_dh:
+            # Mid-flow: don't send model (e.g., "DHS64")
+            params.pop("model", None)
+            # Ensure family present
+            params.setdefault("family", "disc_harrow")
+
+            # Normalize width alias -> dh_width_in
+            if "width" in params and "dh_width_in" not in params:
+                params["dh_width_in"] = str(params.pop("width")).strip()
+
+            # Spacing: move ID from alt keys to dh_spacing_id
+            if "dh_spacing_id" not in params:
+                for alt in ("dh_choice", "dh_spacing", "dh_spacing_choice"):
+                    val = params.get(alt)
+                    if not val:
+                        continue
+                    if isinstance(val, str) and re.match(r"^\d{6,}[A-Z]?$", val.strip()):
+                        params["dh_spacing_id"] = val.strip()
+                        break
+
+            # Blade shorthand -> API label
+            if "dh_blade" in params:
+                t = str(params["dh_blade"]).strip().lower()
+                if t in {"n", "notched"}:
+                    params["dh_blade"] = "Notched (N)"
+                elif t in {"c", "combo"}:
+                    params["dh_blade"] = "Combo (C)"
+
+        # ===================== Bale Spear =====================
+        # Signals we are in/after Bale Spear question:
+        has_bs_flow = (
+            "balespear_choice" in params
+            or ("model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BS"))
+            or "part_id" in params  # sometimes LLM sends the part directly
+        )
+        if has_bs_flow:
+            # Anchor family and drop model mid-flow (model/part_id calls 500 on API)
+            params.setdefault("family", "bale_spear")
+            params.pop("model", None)
+
+            # If the selection came as part_id and looks like an ID, use it as the answer to the question
+            # The API expects the answer under the question field name (balespear_choice), not 'part_id'
+            if "balespear_choice" not in params:
+                # Try to lift from part_id if it looks like an ID (e.g., 1037171)
+                pid = params.get("part_id")
+                if isinstance(pid, str) and re.match(r"^\d{6,}[A-Z]?$", pid.strip()):
+                    params["balespear_choice"] = pid.strip()
+                    # You can keep part_id or drop it; keeping it is usually harmless,
+                    # but if the API is strict, uncomment next line to remove:
+                    # params.pop("part_id", None)
+
+            # If they sent the choice label, fine; if it looks like an ID, that's fine too.
+            # No further mapping is needed here because the API will accept the ID for balespear_choice.
+    except Exception as _e:
+        log.warning("param normalization skipped: %s", _e)
+
+    # -------- Log request --------
+    log.info("QUOTE CALL params=%s", json.dumps(params, ensure_ascii=False))
+
+    # -------- HTTP call --------
+    body, status, used = http_get("/quote", params)
+
+    # -------- Log response shape --------
+    try:
+        if status == 200 and isinstance(body, dict):
+            rq = body.get("required_questions") or []
+            rq_names = [q.get("name") for q in rq]
+            log.info(
+                "QUOTE RESP status=%s mode=%s model=%s rq=%s",
+                status, body.get("mode"), body.get("model"), rq_names
+            )
+        else:
+            log.info("QUOTE RESP status=%s (non-json or error) body=%s", status, str(body)[:500])
+    except Exception as e:
+        log.warning("QUOTE RESP log error: %s", e)
+
+    # -------- Enforce cash discount (round only at the end) --------
+    try:
+        if status == 200 and isinstance(body, dict):
+            summary = body.get("summary", {}) or {}
+            list_total = float(summary.get("subtotal_list", 0) or 0)
+            dealer_net = float(summary.get("total", 0) or 0)
+
+            # Find dealer discount from session (stored as decimal, e.g., 0.24 or 0.05)
+            dealer_number = str(params.get("dealer_number") or "")
+            dealer_discount = None
+            for s in SESS.values():
+                d = s.get("dealer") or {}
+                if str(d.get("dealer_number") or "") == dealer_number:
+                    try:
+                        dealer_discount = float(d.get("discount"))
+                    except Exception:
+                        dealer_discount = None
+                    break
+
+            if list_total > 0 and dealer_net > 0 and dealer_discount is not None:
+                dealer_discount_amt = list_total - dealer_net
+                # Cash discount rule: 5% if dealer discount == 5%, else 12%
+                cash_discount_pct = 0.05 if abs(dealer_discount - 0.05) < 1e-9 else 0.12
+                cash_discount_amt = dealer_net * cash_discount_pct
+                final_net = dealer_net - cash_discount_amt
+
+                body["_enforced_totals"] = {
+                    "list_price_total": round(list_total, 2),
+                    "dealer_discount_total": round(dealer_discount_amt, 2),
+                    "cash_discount_total": round(cash_discount_amt, 2),
+                    "final_net": round(final_net, 2),
+                }
+
+                log.info("ENFORCED TOTALS %s: %s", dealer_number, json.dumps(body["_enforced_totals"]))
+    except Exception as e:
+        log.warning("Failed to inject _enforced_totals: %s", e)
+
+    return {"ok": status == 200, "status": status, "url": used, "body": body}
 
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
     body, status, used = http_get("/health", {})
