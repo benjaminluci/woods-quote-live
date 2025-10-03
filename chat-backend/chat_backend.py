@@ -511,41 +511,27 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
 
     Added:
       - Restore `family` from the active session if missing.
-      - Remember `family` in session when API returns mode="questions".
-      - Clear per-quote context when API returns mode="quote".
+      - Remember/clear `family` in session based on response mode.
+      - ### ANSWER MEMORY: cache previously answered fields per-family and re-send them.
     """
-    import re  # <-- ensure regex is available everywhere in this function
-    from flask import request as _flask_req  # local import; available when called from /chat
+    import re
+    from flask import request as _flask_req
 
-    # -------- Small helper: infer family from a question name --------
+    # -------- helper to infer family from a question name --------
     def _infer_family_from_question_name(name: str) -> Optional[str]:
         n = (name or "").strip().lower()
-        if not n:
-            return None
-        # Prefix-based families
-        if n.startswith("pf_"):
-            return "pallet_fork"
-        if n.startswith("balespear_"):
-            return "bale_spear"
-        if n.startswith("qh_"):
-            return "quick_hitch"
-        if n.startswith("finish_"):
-            return "rear_finish"
-        if n.startswith("dh_"):
-            return "disc_harrow"
-        if n.startswith("rb_"):
-            return "rear_blade"
-        if n.startswith("lrs_"):
-            return "landscape_rake"
-        if n.startswith("gs_"):
-            return "grading_scraper"
-        if n.startswith("pd_"):
-            return "post_hole_digger"
-        if n.startswith("tiller_"):
-            return "tiller"
-        # Common unprefixed Batwing fields
-        if n in ("width_ft", "wing_drive", "transport_lights"):
-            return "batwing"
+        if not n: return None
+        if n.startswith("pf_"): return "pallet_fork"
+        if n.startswith("balespear_"): return "bale_spear"
+        if n.startswith("qh_"): return "quick_hitch"
+        if n.startswith("finish_"): return "rear_finish"
+        if n.startswith("dh_"): return "disc_harrow"
+        if n.startswith("rb_"): return "rear_blade"
+        if n.startswith("lrs_"): return "landscape_rake"
+        if n.startswith("gs_"): return "grading_scraper"
+        if n.startswith("pd_"): return "post_hole_digger"
+        if n.startswith("tiller_"): return "tiller"
+        if n in ("width_ft", "wing_drive", "transport_lights"): return "batwing"
         return None
 
     # -------- Build params (strip empty) --------
@@ -576,33 +562,26 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
             "quick_hitch": "qh",
         }
 
-        # (A) If explicit family is set and it's a menu family, normalize keys and drop model
         if fam in MENU_FAMILIES:
             prefix = FAMILY_PREFIX[fam]
             choice_id_key = f"{prefix}_choice_id"
             choice_label_key = f"{prefix}_choice"
 
-            # Promote generic IDs -> <prefix>_choice_id
             if choice_id_key not in params:
                 for alt in ("choice_id", "part_id", "part_no", f"{prefix}_id"):
                     if params.get(alt):
                         params[choice_id_key] = str(params[alt]).strip()
                         break
 
-            # Promote generic labels -> <prefix>_choice
             if choice_label_key not in params:
                 for alt in ("choice", "choice_label"):
                     if params.get(alt):
                         params[choice_label_key] = str(params[alt]).strip()
                         break
 
-            # If we have a choice id/label, do not send model during menu flow
             if params.get(choice_id_key) or params.get(choice_label_key):
                 params.pop("model", None)
-
-        # (B) If family is missing, try to infer it from scoped keys or part_id heuristic
         else:
-            # 1) Keys themselves declare the family
             key_to_family = [
                 ("pf_choice_id", "pallet_fork"),
                 ("pf_choice", "pallet_fork"),
@@ -617,25 +596,18 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                     inferred_family = fam_name
                     break
 
-            # 2) Bare part_id heuristic based on the ID ranges seen in your logs
             if not inferred_family and "part_id" in params:
                 pid = str(params.get("part_id") or "").strip()
-                # Pallet fork examples: 640020..640024
                 if re.match(r"^64\d{4}$", pid):
-                    inferred_family = "pallet_fork"
-                    params["pf_choice_id"] = pid
-                # Bale spear example: 1037170
+                    inferred_family = "pallet_fork"; params["pf_choice_id"] = pid
                 elif re.match(r"^103\d{4,}$", pid):
-                    inferred_family = "bale_spear"
-                    params["balespear_choice_id"] = pid
+                    inferred_family = "bale_spear";  params["balespear_choice_id"] = pid
 
             if inferred_family:
                 params["family"] = inferred_family
-                # Also remove model in menu flows once we have a choice id/label
                 if inferred_family in MENU_FAMILIES:
                     params.pop("model", None)
 
-            # Finally, if we still only have a generic label, try to map it
             fam2prefix = FAMILY_PREFIX
             for fam_name, prefix in fam2prefix.items():
                 choice_id_key = f"{prefix}_choice_id"
@@ -648,41 +620,45 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as _e:
         log.warning("menu-family normalization skipped: %s", _e)
 
-    # -------- Disc Harrow: param normalization (surgical, safe) --------
+    # -------- Disc Harrow normalization --------
     try:
-        # If any Disc Harrow fields are present, we are mid-flow; don't send `model`
         has_dh = any(k.startswith("dh_") for k in params.keys())
         if has_dh and "model" in params:
             params.pop("model", None)
-
-        # Ensure family is present when answering Disc Harrow questions
         if has_dh and "family" not in params:
             params["family"] = "disc_harrow"
-
-        # Normalize width key if it drifted (API expects dh_width_in)
         if "width" in params and "dh_width_in" not in params:
             params["dh_width_in"] = str(params.pop("width")).strip()
-
-        # Spacing: if an ID was provided under an alt key, move it to dh_spacing_id
         if "dh_spacing_id" not in params:
             for alt in ("dh_choice", "dh_spacing", "dh_spacing_choice"):
                 val = params.get(alt)
-                if not val:
-                    continue
-                # Looks like an ID? 6+ digits, optional trailing letter (e.g., 1041351N)
+                if not val: continue
                 if isinstance(val, str) and re.match(r"^\d{6,}[A-Z]?$", val.strip()):
                     params["dh_spacing_id"] = val.strip()
                     break
-
-        # Blade: normalize shorthand to API labels
         if "dh_blade" in params:
             t = str(params["dh_blade"]).strip().lower()
-            if t in {"n", "notched"}:
-                params["dh_blade"] = "Notched (N)"
-            elif t in {"c", "combo"}:
-                params["dh_blade"] = "Combo (C)"
+            if t in {"n", "notched"}: params["dh_blade"] = "Notched (N)"
+            elif t in {"c", "combo"}: params["dh_blade"] = "Combo (C)"
     except Exception as _e:
         log.warning("disc harrow normalization skipped: %s", _e)
+
+    # -------- ### ANSWER MEMORY: merge previously given answers for this family --------
+    try:
+        sid = (
+            _flask_req.headers.get("X-Session-Id")
+            or (_flask_req.get_json(silent=True) or {}).get("session_id")
+        )
+        fam = params.get("family")
+        if sid and sid in SESS and fam:
+            sess_entry = SESS.get(sid) or {}
+            qc = sess_entry.setdefault("quote_ctx", {"family": None, "answers": {}, "pending": []})
+            # If we are in the same family, merge remembered answers unless caller overrides them
+            if qc.get("family") == fam and isinstance(qc.get("answers"), dict):
+                for k, v in (qc["answers"] or {}).items():
+                    params.setdefault(k, v)
+    except Exception as _e:
+        log.warning("answer-merge skipped: %s", _e)
 
     # -------- Log request --------
     log.info("QUOTE CALL params=%s", json.dumps(params, ensure_ascii=False))
@@ -704,7 +680,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.warning("QUOTE RESP log error: %s", e)
 
-    # -------- Persist/clear active family in session based on response mode --------
+    # -------- Persist/clear family + ### ANSWER MEMORY: track answers/pending --------
     try:
         sid = (
             _flask_req.headers.get("X-Session-Id")
@@ -712,32 +688,41 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         )
         if sid and sid in SESS and isinstance(body, dict):
             sess_entry = SESS.get(sid) or {}
-            qc = sess_entry.setdefault("quote_ctx", {"family": None, "answers": {}})
+            qc = sess_entry.setdefault("quote_ctx", {"family": None, "answers": {}, "pending": []})
 
             mode = body.get("mode")
             if mode == "questions":
-                # Prefer the family we just sent; else infer from the first question name
-                fam = params.get("family")
-                if not fam:
+                fam_now = params.get("family")
+                if not fam_now:
                     rqs = body.get("required_questions") or []
                     if rqs:
-                        fam = _infer_family_from_question_name(rqs[0].get("name"))
-                if fam:
-                    qc["family"] = fam
+                        fam_now = _infer_family_from_question_name(rqs[0].get("name"))
+                if fam_now:
+                    qc["family"] = fam_now
+
+                # record pending names for this step
+                rqs = body.get("required_questions") or []
+                qc["pending"] = [q.get("name") for q in rqs if q.get("name")]
+
+                # upsert any answers we just sent that match pending (or previous) question keys
+                if isinstance(qc.get("answers"), dict):
+                    for k, v in params.items():
+                        if k in (qc["pending"] or []) or k.startswith(("pf_","balespear_","qh_","finish_","dh_","bw_","rb_","lrs_","gs_","pd_","tiller_")) or k in ("width_ft",):
+                            qc["answers"][k] = v
+
             elif mode == "quote":
-                sess_entry["quote_ctx"] = {"family": None, "answers": {}}
+                # finished — clear per-quote state
+                sess_entry["quote_ctx"] = {"family": None, "answers": {}, "pending": []}
                 sess_entry["err_count"] = 0
     except Exception as _e:
-        log.warning("remember/clear family skipped: %s", _e)
+        log.warning("remember/clear family & answers skipped: %s", _e)
 
-    # -------- Enforce cash discount (round only at the end) --------
+    # -------- Enforce cash discount (unchanged) --------
     try:
         if status == 200 and isinstance(body, dict):
             summary = body.get("summary", {}) or {}
             list_total = float(summary.get("subtotal_list", 0) or 0)
             dealer_net = float(summary.get("total", 0) or 0)
-
-            # Find dealer discount from session (stored as decimal, e.g., 0.24 or 0.05)
             dealer_number = str(params.get("dealer_number") or "")
             dealer_discount = None
             for s in SESS.values():
@@ -751,18 +736,15 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
 
             if list_total > 0 and dealer_net > 0 and dealer_discount is not None:
                 dealer_discount_amt = list_total - dealer_net
-                # Cash discount rule: 5% if dealer discount == 5%, else 12%
                 cash_discount_pct = 0.05 if abs(dealer_discount - 0.05) < 1e-9 else 0.12
                 cash_discount_amt = dealer_net * cash_discount_pct
                 final_net = dealer_net - cash_discount_amt
-
                 body["_enforced_totals"] = {
                     "list_price_total": round(list_total, 2),
                     "dealer_discount_total": round(dealer_discount_amt, 2),
                     "cash_discount_total": round(cash_discount_amt, 2),
                     "final_net": round(final_net, 2),
                 }
-
                 log.info("ENFORCED TOTALS %s: %s", dealer_number, json.dumps(body["_enforced_totals"]))
     except Exception as e:
         log.warning("Failed to inject _enforced_totals: %s", e)
