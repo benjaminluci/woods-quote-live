@@ -509,6 +509,8 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     Calls /quote with sanitized params, logs request/response, and injects `_enforced_totals`
     computed from API summary (dealer net already applied by API).
     """
+    import re  # <-- ensure regex is available everywhere in this function
+
     # -------- Build params (strip empty) --------
     params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
 
@@ -570,7 +572,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                 if re.match(r"^64\d{4}$", pid):
                     inferred_family = "pallet_fork"
                     params["pf_choice_id"] = pid
-                # Bale spear example you showed: 1037170
+                # Bale spear example: 1037170
                 elif re.match(r"^103\d{4,}$", pid):
                     inferred_family = "bale_spear"
                     params["balespear_choice_id"] = pid
@@ -596,8 +598,6 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
 
     # -------- Disc Harrow: param normalization (surgical, safe) --------
     try:
-        import re
-
         # If any Disc Harrow fields are present, we are mid-flow; don't send `model`
         has_dh = any(k.startswith("dh_") for k in params.keys())
         if has_dh and "model" in params:
