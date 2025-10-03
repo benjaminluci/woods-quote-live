@@ -506,167 +506,105 @@ def tool_woods_dealer_discount(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Calls /quote with sanitized params, logs request/response, and injects `_enforced_totals`
-    computed from API summary (dealer net already applied by API).
+    Call /quote with a merged view of ALL known params for the in-progress quote.
+    On every turn:
+      - Merge previously remembered params for this session+family.
+      - Overlay any newly provided params (newest wins).
+      - Send the full merged param set to the API.
 
-    Added:
-      - Restore `family` from the active session if missing.
-      - Remember/clear `family` in session based on response mode.
-      - ### ANSWER MEMORY: cache previously answered fields per-family and re-send them.
+    After response:
+      - If mode == "questions": remember the merged param set for this family.
+      - If mode == "quote": clear per-quote memory (keep dealer info).
     """
     import re
     from flask import request as _flask_req
 
-    # -------- helper to infer family from a question name --------
-    def _infer_family_from_question_name(name: str) -> Optional[str]:
-        n = (name or "").strip().lower()
-        if not n: return None
-        if n.startswith("pf_"): return "pallet_fork"
-        if n.startswith("balespear_"): return "bale_spear"
-        if n.startswith("qh_"): return "quick_hitch"
-        if n.startswith("finish_"): return "rear_finish"
-        if n.startswith("dh_"): return "disc_harrow"
-        if n.startswith("rb_"): return "rear_blade"
-        if n.startswith("lrs_"): return "landscape_rake"
-        if n.startswith("gs_"): return "grading_scraper"
-        if n.startswith("pd_"): return "post_hole_digger"
-        if n.startswith("tiller_"): return "tiller"
-        if n in ("width_ft", "wing_drive", "transport_lights"): return "batwing"
+    # --- helpers --------------------------------------------------------------
+
+    def _clean_params(d: Dict[str, Any]) -> Dict[str, Any]:
+        """Drop empty values; coerce simple strings."""
+        out = {}
+        for k, v in (d or {}).items():
+            if v in (None, "", []):  # treat [] as empty too
+                continue
+            if isinstance(v, str):
+                v = v.strip()
+                if v == "":
+                    continue
+            out[k] = v
+        return out
+
+    def _infer_family_from_keys(p: Dict[str, Any]) -> Optional[str]:
+        """Best-effort family inference from key prefixes or known fields."""
+        keys = {k.lower() for k in p.keys()}
+        for fam, pfx in {
+            "pallet_fork": "pf_",
+            "bale_spear": "balespear_",
+            "quick_hitch": "qh_",
+            "rear_finish": "finish_",
+            "disc_harrow": "dh_",
+            "batwing": "bw_",
+            "rear_blade": "rb_",
+            "landscape_rake": "lrs_",
+            "grading_scraper": "gs_",
+            "post_hole_digger": "pd_",
+            "tiller": "tiller_",
+        }.items():
+            if any(k.startswith(pfx) for k in keys):
+                return fam
+        # some families use unprefixed selector fields
+        if "width_ft" in keys:
+            return "batwing"
         return None
 
-    # -------- Build params (strip empty) --------
-    params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
+    # --- build params for this turn ------------------------------------------
 
-    # -------- Restore active family from session if planner omitted it --------
-    try:
-        if "family" not in params:
-            sid = (
-                _flask_req.headers.get("X-Session-Id")
-                or (_flask_req.get_json(silent=True) or {}).get("session_id")
-            )
-            if sid and sid in SESS:
-                qc = (SESS.get(sid) or {}).get("quote_ctx") or {}
-                fam_restore = qc.get("family")
-                if fam_restore:
-                    params["family"] = fam_restore
-    except Exception as _e:
-        log.warning("family restore skipped: %s", _e)
+    # 1) start with only the non-empty incoming args
+    turn_params = _clean_params(args or {})
 
-    # -------- Menu-family guard (pallet_fork / bale_spear / quick_hitch) --------
-    try:
-        fam = str(params.get("family") or "").strip().lower()
-        MENU_FAMILIES = {"pallet_fork", "bale_spear", "quick_hitch"}
-        FAMILY_PREFIX = {
-            "pallet_fork": "pf",
-            "bale_spear": "balespear",
-            "quick_hitch": "qh",
-        }
+    # 2) get session + per-quote context
+    sid = (
+        _flask_req.headers.get("X-Session-Id")
+        or (_flask_req.get_json(silent=True) or {}).get("session_id")
+    )
+    sess_entry = SESS.setdefault(sid, {}) if sid else {}
+    qc = sess_entry.setdefault("quote_ctx", {"family": None, "answers": {}})
 
-        if fam in MENU_FAMILIES:
-            prefix = FAMILY_PREFIX[fam]
-            choice_id_key = f"{prefix}_choice_id"
-            choice_label_key = f"{prefix}_choice"
+    # 3) determine active family: prefer incoming, else remembered, else infer
+    fam = (turn_params.get("family") or qc.get("family") or _infer_family_from_keys(turn_params))
+    if fam:
+        turn_params["family"] = fam
 
-            if choice_id_key not in params:
-                for alt in ("choice_id", "part_id", "part_no", f"{prefix}_id"):
-                    if params.get(alt):
-                        params[choice_id_key] = str(params[alt]).strip()
-                        break
+    # 4) merge previously remembered params for this family
+    #    (only if it's the same family; never mix families)
+    merged = {}
+    # always include dealer_number if present (from this turn or remembered)
+    dealer_number = turn_params.get("dealer_number") or (qc.get("answers") or {}).get("dealer_number")
+    if dealer_number:
+        merged["dealer_number"] = dealer_number
 
-            if choice_label_key not in params:
-                for alt in ("choice", "choice_label"):
-                    if params.get(alt):
-                        params[choice_label_key] = str(params[alt]).strip()
-                        break
+    if fam and qc.get("family") == fam and isinstance(qc.get("answers"), dict):
+        # start from remembered answers
+        for k, v in qc["answers"].items():
+            if k == "dealer_number":  # already handled
+                continue
+            merged[k] = v
 
-            if params.get(choice_id_key) or params.get(choice_label_key):
-                params.pop("model", None)
-        else:
-            key_to_family = [
-                ("pf_choice_id", "pallet_fork"),
-                ("pf_choice", "pallet_fork"),
-                ("balespear_choice_id", "bale_spear"),
-                ("balespear_choice", "bale_spear"),
-                ("qh_choice_id", "quick_hitch"),
-                ("qh_choice", "quick_hitch"),
-            ]
-            inferred_family = None
-            for k, fam_name in key_to_family:
-                if k in params:
-                    inferred_family = fam_name
-                    break
+    # overlay current turn params (newest answers win)
+    for k, v in turn_params.items():
+        merged[k] = v
 
-            if not inferred_family and "part_id" in params:
-                pid = str(params.get("part_id") or "").strip()
-                if re.match(r"^64\d{4}$", pid):
-                    inferred_family = "pallet_fork"; params["pf_choice_id"] = pid
-                elif re.match(r"^103\d{4,}$", pid):
-                    inferred_family = "bale_spear";  params["balespear_choice_id"] = pid
+    # 5) safety: avoid sending 'model' while we are still answering menus
+    #    (some families derive model later; sending early can cause 404/drift)
+    fam_lower = (fam or "").lower()
+    if fam_lower in {"pallet_fork", "bale_spear", "quick_hitch", "rear_finish", "disc_harrow", "batwing"}:
+        merged.pop("model", None)
 
-            if inferred_family:
-                params["family"] = inferred_family
-                if inferred_family in MENU_FAMILIES:
-                    params.pop("model", None)
+    # 6) log and call API
+    log.info("QUOTE CALL params=%s", json.dumps(merged, ensure_ascii=False))
+    body, status, used = http_get("/quote", merged)
 
-            fam2prefix = FAMILY_PREFIX
-            for fam_name, prefix in fam2prefix.items():
-                choice_id_key = f"{prefix}_choice_id"
-                choice_label_key = f"{prefix}_choice"
-                if choice_label_key in params and "family" not in params:
-                    params["family"] = fam_name
-                    params.pop("model", None)
-                    break
-
-    except Exception as _e:
-        log.warning("menu-family normalization skipped: %s", _e)
-
-    # -------- Disc Harrow normalization --------
-    try:
-        has_dh = any(k.startswith("dh_") for k in params.keys())
-        if has_dh and "model" in params:
-            params.pop("model", None)
-        if has_dh and "family" not in params:
-            params["family"] = "disc_harrow"
-        if "width" in params and "dh_width_in" not in params:
-            params["dh_width_in"] = str(params.pop("width")).strip()
-        if "dh_spacing_id" not in params:
-            for alt in ("dh_choice", "dh_spacing", "dh_spacing_choice"):
-                val = params.get(alt)
-                if not val: continue
-                if isinstance(val, str) and re.match(r"^\d{6,}[A-Z]?$", val.strip()):
-                    params["dh_spacing_id"] = val.strip()
-                    break
-        if "dh_blade" in params:
-            t = str(params["dh_blade"]).strip().lower()
-            if t in {"n", "notched"}: params["dh_blade"] = "Notched (N)"
-            elif t in {"c", "combo"}: params["dh_blade"] = "Combo (C)"
-    except Exception as _e:
-        log.warning("disc harrow normalization skipped: %s", _e)
-
-    # -------- ### ANSWER MEMORY: merge previously given answers for this family --------
-    try:
-        sid = (
-            _flask_req.headers.get("X-Session-Id")
-            or (_flask_req.get_json(silent=True) or {}).get("session_id")
-        )
-        fam = params.get("family")
-        if sid and sid in SESS and fam:
-            sess_entry = SESS.get(sid) or {}
-            qc = sess_entry.setdefault("quote_ctx", {"family": None, "answers": {}, "pending": []})
-            # If we are in the same family, merge remembered answers unless caller overrides them
-            if qc.get("family") == fam and isinstance(qc.get("answers"), dict):
-                for k, v in (qc["answers"] or {}).items():
-                    params.setdefault(k, v)
-    except Exception as _e:
-        log.warning("answer-merge skipped: %s", _e)
-
-    # -------- Log request --------
-    log.info("QUOTE CALL params=%s", json.dumps(params, ensure_ascii=False))
-
-    # -------- HTTP call --------
-    body, status, used = http_get("/quote", params)
-
-    # -------- Log response shape --------
+    # --- log response shape ---------------------------------------------------
     try:
         if status == 200 and isinstance(body, dict):
             rq = body.get("required_questions") or []
@@ -680,50 +618,42 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.warning("QUOTE RESP log error: %s", e)
 
-    # -------- Persist/clear family + ### ANSWER MEMORY: track answers/pending --------
+    # --- persist/clear per-quote memory --------------------------------------
     try:
-        sid = (
-            _flask_req.headers.get("X-Session-Id")
-            or (_flask_req.get_json(silent=True) or {}).get("session_id")
-        )
-        if sid and sid in SESS and isinstance(body, dict):
-            sess_entry = SESS.get(sid) or {}
-            qc = sess_entry.setdefault("quote_ctx", {"family": None, "answers": {}, "pending": []})
-
+        if sid and isinstance(body, dict):
             mode = body.get("mode")
+
             if mode == "questions":
-                fam_now = params.get("family")
-                if not fam_now:
-                    rqs = body.get("required_questions") or []
-                    if rqs:
-                        fam_now = _infer_family_from_question_name(rqs[0].get("name"))
-                if fam_now:
-                    qc["family"] = fam_now
-
-                # record pending names for this step
-                rqs = body.get("required_questions") or []
-                qc["pending"] = [q.get("name") for q in rqs if q.get("name")]
-
-                # upsert any answers we just sent that match pending (or previous) question keys
-                if isinstance(qc.get("answers"), dict):
-                    for k, v in params.items():
-                        if k in (qc["pending"] or []) or k.startswith(("pf_","balespear_","qh_","finish_","dh_","bw_","rb_","lrs_","gs_","pd_","tiller_")) or k in ("width_ft",):
-                            qc["answers"][k] = v
+                # remember family and ALL current merged params for this family
+                if fam:
+                    qc["family"] = fam
+                # Store everything except transient fields we never want to carry forever.
+                # We *do* keep choice labels/ids, quantities, etc. Dealer number is kept outside.
+                answers = qc.setdefault("answers", {})
+                for k, v in merged.items():
+                    if k == "dealer_number":
+                        continue
+                    answers[k] = v
 
             elif mode == "quote":
-                # finished — clear per-quote state
-                sess_entry["quote_ctx"] = {"family": None, "answers": {}, "pending": []}
+                # quote finished: clear per-quote memory, keep dealer info
+                dealer = sess_entry.get("dealer")  # preserved elsewhere
+                sess_entry["quote_ctx"] = {"family": None, "answers": {}}
                 sess_entry["err_count"] = 0
-    except Exception as _e:
-        log.warning("remember/clear family & answers skipped: %s", _e)
+                if dealer:
+                    sess_entry["dealer"] = dealer  # explicit (likely redundant, but safe)
+    except Exception as e:
+        log.warning("quote memory persist/clear failed: %s", e)
 
-    # -------- Enforce cash discount (unchanged) --------
+    # --- compute client-side enforced totals (unchanged) ----------------------
     try:
         if status == 200 and isinstance(body, dict):
             summary = body.get("summary", {}) or {}
             list_total = float(summary.get("subtotal_list", 0) or 0)
             dealer_net = float(summary.get("total", 0) or 0)
-            dealer_number = str(params.get("dealer_number") or "")
+
+            # Find dealer discount from session (stored as decimal, e.g., 0.24 or 0.05)
+            dealer_number = str(merged.get("dealer_number") or "")
             dealer_discount = None
             for s in SESS.values():
                 d = s.get("dealer") or {}
@@ -736,9 +666,11 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
 
             if list_total > 0 and dealer_net > 0 and dealer_discount is not None:
                 dealer_discount_amt = list_total - dealer_net
+                # Cash discount rule: 5% if dealer discount == 5%, else 12%
                 cash_discount_pct = 0.05 if abs(dealer_discount - 0.05) < 1e-9 else 0.12
                 cash_discount_amt = dealer_net * cash_discount_pct
                 final_net = dealer_net - cash_discount_amt
+
                 body["_enforced_totals"] = {
                     "list_price_total": round(list_total, 2),
                     "dealer_discount_total": round(dealer_discount_amt, 2),
@@ -750,6 +682,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         log.warning("Failed to inject _enforced_totals: %s", e)
 
     return {"ok": status == 200, "status": status, "url": used, "body": body}
+
 
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
     body, status, used = http_get("/health", {})
