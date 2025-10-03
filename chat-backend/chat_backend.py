@@ -506,172 +506,49 @@ def tool_woods_dealer_discount(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Calls /quote with sanitized params, logs request/response, and injects `_enforced_totals`.
-    Also hardens mid-flow handling so we always anchor a family (and avoid loops/500s)
-    based on which question fields are present.
+    Calls /quote with sanitized params, logs request/response, and injects `_enforced_totals`
+    computed from API summary (dealer net already applied by API).
     """
-    # -------- Build params (strip Nones/empty strings) --------
-    params: Dict[str, Any] = {k: v for k, v in (args or {}).items() if v not in (None, "")}
+    # -------- Build params (strip empty) --------
+    params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
 
+    # -------- Disc Harrow: param normalization (surgical, safe) --------
     try:
         import re
 
-        # ===== Helpers =====
-        def _as_int(v):
-            try:
-                return int(str(v).strip())
-            except Exception:
-                return v
-
-        def _normalize_width_ft(v: Any) -> str:
-            """
-            Accepts '15', '15 ft', '15 feet', 'A/B/C' mapped by the planner beforehand, etc.
-            Returns '12'/'15'/'17' or original text if not a simple match.
-            """
-            t = str(v or "").strip().lower()
-            # Strip 'ft', 'feet'
-            t = re.sub(r"\s*(ft|feet)\b", "", t).strip()
-            # Single letters sometimes get passed through; do not map here (planner handles that).
-            return t or str(v)
-
-        def _ensure_family(fam: str):
-            # Lock the family for mid-flow calls
-            if fam:
-                params["family"] = fam
-            # Mid-flow we never want to carry a model for these families (API asks questions by family)
-            if fam in {
-                "disc_harrow",
-                "bale_spear",
-                "pallet_fork",
-                "quick_hitch",
-                "rear_finish",
-                "turf_batwing",
-                "landscape_rake",
-                "rear_blade",
-                "box_scraper",
-                "grading_scraper",
-                "dual_spindle",
-                "tiller",
-            }:
-                params.pop("model", None)
-
-        # --------------------------------------------------------------------
-        # FAMILY ANCHORING (site-wide): infer `family` from the presence of
-        # family-specific fields so the next step never "forgets" context.
-        # --------------------------------------------------------------------
-        keyset = set(params.keys())
-
-        # Disc Harrow
-        if any(k.startswith("dh_") for k in keyset):
-            _ensure_family("disc_harrow")
-            # width alias
-            if "width" in params and "dh_width_in" not in params:
-                params["dh_width_in"] = str(params.pop("width")).strip()
-            # blade shorthand
-            if "dh_blade" in params:
-                t = str(params["dh_blade"]).strip().lower()
-                if t in {"n", "notched"}:
-                    params["dh_blade"] = "Notched (N)"
-                elif t in {"c", "combo"}:
-                    params["dh_blade"] = "Combo (C)"
-            # spacing id: normalize from alternates
-            if "dh_spacing_id" not in params:
-                for alt in ("dh_choice", "dh_spacing", "dh_spacing_choice"):
-                    val = params.get(alt)
-                    if isinstance(val, str) and re.match(r"^\d{6,}[A-Z]?$", val.strip()):
-                        params["dh_spacing_id"] = val.strip()
-                        break
-
-        # Bale Spear
-        if "balespear_choice" in keyset or (
-            "model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BS")
-        ) or "part_id" in keyset:
-            _ensure_family("bale_spear")
-            # lift part_id to balespear_choice if it's actually an ID
-            if "balespear_choice" not in params:
-                pid = params.get("part_id")
-                if isinstance(pid, str) and re.match(r"^\d{6,}[A-Z]?$", pid.strip()):
-                    params["balespear_choice"] = pid.strip()
-
-        # Pallet Forks
-        if "pf_choice" in keyset or (
-            "model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("PF")
-        ):
-            _ensure_family("pallet_fork")
-
-        # Quick Hitch
-        if "tqh_choice" in keyset or (
-            "model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("TQH")
-        ):
-            _ensure_family("quick_hitch")
-
-        # Rear Finish (Finish mowers)
-        if {"finish_choice", "rollers"} & keyset or ("chains" in keyset and "tbw_duty" not in keyset):
-            _ensure_family("rear_finish")
-            # make sure we don't pass an RD/TK/TKP model mid-flow; API will guide via questions
-            # (We still allow a direct RD990X one-shot when ONLY model is sent by the user elsewhere.)
-            # Here, since we're mid-flow (we saw finish_choice/rollers/chains), drop model.
+        # If any Disc Harrow fields are present, we are mid-flow; don't send `model`
+        has_dh = any(k.startswith("dh_") for k in params.keys())
+        if has_dh and "model" in params:
             params.pop("model", None)
 
-        # Turf Batwing
-        if {"tbw_duty", "front_rollers"} & keyset:
-            _ensure_family("turf_batwing")
-            if "width_ft" in params:
-                params["width_ft"] = _normalize_width_ft(params["width_ft"])
+        # Ensure family is present when answering Disc Harrow questions
+        if has_dh and "family" not in params:
+            params["family"] = "disc_harrow"
 
-        # Batwing (flex wing)
-        if {"bw_duty", "bw_driveline", "tire_id", "bw_tire_qty", "shielding_rows", "deck_rings"} & keyset or (
-            "model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BW")
-        ):
-            # For true Batwing (not Turf Batwing)
-            if params.get("family") != "turf_batwing":
-                params.setdefault("family", "batwing")
-            # Normalize tire qty to int when present
-            if "bw_tire_qty" in params:
-                params["bw_tire_qty"] = _as_int(params["bw_tire_qty"])
+        # Normalize width key if it drifted (API expects dh_width_in)
+        if "width" in params and "dh_width_in" not in params:
+            params["dh_width_in"] = str(params.pop("width")).strip()
 
-        # Dual Spindle
-        if any(k.startswith("ds_") for k in keyset) or "tire_id" in keyset or "tire_qty" in keyset:
-            _ensure_family("dual_spindle")
-            if "tire_qty" in params:
-                params["tire_qty"] = _as_int(params["tire_qty"])
+        # Spacing: if an ID was provided under an alt key, move it to dh_spacing_id
+        if "dh_spacing_id" not in params:
+            for alt in ("dh_choice", "dh_spacing", "dh_spacing_choice"):
+                val = params.get(alt)
+                if not val:
+                    continue
+                # Looks like an ID? 6+ digits, optional trailing letter (e.g., 1041351N)
+                if isinstance(val, str) and re.match(r"^\d{6,}[A-Z]?$", val.strip()):
+                    params["dh_spacing_id"] = val.strip()
+                    break
 
-        # Landscape Rake
-        if any(k.startswith("lrs_") for k in keyset):
-            _ensure_family("landscape_rake")
-
-        # Rear Blade
-        if any(k.startswith("rb_") for k in keyset):
-            _ensure_family("rear_blade")
-
-        # Box / Grading Scrapers
-        if any(k.startswith("bs_") for k in keyset):
-            _ensure_family("box_scraper")
-        if any(k.startswith("gs_") for k in keyset):
-            _ensure_family("grading_scraper")
-
-        # Tillers
-        if any(k.startswith("tiller_") for k in keyset):
-            _ensure_family("tiller")
-
-        # BrushFighter (BF) – nothing special beyond family anchor (model quoting works fine)
-        if any(k.startswith("bf_") for k in keyset) or (
-            "model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BF")
-        ):
-            params.setdefault("family", "brushfighter")
-
-        # BrushBull (BB) – allow model or family flow
-        if any(k.startswith("bb_") for k in keyset) or (
-            "model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BB")
-        ):
-            params.setdefault("family", "brushbull")
-
-        # Width normalization for flows that use width_ft as a question
-        if "width_ft" in params:
-            params["width_ft"] = _normalize_width_ft(params["width_ft"])
-
+        # Blade: normalize shorthand to API labels
+        if "dh_blade" in params:
+            t = str(params["dh_blade"]).strip().lower()
+            if t in {"n", "notched"}:
+                params["dh_blade"] = "Notched (N)"
+            elif t in {"c", "combo"}:
+                params["dh_blade"] = "Combo (C)"
     except Exception as _e:
-        log.warning("param normalization skipped: %s", _e)
+        log.warning("disc harrow normalization skipped: %s", _e)
 
     # -------- Log request --------
     log.info("QUOTE CALL params=%s", json.dumps(params, ensure_ascii=False))
@@ -693,14 +570,14 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.warning("QUOTE RESP log error: %s", e)
 
-    # -------- Enforce cash discount (from API summary) --------
+    # -------- Enforce cash discount (round only at the end) --------
     try:
         if status == 200 and isinstance(body, dict):
             summary = body.get("summary", {}) or {}
             list_total = float(summary.get("subtotal_list", 0) or 0)
             dealer_net = float(summary.get("total", 0) or 0)
 
-            # Locate dealer discount in active sessions
+            # Find dealer discount from session (stored as decimal, e.g., 0.24 or 0.05)
             dealer_number = str(params.get("dealer_number") or "")
             dealer_discount = None
             for s in SESS.values():
@@ -714,6 +591,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
 
             if list_total > 0 and dealer_net > 0 and dealer_discount is not None:
                 dealer_discount_amt = list_total - dealer_net
+                # Cash discount rule: 5% if dealer discount == 5%, else 12%
                 cash_discount_pct = 0.05 if abs(dealer_discount - 0.05) < 1e-9 else 0.12
                 cash_discount_amt = dealer_net * cash_discount_pct
                 final_net = dealer_net - cash_discount_amt
@@ -724,6 +602,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                     "cash_discount_total": round(cash_discount_amt, 2),
                     "final_net": round(final_net, 2),
                 }
+
                 log.info("ENFORCED TOTALS %s: %s", dealer_number, json.dumps(body["_enforced_totals"]))
     except Exception as e:
         log.warning("Failed to inject _enforced_totals: %s", e)
