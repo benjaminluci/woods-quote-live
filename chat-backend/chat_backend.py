@@ -270,7 +270,7 @@ FAMILY_CATALOG = [
         "model_prefixes": ["DB", "RT", "RTR"],
     },
     {
-        "family": "finish_mower",
+        "family": "rear_finish",
         "aliases": ["finish mower", "rd990x", "tk", "tkp", "grooming mower"],
         "model_prefixes": ["RD", "TK", "TKP"],
     },
