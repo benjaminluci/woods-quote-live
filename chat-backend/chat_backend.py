@@ -504,373 +504,185 @@ def tool_woods_dealer_discount(args: Dict[str, Any]) -> Dict[str, Any]:
     body, status, used = http_get("/dealer-discount", {"dealer_number": dealer_number})
     return {"ok": status == 200, "status": status, "url": used, "body": body}
 
-def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
+def tool_woods_quote(params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Calls /quote with sanitized params, logs request/response, and injects `_enforced_totals`.
-    Uses a per-session quote context ("quote_ctx") to resend all known answers every turn.
-    Prevents stale `model` polluting family Q&A, and normalizes some family-specific params.
-    Also handles BrushFighter label/letter → id mapping using the last seen options to prevent loops.
-    Auto-resets session (keeps dealer) after 2 consecutive API errors.
+    Wrapper around GET /quote with a few guardrails:
+      - strips internal keys (anything starting with "_") so we don't leak them to the API
+      - family-agnostic 'mid-question' guard (drop model if we're clearly in Q&A)
+      - BrushFighter mapping: map "a/b/c", "pin/clutch", or label → real bf_choice_id
+      - remembers last options (choices_with_ids) in session state for the next turn
+      - tracks consecutive quote errors and auto-resets the session after 2 errors
     """
-    # -------- Build params (strip empty) --------
-    params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
+    from flask import request
 
-    # -------- Resolve session for this dealer + ensure quote_ctx --------
-    dealer_number = str(params.get("dealer_number") or "")
-    sess = None
-    for s in SESS.values():
-        d = s.get("dealer") or {}
-        if str(d.get("dealer_number") or "") == dealer_number:
-            sess = s
-            break
+    # ---- Resolve session ----
+    sid = request.headers.get("X-Session-Id") or request.json.get("session_id") if request.is_json else None
+    now = time.time()
+    sess = SESS.setdefault(sid or f"anon-{int(now*1000)}", {"messages": [], "dealer": None, "updated_at": now})
+    sess["updated_at"] = now
+    sess.setdefault("quote_ctx", {"family": None, "answers": {}})
+    sess.setdefault("err_count", 0)
 
-    # Ensure session containers
-    if sess is not None:
-        qc = sess.setdefault("quote_ctx", {"family": None, "answers": {}})
-        if not isinstance(qc, dict) or "family" not in qc or "answers" not in qc:
-            qc = {"family": None, "answers": {}}
-            sess["quote_ctx"] = qc
-        sess.setdefault("err_count", 0)
-    else:
-        qc = {"family": None, "answers": {}}
+    # Work on a copy; never mutate caller's dict
+    params = dict(params or {})
+    qc = sess["quote_ctx"]
+    qc.setdefault("answers", {})
 
-    # -------- Lock/track family for this flow (do NOT persist across quotes) --------
-    if params.get("family"):
-        if qc["family"] and qc["family"] != params["family"]:
-            # Switching families mid-flow: reset flow memory
-            qc["family"] = params["family"]
-            qc["answers"] = {}
-        elif not qc["family"]:
-            qc["family"] = params["family"]
-
-    # If this is a model-first start, remember it for THIS quote only (crumb _model_first)
-    if "model" in params and not qc["answers"].get("_model_first") and not params.get("family"):
-        qc["answers"]["_model_first"] = params["model"]
-
-    # -------- Merge: dealer + family + prior answers + incoming (incoming overrides) --------
-    merged = {"dealer_number": dealer_number}
-    if qc["family"]:
-        merged["family"] = qc["family"]
-    merged.update(qc.get("answers", {}))  # carries previous concrete answers
-    for k, v in params.items():
-        if k != "dealer_number":
-            merged[k] = v
-
-    # Keep model if we began model-first for this quote (and not in a family flow)
-    if merged.get("_model_first") and "model" not in merged and not merged.get("family"):
-        merged["model"] = merged["_model_first"]
-
-    # Remove internal crumb before calling API
-    merged.pop("_model_first", None)
-
-    params = {k: v for k, v in merged.items() if v not in (None, "")}
-
-    # -------- Family-agnostic Q&A guard: drop model only for FAMILY flows mid-questions --------
+    # -------- Family-agnostic Q&A guard: drop model if we’re clearly mid-questions --------
     QUESTION_KEYS = {
         "width", "width_ft", "width_in", "quantity", "part_id", "accessory_id", "choice_id",
-        # BrushBull
-        "bb_shielding","bb_tailwheel","bb_duty",
-        # Batwing / TBW
+        "bb_shielding","bb_tailwheel",
         "bw_duty","bw_driveline","bw_tire_qty","shielding_rows","deck_rings",
         "tbw_duty","front_rollers","chains",
-        # Dual Spindle
         "ds_mount","ds_shielding","ds_driveline","tire_id","tire_qty",
-        # Disc Harrow
-        "dh_width_in","dh_duty","dh_spacing_id","dh_blade",
-        # Box / Grading Scrapers
+        "dh_width_in","dh_duty","dh_spacing_id",
         "bs_width_in","bs_duty","bs_choice_id",
         "gs_width_in","gs_choice_id",
-        # Landscape Rake
         "lrs_width_in","lrs_grade","lrs_choice_id",
-        # Rear Blade
         "rb_width_in","rb_duty","rb_choice_id",
-        # Post Hole Digger
         "pd_model","auger_id",
-        # Tillers
         "tiller_series","tiller_width_in","tiller_rotation","tiller_choice_id",
-        # Finish Mowers
         "finish_choice","rollers",
-        # PF / Bale Spear / misc
         "pf_choice","balespear_choice","hydraulics_id",
-        # BrushFighter
-        "bf_choice","bf_choice_id","drive","bf_drive",
+        # BrushFighter follow-ups
+        "bf_choice", "bf_choice_id", "drive",
     }
-    if "model" in params and any(k in params for k in QUESTION_KEYS):
-        # Only drop model if we are clearly in a family-driven Q&A.
-        if params.get("family"):
-            params.pop("model", None)
-        # else keep model (model-first path)
+    mid_qa = any(k in params for k in QUESTION_KEYS)
+    if mid_qa and "model" in params:
+        # Let the API drive the next question; 'model' can cause short-circuiting
+        params.pop("model", None)
 
-    # -------- Family-specific param normalization (BrushFighter, Disc Harrow, Bale Spear, Pallet Fork) --------
-    try:
+    # -------- Don’t leak internal crumbs to the API (anything starting with "_") --------
+    for k in list(params.keys()):
+        if str(k).startswith("_"):
+            params.pop(k, None)
+
+    # ===================== BrushFighter specific mapping =====================
+    has_bf = (
+        params.get("family") == "brushfighter"
+        or "bf_choice" in params
+        or "bf_choice_id" in params
+        or ("model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BF"))
+    )
+    if has_bf:
+        params.setdefault("family", "brushfighter")
+        params.pop("model", None)  # avoid model short-circuit mid-flow
+
         import re
+        def _pick_to_ft(v):
+            if v is None: return None
+            s = str(v).strip().lower()
+            if s in {"a","b","c"}:  # A/B/C → 4/5/6
+                return {"a":"4","b":"5","c":"6"}[s]
+            m = re.match(r"^\s*(\d{1,2})(?:\s*ft)?\s*$", s)  # "5", "5 ft"
+            return m.group(1) if m else None
 
-        # ===================== BrushFighter (BF) =====================
-        has_bf = (
-            params.get("family") == "brushfighter"
-            or "bf_choice" in params
-            or "bf_choice_id" in params
-            or ("model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BF"))
-        )
-        if has_bf:
-            params.setdefault("family", "brushfighter")
-            # avoid model short-circuit mid-flow
-            params.pop("model", None)
+        def _looks_like_part_id(x):
+            if x is None: return False
+            s = str(x).strip()
+            if len(s) <= 3: return False
+            return bool(re.match(r"^\d{5,}[A-Z]?$", s))  # e.g., 639920A
 
-            def _pick_to_ft(v):
-                if v is None: return None
-                s = str(v).strip().lower()
-                if s in {"a","b","c"}:  # A/B/C → 4/5/6
-                    return {"a":"4","b":"5","c":"6"}[s]
-                m = re.match(r"^\s*(\d{1,2})(?:\s*ft)?\s*$", s)  # "5", "5 ft", "6ft"
-                return m.group(1) if m else None
+        # width_ft from letter/number if missing
+        if "width_ft" not in params:
+            wf = _pick_to_ft(params.get("bf_choice")) or _pick_to_ft(params.get("bf_choice_id")) or _pick_to_ft(params.get("width"))
+            if wf:
+                params["width_ft"] = wf
 
-            def _looks_like_part_id(x):
-                if x is None: return False
-                s = str(x).strip()
-                if len(s) <= 3: return False
-                return bool(re.match(r"^\d{5,}[A-Z]?$", s))  # e.g., 639920A
+        # Try resolve bf_choice → bf_choice_id from last turn options we cached
+        bf_opts = []
+        last_opts = (qc.get("answers") or {}).get("_last_options") or {}
+        bf_opts = last_opts.get("bf_choice") or []
 
-            # width_ft normalization from letter/number
-            if "width_ft" not in params:
-                wf = _pick_to_ft(params.get("bf_choice")) or _pick_to_ft(params.get("bf_choice_id")) or _pick_to_ft(params.get("width"))
-                if wf:
-                    params["width_ft"] = wf
+        if "bf_choice_id" not in params:
+            raw = params.get("bf_choice")
+            pick = str(raw).strip().lower() if raw is not None else ""
+            picked = None
 
-            # Try to resolve bf_choice → bf_choice_id using options we saw last turn
-            if "bf_choice_id" not in params and "bf_choice" in params and sess:
-                last_opts = (((sess.get("quote_ctx") or {}).get("answers") or {}).get("_last_options") or {})
-                bf_opts = last_opts.get("bf_choice") or []
-                if bf_opts:
-                    # Accept A/B/C (1-based) or full label match
-                    pick = str(params.get("bf_choice")).strip()
-                    if pick.lower() in {"a","b","c","d","e","f","g"}:
-                        idx = "abcdefg".index(pick.lower())
-                        if 0 <= idx < len(bf_opts):
-                            params["bf_choice_id"] = bf_opts[idx].get("id")
-                            params["bf_choice"] = bf_opts[idx].get("label")
-                    else:
-                        for opt in bf_opts:
-                            if opt.get("label","").strip().lower() == pick.lower():
-                                params["bf_choice_id"] = opt.get("id")
-                                params["bf_choice"]  = opt.get("label")
-                                break
+            if bf_opts:
+                # Letter picks
+                if pick in {"a","b","c","d","e","f","g"}:
+                    idx = "abcdefg".index(pick)
+                    if 0 <= idx < len(bf_opts):
+                        picked = bf_opts[idx]
+                else:
+                    # Keyword shortcuts
+                    if any(t in pick for t in ["pin", "shear"]):
+                        picked = next((o for o in bf_opts if "shear" in (o.get("label","").lower())), None)
+                    elif any(t in pick for t in ["slip", "clutch"]):
+                        picked = next((o for o in bf_opts if ("slip" in o.get("label","").lower()) or ("clutch" in o.get("label","").lower())), None)
+                    # Exact label match
+                    if not picked and pick:
+                        picked = next((o for o in bf_opts if o.get("label","").strip().lower() == pick), None)
 
-            # If bf_choice_id looks bogus, drop it
-            if "bf_choice_id" in params and not _looks_like_part_id(params.get("bf_choice_id")):
-                params.pop("bf_choice_id", None)
+                if picked:
+                    params["bf_choice_id"] = picked.get("id")
+                    params["bf_choice"]    = picked.get("label")
 
-            # If we *still* don't have a real id, drop the label so API will re-ask (fallback)
-            if "bf_choice_id" not in params:
-                params.pop("bf_choice", None)
+        # If id looks bogus, drop so API will re-ask
+        if "bf_choice_id" in params and not _looks_like_part_id(params.get("bf_choice_id")):
+            params.pop("bf_choice_id", None)
+        # If still no id, drop label too to force a clean re-ask
+        if "bf_choice_id" not in params:
+            params.pop("bf_choice", None)
 
-            # Normalize drive name if present
-            if "bf_drive" in params and "drive" not in params:
-                params["drive"] = params.pop("bf_drive")
-
-        # ===================== Disc Harrow (DH) =====================
-        has_dh = any(k.startswith("dh_") for k in params.keys()) or params.get("family") == "disc_harrow"
-        if has_dh:
-            params.setdefault("family", "disc_harrow")
-            params.pop("model", None)
-
-            # Normalize width alias -> dh_width_in
-            if "width" in params and "dh_width_in" not in params:
-                params["dh_width_in"] = str(params.pop("width")).strip()
-
-            # Spacing: move ID from alt keys to dh_spacing_id
-            if "dh_spacing_id" not in params:
-                for alt in ("dh_choice", "dh_spacing", "dh_spacing_choice"):
-                    val = params.get(alt)
-                    if isinstance(val, str) and re.match(r"^\d{6,}[A-Z]?$", val.strip()):
-                        params["dh_spacing_id"] = val.strip()
-                        break
-
-            # Blade shorthand -> API label
-            if "dh_blade" in params:
-                t = str(params["dh_blade"]).strip().lower()
-                if t in {"n", "notched"}:
-                    params["dh_blade"] = "Notched (N)"
-                elif t in {"c", "combo"}:
-                    params["dh_blade"] = "Combo (C)"
-
-        # ===================== Bale Spear =====================
-        has_bspear = (
-            "balespear_choice" in params
-            or ("model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BS"))
-            or "part_id" in params
-            or params.get("family") == "bale_spear"
-        )
-        if has_bspear:
-            params.setdefault("family", "bale_spear")
-            mdl = params.pop("model", None)  # avoid model short-circuit mid-flow
-            if "balespear_choice" not in params:
-                pid = params.get("part_id")
-                if isinstance(pid, str) and re.match(r"^\d{6,}[A-Z]?$", pid.strip()):
-                    params["balespear_choice"] = pid.strip()
-                elif isinstance(mdl, str) and mdl.strip():
-                    params["balespear_choice"] = mdl.strip().upper()
-
-        # ===================== Pallet Fork =====================
-        has_pf = (
-            "pf_choice" in params
-            or ("model" in params and isinstance(params["model"], str) and params["model"].upper().startswith(("PF", "PFW")))
-            or "part_id" in params
-            or params.get("family") == "pallet_fork"
-        )
-        if has_pf:
-            params.setdefault("family", "pallet_fork")
-            mdl = params.pop("model", None)
-            if "pf_choice" not in params:
-                pid = params.get("part_id")
-                if isinstance(pid, str) and re.match(r"^\d{6,}[A-Z]?$", pid.strip()):
-                    params["pf_choice"] = pid.strip()
-                elif isinstance(mdl, str) and mdl.strip():
-                    params["pf_choice"] = mdl.strip().upper()
-
-    except Exception as _e:
-        log.warning("param normalization skipped: %s", _e)
-
+    # -------- Call the API --------
     log.info("QUOTE CALL params=%s", json.dumps(params, ensure_ascii=False))
+    body, status, url = http_get("/quote", params)
 
-    # -------- HTTP call --------
-    body, status, used = http_get("/quote", params)
-
-    # -------- Log response shape --------
-    try:
-        if status == 200 and isinstance(body, dict):
-            rq = body.get("required_questions") or []
-            rq_names = [q.get("name") for q in rq]
-            log.info(
-                "QUOTE RESP status=%s mode=%s model=%s rq=%s",
-                status, body.get("mode"), body.get("model"), rq_names
-            )
-        else:
-            log.info("QUOTE RESP status=%s (non-json or error) body=%s", status, str(body)[:500])
-    except Exception as e:
-        log.warning("QUOTE RESP log error: %s", e)
-
-    # -------- Persist last options (labels+ids) for mapping next turn --------
-    try:
-        if sess and status == 200 and isinstance(body, dict) and (body.get("mode") or "").lower() == "questions":
-            rq = body.get("required_questions") or []
-            last_opts = {}
-            for q in rq:
-                opts = q.get("choices_with_ids")
-                if isinstance(opts, list) and opts and all(isinstance(x, dict) for x in opts):
-                    row = []
-                    for x in opts:
-                        lab = (x.get("label") or "").strip()
-                        _id = (x.get("id") or "").strip()
-                        if lab and _id:
-                            row.append({"label": lab, "id": _id})
-                    if row:
-                        last_opts[q.get("name")] = row
-            if last_opts:
-                ans = qc.get("answers") or {}
-                ans["_last_options"] = last_opts
-                qc["answers"] = ans
-                sess["quote_ctx"] = qc
-    except Exception as e:
-        log.warning("failed to persist last options: %s", e)
-
-    # -------- Error safeguard: auto-reset after 2 consecutive errors --------
-    try:
-        is_api_error = (
-            status >= 400
-            or not isinstance(body, dict)
-            or (isinstance(body, dict) and str(body.get("mode") or "").lower() == "error")
-        )
-        if sess is not None:
-            if is_api_error:
-                sess["err_count"] = int(sess.get("err_count", 0)) + 1
-                log.warning("QUOTE ERROR #%d for dealer %s", sess["err_count"], dealer_number)
-
-                if sess["err_count"] >= 2:
-                    dealer_snapshot = sess.get("dealer")
-                    log.error("AUTO RESET after 2 errors (dealer %s). Clearing session state.", dealer_number)
-
-                    # wipe conversation/history so planner doesn't keep reusing bad state
-                    try:
-                        if isinstance(sess.get("messages"), list):
-                            sess["messages"].clear()
-                    except Exception:
-                        pass
-
-                    # wipe in-progress quote state
-                    sess["quote_ctx"] = {"family": None, "answers": {}}
-
-                    # clear other sticky crumbs
-                    for k in ("last_family", "last_model"):
-                        if k in sess:
-                            sess.pop(k, None)
-
-                    # keep dealer badge
-                    sess["dealer"] = dealer_snapshot
-                    sess["err_count"] = 0  # reset the counter so we don't loop resets
-
-                    # Return a user-friendly reset notice as a normal 200 response
-                    body = {
-                        "mode": "error",
-                        "message": ("There was a system error while retrieving data. I've reset this session so we can start fresh. "
-                                    "Please tell me the family or model you’d like to quote."),
-                        "_auto_reset": True,
-                    }
-                    status = 200
-            else:
-                # Any successful JSON response clears the error streak
-                sess["err_count"] = 0
-    except Exception as e:
-        log.warning("error safeguard handling failed: %s", e)
-
-    # -------- Persist answers for next turn; clear when quote completes --------
-    try:
-        if sess and status == 200 and isinstance(body, dict):
-            mode = body.get("mode")
-            # Save concrete values used this turn (exclude boilerplate)
-            for k, v in params.items():
-                if k not in {"dealer_number"}:
-                    # don't re-store family/model here; we manage family in qc["family"], and model via _model_first
-                    if k not in {"family", "model"}:
-                        qc["answers"][k] = v
-
-            if mode == "quote":
-                # Quote finished: reset flow memory (dealer is remembered elsewhere)
-                sess["quote_ctx"] = {"family": None, "answers": {}}
-    except Exception as e:
-        log.warning("quote_ctx persist/clear failed: %s", e)
-
-    # -------- Enforce cash discount totals (unchanged) --------
-    try:
-        if status == 200 and isinstance(body, dict):
-            summary = body.get("summary", {}) or {}
-            list_total = float(summary.get("subtotal_list", 0) or 0)
-            dealer_net = float(summary.get("total", 0) or 0)
-
-            dealer_discount = None
-            if sess:
-                try:
-                    dealer_discount = float(sess.get("dealer", {}).get("discount"))
-                except Exception:
-                    pass
-
-            if list_total > 0 and dealer_net > 0 and dealer_discount is not None:
-                dealer_discount_amt = list_total - dealer_net
-                cash_discount_pct = 0.05 if abs(dealer_discount - 0.05) < 1e-9 else 0.12
-                cash_discount_amt = dealer_net * cash_discount_pct
-                final_net = dealer_net - cash_discount_amt
-
-                body["_enforced_totals"] = {
-                    "list_price_total": round(list_total, 2),
-                    "dealer_discount_total": round(dealer_discount_amt, 2),
-                    "cash_discount_total": round(cash_discount_amt, 2),
-                    "final_net": round(final_net, 2),
+    # -------- Error tracking + auto-reset after 2 errors --------
+    is_errorish = (
+        status >= 400
+        or (isinstance(body, dict) and (body.get("mode") == "error" or body.get("found") is False))
+        or not isinstance(body, dict)
+    )
+    if is_errorish:
+        sess["err_count"] = int(sess.get("err_count") or 0) + 1
+        log.warning("QUOTE ERROR #%s for dealer %s", sess["err_count"], (sess.get("dealer") or {}).get("dealer_number"))
+        if sess["err_count"] >= 2:
+            # Preserve dealer, wipe the rest
+            dealer_keep = sess.get("dealer")
+            SESS[sid] = {
+                "messages": [],
+                "dealer": dealer_keep,
+                "updated_at": time.time(),
+                "quote_ctx": {"family": None, "answers": {}},
+                "err_count": 0,
+            }
+            log.error("AUTO RESET after 2 errors (dealer %s). Clearing session state.", (dealer_keep or {}).get("dealer_number"))
+            return {
+                "ok": True,
+                "body": {
+                    "_auto_reset": True,
+                    "message": "There was a system error while retrieving data. I've reset this session so we can start fresh. Please tell me the family or model you’d like to quote.",
                 }
-                log.info("ENFORCED TOTALS %s: %s", dealer_number, json.dumps(body["_enforced_totals"]))
-    except Exception as e:
-        log.warning("Failed to inject _enforced_totals: %s", e)
+            }
+    else:
+        # Successful call resets error counter
+        sess["err_count"] = 0
 
-    return {"ok": status == 200, "status": status, "url": used, "body": body}
+    # -------- Stash choices_with_ids so the next turn can resolve letters/keywords --------
+    try:
+        if isinstance(body, dict) and body.get("mode") == "questions":
+            rq = body.get("required_questions") or []
+            last_options: Dict[str, Any] = {}
+            for q in rq:
+                nm = q.get("name")
+                cids = q.get("choices_with_ids")
+                if nm and cids:
+                    last_options.setdefault(nm, [])
+                    for opt in cids:
+                        # keep only id + label to keep memory light
+                        last_options[nm].append({"label": opt.get("label"), "id": opt.get("id")})
+            if last_options:
+                qc["answers"]["_last_options"] = last_options
+        elif isinstance(body, dict) and body.get("mode") == "quote":
+            # Clear last_options after a finished quote
+            qc["answers"].pop("_last_options", None)
+    except Exception:
+        pass
+
+    return {"ok": (status == 200), "body": body, "status": status, "url": url}
 
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
     body, status, used = http_get("/health", {})
@@ -1001,7 +813,6 @@ def chat():
         sess["updated_at"] = now
         # Ensure quote_ctx exists (per-quote "notebook")
         sess.setdefault("quote_ctx", {"family": None, "answers": {}})
-        # ✅ NEW: per-session consecutive error counter used by tool_woods_quote
         sess.setdefault("err_count", 0)
 
         # ---------- Build conversation (system → history) ----------
@@ -1029,8 +840,8 @@ def chat():
             for m in reversed(convo):
                 if m.get("role") == "tool" and m.get("name") == "woods_dealer_discount":
                     try:
-                        payload = json.loads(m.get("content") or "{}")
-                        b = payload.get("body") or {}
+                        payload2 = json.loads(m.get("content") or "{}")
+                        b = payload2.get("body") or {}
                         dn = b.get("dealer_number") or b.get("number")
                         if dn:
                             dealer_num = str(dn)
@@ -1045,8 +856,7 @@ def chat():
         if dealer_num and (model or family_slug):
             args = {"dealer_number": dealer_num}
             if model:
-                # allow first-call model; tool_woods_quote will drop it mid-flow if needed
-                args["model"] = model
+                args["model"] = model   # allow first-call model; quote tool will drop it mid-flow if needed
             if family_slug:
                 args["family"] = family_slug
 
@@ -1055,9 +865,27 @@ def chat():
                 log.info("Skip /quote: only dealer_number present (auto-trigger)")
             else:
                 res = tool_woods_quote(args)
+
+                # ---- EARLY RETURN if tool requested an auto-reset ----
+                if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
+                    try:
+                        sess["messages"] = []
+                        sess["quote_ctx"] = {"family": None, "answers": {}}
+                        sess["err_count"] = 0
+                    except Exception:
+                        pass
+                    dealer_badge = sess.get("dealer") or {}
+                    return jsonify({
+                        "reply": res["body"]["message"],
+                        "dealer": {
+                            "dealer_number": dealer_badge.get("dealer_number"),
+                            "dealer_name": dealer_badge.get("dealer_name"),
+                        }
+                    })
+
                 add_tool_exchange(convo, "woods_quote", args, res)
 
-        # ---------- Handle follow-up (e.g., "15", "A", etc.) ----------
+        # ---------- Handle follow-up (e.g., "15", "A", "pin", etc.) ----------
         elif dealer_num:
             args = {"dealer_number": dealer_num}
 
@@ -1071,6 +899,24 @@ def chat():
                 log.info("Skip /quote: only dealer_number present (follow-up)")
             else:
                 res = tool_woods_quote(args)
+
+                # ---- EARLY RETURN if tool requested an auto-reset ----
+                if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
+                    try:
+                        sess["messages"] = []
+                        sess["quote_ctx"] = {"family": None, "answers": {}}
+                        sess["err_count"] = 0
+                    except Exception:
+                        pass
+                    dealer_badge = sess.get("dealer") or {}
+                    return jsonify({
+                        "reply": res["body"]["message"],
+                        "dealer": {
+                            "dealer_number": dealer_badge.get("dealer_number"),
+                            "dealer_name": dealer_badge.get("dealer_name"),
+                        }
+                    })
+
                 add_tool_exchange(convo, "woods_quote", args, res)
 
         # ---------- Append user and run planner ----------
