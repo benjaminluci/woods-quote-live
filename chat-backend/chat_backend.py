@@ -522,12 +522,13 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
             sess = s
             break
 
-    # Simple quote_ctx shape: only for the current, in-progress quote
+    # Ensure session containers
     if sess is not None:
         qc = sess.setdefault("quote_ctx", {"family": None, "answers": {}})
         if not isinstance(qc, dict) or "family" not in qc or "answers" not in qc:
             qc = {"family": None, "answers": {}}
             sess["quote_ctx"] = qc
+        sess.setdefault("err_count", 0)
     else:
         qc = {"family": None, "answers": {}}
 
@@ -540,6 +541,10 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         elif not qc["family"]:
             qc["family"] = params["family"]
 
+    # If this is a model-first start, remember it for THIS quote only
+    if "model" in params and not qc["answers"].get("_model_first") and not params.get("family"):
+        qc["answers"]["_model_first"] = params["model"]
+
     # -------- Merge: dealer + family + prior answers + incoming (incoming overrides) --------
     merged = {"dealer_number": dealer_number}
     if qc["family"]:
@@ -548,20 +553,29 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in params.items():
         if k != "dealer_number":
             merged[k] = v
+
+    # If we began model-first in this quote and caller didn't send model now (and not in a family flow),
+    # keep including the model until the quote completes.
+    if merged.get("_model_first") and "model" not in merged and not merged.get("family"):
+        merged["model"] = merged["_model_first"]
+
+    # Remove internal crumb before calling API
+    merged.pop("_model_first", None)
+
     params = {k: v for k, v in merged.items() if v not in (None, "")}
 
-    # -------- Family-agnostic Q&A guard: drop model if we’re clearly mid-questions --------
+    # -------- Family-agnostic Q&A guard: drop model only for FAMILY flows mid-questions --------
     QUESTION_KEYS = {
         "width", "width_ft", "width_in", "quantity", "part_id", "accessory_id", "choice_id",
         # BrushBull
-        "bb_shielding","bb_tailwheel",
+        "bb_shielding","bb_tailwheel","bb_duty",
         # Batwing / TBW
         "bw_duty","bw_driveline","bw_tire_qty","shielding_rows","deck_rings",
         "tbw_duty","front_rollers","chains",
         # Dual Spindle
         "ds_mount","ds_shielding","ds_driveline","tire_id","tire_qty",
         # Disc Harrow
-        "dh_width_in","dh_duty","dh_spacing_id",
+        "dh_width_in","dh_duty","dh_spacing_id","dh_blade",
         # Box / Grading Scrapers
         "bs_width_in","bs_duty","bs_choice_id",
         "gs_width_in","gs_choice_id",
@@ -577,67 +591,69 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         "finish_choice","rollers",
         # PF / Bale Spear / misc
         "pf_choice","balespear_choice","hydraulics_id",
-        # BrushFighter (added)
+        # BrushFighter
         "bf_choice","bf_choice_id","drive","bf_drive",
     }
     if "model" in params and any(k in params for k in QUESTION_KEYS):
-        params.pop("model", None)
+        # Only drop model if we are clearly in a family-driven Q&A.
+        if params.get("family"):
+            params.pop("model", None)
+        # else keep model (model-first path)
 
     # -------- Family-specific param normalization --------
     try:
         import re
 
         # ===================== BrushFighter (BF) =====================
-        has_bf_flow = (
+        has_bf = (
             params.get("family") == "brushfighter"
             or "bf_choice" in params
             or "bf_choice_id" in params
             or ("model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BF"))
         )
-        if has_bf_flow:
+        if has_bf:
             params.setdefault("family", "brushfighter")
             # avoid model short-circuit mid-flow
             params.pop("model", None)
 
-            # Helper: A/B/C or 4/5/6 or "5 ft" -> "4"/"5"/"6"
             def _pick_to_ft(v):
                 if v is None: return None
                 s = str(v).strip().lower()
-                if s in {"a","b","c"}:
+                if s in {"a","b","c"}:  # A/B/C → 4/5/6
                     return {"a":"4","b":"5","c":"6"}[s]
-                m = re.match(r"^\s*(\d{1,2})(?:\s*ft)?\s*$", s)
+                m = re.match(r"^\s*(\d{1,2})(?:\s*ft)?\s*$", s)  # "5", "5 ft", "6ft"
                 return m.group(1) if m else None
 
-            # Helper: does it look like a real part id (e.g., 639920A, BF..., 6+ alnum)
             def _looks_like_part_id(x):
                 if x is None: return False
                 s = str(x).strip()
                 if len(s) <= 3: return False
-                return bool(re.match(r"^(BF|[A-Za-z0-9]{5,})", s))
+                return bool(re.match(r"^(BF|[A-Za-z0-9]{5,})", s))  # e.g., 639920A, BF...
 
-            # Step 1: first question expects width_ft
+            # First step expects width_ft; map letter/number to width_ft
             if "width_ft" not in params:
                 wf = _pick_to_ft(params.get("bf_choice")) or _pick_to_ft(params.get("bf_choice_id")) or _pick_to_ft(params.get("width"))
                 if wf:
                     params["width_ft"] = wf
-                    # prevent misinterpreting "5" as a part id
-                    params.pop("bf_choice", None)
-                    params.pop("bf_choice_id", None)
 
-            # Step 2: only pass bf_choice_id if it looks like a real id
+            # Only pass a REAL bf_choice_id; otherwise drop it
             if "bf_choice_id" in params and not _looks_like_part_id(params.get("bf_choice_id")):
                 params.pop("bf_choice_id", None)
 
-            # Normalize drive key
+            # If we don't (yet) have a real choice id, drop the label too so API must ask (shear/slip)
+            if "bf_choice_id" not in params:
+                params.pop("bf_choice", None)
+
+            # Normalize drive name
             if "bf_drive" in params and "drive" not in params:
                 params["drive"] = params["bf_drive"]
+                params.pop("bf_drive", None)
 
         # ===================== Disc Harrow =====================
         has_dh = any(k.startswith("dh_") for k in params.keys()) or params.get("family") == "disc_harrow"
         if has_dh:
-            # Mid-flow: the API expects param questions, not a model guess
-            params.pop("model", None)
             params.setdefault("family", "disc_harrow")
+            params.pop("model", None)
 
             # Normalize width alias -> dh_width_in
             if "width" in params and "dh_width_in" not in params:
@@ -660,16 +676,15 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                     params["dh_blade"] = "Combo (C)"
 
         # ===================== Bale Spear =====================
-        has_bs_flow = (
+        has_bspear = (
             "balespear_choice" in params
             or ("model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BS"))
             or "part_id" in params
             or params.get("family") == "bale_spear"
         )
-        if has_bs_flow:
+        if has_bspear:
             params.setdefault("family", "bale_spear")
             mdl = params.pop("model", None)  # avoid model short-circuit mid-flow
-
             if "balespear_choice" not in params:
                 pid = params.get("part_id")
                 if isinstance(pid, str) and re.match(r"^\d{6,}[A-Z]?$", pid.strip()):
@@ -678,16 +693,15 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                     params["balespear_choice"] = mdl.strip().upper()
 
         # ===================== Pallet Fork =====================
-        has_pf_flow = (
+        has_pf = (
             "pf_choice" in params
             or ("model" in params and isinstance(params["model"], str) and params["model"].upper().startswith(("PF", "PFW")))
             or "part_id" in params
             or params.get("family") == "pallet_fork"
         )
-        if has_pf_flow:
+        if has_pf:
             params.setdefault("family", "pallet_fork")
-            mdl = params.pop("model", None)  # avoid model short-circuit mid-flow
-
+            mdl = params.pop("model", None)
             if "pf_choice" not in params:
                 pid = params.get("part_id")
                 if isinstance(pid, str) and re.match(r"^\d{6,}[A-Z]?$", pid.strip()):
@@ -717,14 +731,66 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.warning("QUOTE RESP log error: %s", e)
 
+    # -------- Error safeguard: auto-reset after 2 consecutive errors --------
+    try:
+        is_api_error = (
+            status >= 400
+            or not isinstance(body, dict)
+            or (isinstance(body, dict) and str(body.get("mode") or "").lower() == "error")
+        )
+        if sess is not None:
+            if is_api_error:
+                sess["err_count"] = int(sess.get("err_count", 0)) + 1
+                log.warning("QUOTE ERROR #%d for dealer %s", sess["err_count"], dealer_number)
+
+                if sess["err_count"] >= 2:
+                    dealer_snapshot = sess.get("dealer")
+                    log.error("AUTO RESET after 2 errors (dealer %s). Clearing session state.", dealer_number)
+
+                    # wipe conversation/history so planner doesn't keep reusing bad state
+                    try:
+                        if isinstance(sess.get("messages"), list):
+                            sess["messages"].clear()
+                    except Exception:
+                        pass
+
+                    # wipe in-progress quote state
+                    sess["quote_ctx"] = {"family": None, "answers": {}}
+
+                    # clear other sticky crumbs
+                    for k in ("last_family", "last_model"):
+                        if k in sess:
+                            sess.pop(k, None)
+
+                    # keep dealer badge
+                    sess["dealer"] = dealer_snapshot
+                    sess["err_count"] = 0  # reset the counter so we don't loop resets
+
+                    # Return a user-friendly reset notice as a normal 200 response
+                    body = {
+                        "mode": "error",
+                        "message": ("There was a system error while retrieving data. I've reset this session so we can start fresh. "
+                                    "Please tell me the family or model you’d like to quote."),
+                        "_auto_reset": True,
+                    }
+                    status = 200
+            else:
+                # Any successful JSON response clears the error streak
+                sess["err_count"] = 0
+    except Exception as e:
+        log.warning("error safeguard handling failed: %s", e)
+
     # -------- Persist answers for next turn; clear when quote completes --------
     try:
         if sess and status == 200 and isinstance(body, dict):
             mode = body.get("mode")
             # Save concrete values used this turn (exclude boilerplate)
             for k, v in params.items():
-                if k not in {"dealer_number", "family", "model"}:
-                    qc["answers"][k] = v
+                if k not in {"dealer_number"}:
+                    # don't re-store family/model here; we manage family in qc["family"], and model via _model_first
+                    if k not in {"family", "model"}:
+                        qc["answers"][k] = v
+
             if mode == "quote":
                 # Quote finished: reset flow memory (dealer is remembered elsewhere)
                 sess["quote_ctx"] = {"family": None, "answers": {}}
@@ -762,7 +828,6 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         log.warning("Failed to inject _enforced_totals: %s", e)
 
     return {"ok": status == 200, "status": status, "url": used, "body": body}
-
 
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
     body, status, used = http_get("/health", {})
@@ -893,6 +958,8 @@ def chat():
         sess["updated_at"] = now
         # Ensure quote_ctx exists (per-quote "notebook")
         sess.setdefault("quote_ctx", {"family": None, "answers": {}})
+        # ✅ NEW: per-session consecutive error counter used by tool_woods_quote
+        sess.setdefault("err_count", 0)
 
         # ---------- Build conversation (system → history) ----------
         convo: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
