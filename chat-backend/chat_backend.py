@@ -493,13 +493,14 @@ def tool_woods_dealer_discount(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Calls /quote with sanitized params, logs request/response, and injects `_enforced_totals`
-    computed from API summary (dealer net already applied by API).
+    Calls /quote with sanitized params, logs request/response, and injects `_enforced_totals`.
+    Adds a small per-session quote context so we always resend all known answers each turn,
+    and avoids stale `model` pollution during Q&A.
     """
     # -------- Build params (strip empty) --------
     params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
 
-    # -------- Inject last-known family/model if missing --------
+    # -------- Resolve session for this dealer + ensure quote_ctx --------
     dealer_number = str(params.get("dealer_number") or "")
     sess = None
     for s in SESS.values():
@@ -508,13 +509,55 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
             sess = s
             break
 
-    if sess:
-        if "family" not in params and sess.get("last_family"):
-            params["family"] = sess["last_family"]
-        if "model" not in params and sess.get("last_model"):
-            params["model"] = sess["last_model"]
+    # Simple quote_ctx shape: only for the current, in-progress quote
+    if sess is not None:
+        qc = sess.setdefault("quote_ctx", {"family": None, "answers": {}})
+        if not isinstance(qc, dict) or "family" not in qc or "answers" not in qc:
+            qc = {"family": None, "answers": {}}
+            sess["quote_ctx"] = qc
+    else:
+        qc = {"family": None, "answers": {}}
 
-    # -------- Family-specific param normalization --------
+    # -------- Lock/track family in this flow (do NOT persist across quotes) --------
+    if params.get("family"):
+        if qc["family"] and qc["family"] != params["family"]:
+            # Switching families mid-flow: reset flow memory
+            qc["family"] = params["family"]
+            qc["answers"] = {}
+        elif not qc["family"]:
+            qc["family"] = params["family"]
+
+    # -------- Merge: dealer + family + prior answers + incoming (incoming overrides) --------
+    merged = {"dealer_number": dealer_number}
+    if qc["family"]:
+        merged["family"] = qc["family"]
+    merged.update(qc.get("answers", {}))
+    for k, v in params.items():
+        if k != "dealer_number":
+            merged[k] = v
+    params = {k: v for k, v in merged.items() if v not in (None, "")}
+
+    # -------- Family-agnostic Q&A guard: drop model if we’re clearly mid-questions --------
+    QUESTION_KEYS = {
+        "width", "width_ft", "width_in", "quantity", "part_id", "accessory_id", "choice_id",
+        "bb_shielding","bb_tailwheel",
+        "bw_duty","bw_driveline","bw_tire_qty","shielding_rows","deck_rings",
+        "tbw_duty","front_rollers","chains",
+        "ds_mount","ds_shielding","ds_driveline","tire_id","tire_qty",
+        "dh_width_in","dh_duty","dh_spacing_id",
+        "bs_width_in","bs_duty","bs_choice_id",
+        "gs_width_in","gs_choice_id",
+        "lrs_width_in","lrs_grade","lrs_choice_id",
+        "rb_width_in","rb_duty","rb_choice_id",
+        "pd_model","auger_id",
+        "tiller_series","tiller_width_in","tiller_rotation","tiller_choice_id",
+        "finish_choice","rollers",
+        "pf_choice","balespear_choice","hydraulics_id",
+    }
+    if "model" in params and any(k in params for k in QUESTION_KEYS):
+        params.pop("model", None)
+
+    # -------- Family-specific param normalization (keep your existing logic) --------
     try:
         import re
 
@@ -554,20 +597,14 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         )
         if has_bs_flow:
             params.setdefault("family", "bale_spear")
-            # Do not let a model short-circuit the question flow
-            mdl = params.pop("model", None)
+            mdl = params.pop("model", None)  # avoid model short-circuit mid-flow
 
-            # Ensure the answer is under the expected question field
             if "balespear_choice" not in params:
-                # Prefer a part ID if present (e.g., 1037171 / 1037798)
                 pid = params.get("part_id")
                 if isinstance(pid, str) and re.match(r"^\d{6,}[A-Z]?$", pid.strip()):
                     params["balespear_choice"] = pid.strip()
                 elif isinstance(mdl, str) and mdl.strip():
-                    # Some backends accept the model token as the choice value
                     params["balespear_choice"] = mdl.strip().upper()
-                # (Optionally) drop part_id if your API is strict:
-                # params.pop("part_id", None)
 
         # ===================== Pallet Fork =====================
         has_pf_flow = (
@@ -581,15 +618,11 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
             mdl = params.pop("model", None)  # avoid model short-circuit mid-flow
 
             if "pf_choice" not in params:
-                # Prefer a part ID if present (e.g., 1037171)
                 pid = params.get("part_id")
                 if isinstance(pid, str) and re.match(r"^\d{6,}[A-Z]?$", pid.strip()):
                     params["pf_choice"] = pid.strip()
                 elif isinstance(mdl, str) and mdl.strip():
-                    # Fall back to the model token if given (common from LLM)
                     params["pf_choice"] = mdl.strip().upper()
-                # (Optionally) drop part_id if your API is strict:
-                # params.pop("part_id", None)
 
     except Exception as _e:
         log.warning("param normalization skipped: %s", _e)
@@ -613,7 +646,21 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.warning("QUOTE RESP log error: %s", e)
 
-    # -------- Enforce cash discount --------
+    # -------- Persist answers for next turn; clear when quote completes --------
+    try:
+        if sess and status == 200 and isinstance(body, dict):
+            mode = body.get("mode")
+            # Save concrete values used this turn (exclude boilerplate)
+            for k, v in params.items():
+                if k not in {"dealer_number", "family", "model"}:
+                    qc["answers"][k] = v
+            if mode == "quote":
+                # Quote finished: reset flow memory (dealer is remembered elsewhere)
+                sess["quote_ctx"] = {"family": None, "answers": {}}
+    except Exception as e:
+        log.warning("quote_ctx persist/clear failed: %s", e)
+
+    # -------- Enforce cash discount (unchanged) --------
     try:
         if status == 200 and isinstance(body, dict):
             summary = body.get("summary", {}) or {}
@@ -773,6 +820,8 @@ def chat():
 
         sess = SESS.setdefault(sid, {"messages": [], "dealer": None, "updated_at": now})
         sess["updated_at"] = now
+        # Ensure quote_ctx exists (per-quote "notebook")
+        sess.setdefault("quote_ctx", {"family": None, "answers": {}})
 
         # ---------- Build conversation (system → history) ----------
         convo: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -808,35 +857,40 @@ def chat():
                     except Exception:
                         pass
 
-        # ---------- Auto-trigger: model OR family ----------
+        # ---------- Auto-trigger: model OR family in user message ----------
         model = detect_model(user_message)
         family_slug = detect_family_slug(user_message) if not model else None
 
         if dealer_num and (model or family_slug):
             args = {"dealer_number": dealer_num}
             if model:
+                # allow first-call model; tool_woods_quote will drop it mid-flow if needed
                 args["model"] = model
-                sess["last_model"] = model
             if family_slug:
                 args["family"] = family_slug
-                sess["last_family"] = family_slug
 
-            res = tool_woods_quote(args)
-            add_tool_exchange(convo, "woods_quote", args, res)
+            # If only dealer_number somehow, skip preflight
+            if set(args.keys()) == {"dealer_number"}:
+                log.info("Skip /quote: only dealer_number present (auto-trigger)")
+            else:
+                res = tool_woods_quote(args)
+                add_tool_exchange(convo, "woods_quote", args, res)
 
         # ---------- Handle follow-up (e.g., "15", "A", etc.) ----------
         elif dealer_num:
             args = {"dealer_number": dealer_num}
 
-            # Restore model/family if they existed from earlier
-            if sess.get("last_model"):
-                args["model"] = sess["last_model"]
-            if sess.get("last_family"):
-                args["family"] = sess["last_family"]
+            # Prefer active quote_ctx (family set there)
+            qc = sess.get("quote_ctx") or {}
+            if qc.get("family"):
+                args["family"] = qc["family"]
 
-            # Let OpenAI decide rest via planner; but restore context here
-            res = tool_woods_quote(args)
-            add_tool_exchange(convo, "woods_quote", args, res)
+            # If we only have dealer_number, don't ping /quote yet — let the planner ask next
+            if set(args.keys()) == {"dealer_number"}:
+                log.info("Skip /quote: only dealer_number present (follow-up)")
+            else:
+                res = tool_woods_quote(args)
+                add_tool_exchange(convo, "woods_quote", args, res)
 
         # ---------- Append user and run planner ----------
         convo.append({"role": "user", "content": user_message})
