@@ -508,93 +508,14 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     """
     Calls /quote with sanitized params, logs request/response, and injects `_enforced_totals`
     computed from API summary (dealer net already applied by API).
+
+    Also normalizes menu-style families that expect *_choice_id instead of bare part_id.
     """
-    import re  # <-- ensure regex is available everywhere in this function
+    import json
+    import re
 
     # -------- Build params (strip empty) --------
     params = {k: v for k, v in (args or {}).items() if v not in (None, "")}
-
-    # -------- Menu-family guard (pallet_fork / bale_spear / quick_hitch) --------
-    try:
-        fam = str(params.get("family") or "").strip().lower()
-        MENU_FAMILIES = {"pallet_fork", "bale_spear", "quick_hitch"}
-        FAMILY_PREFIX = {
-            "pallet_fork": "pf",
-            "bale_spear": "balespear",
-            "quick_hitch": "qh",
-        }
-
-        # (A) If explicit family is set and it's a menu family, normalize keys and drop model
-        if fam in MENU_FAMILIES:
-            prefix = FAMILY_PREFIX[fam]
-            choice_id_key = f"{prefix}_choice_id"
-            choice_label_key = f"{prefix}_choice"
-
-            # Promote generic IDs -> <prefix>_choice_id
-            if choice_id_key not in params:
-                for alt in ("choice_id", "part_id", "part_no", f"{prefix}_id"):
-                    if params.get(alt):
-                        params[choice_id_key] = str(params[alt]).strip()
-                        break
-
-            # Promote generic labels -> <prefix>_choice
-            if choice_label_key not in params:
-                for alt in ("choice", "choice_label"):
-                    if params.get(alt):
-                        params[choice_label_key] = str(params[alt]).strip()
-                        break
-
-            # If we have a choice id/label, do not send model during menu flow
-            if params.get(choice_id_key) or params.get(choice_label_key):
-                params.pop("model", None)
-
-        # (B) If family is missing, try to infer it from scoped keys or part_id heuristic
-        else:
-            # 1) Keys themselves declare the family
-            key_to_family = [
-                ("pf_choice_id", "pallet_fork"),
-                ("pf_choice", "pallet_fork"),
-                ("balespear_choice_id", "bale_spear"),
-                ("balespear_choice", "bale_spear"),
-                ("qh_choice_id", "quick_hitch"),
-                ("qh_choice", "quick_hitch"),
-            ]
-            inferred_family = None
-            for k, fam_name in key_to_family:
-                if k in params:
-                    inferred_family = fam_name
-                    break
-
-            # 2) Bare part_id heuristic based on the ID ranges seen in your logs
-            if not inferred_family and "part_id" in params:
-                pid = str(params.get("part_id") or "").strip()
-                # Pallet fork examples: 640020..640024
-                if re.match(r"^64\d{4}$", pid):
-                    inferred_family = "pallet_fork"
-                    params["pf_choice_id"] = pid
-                # Bale spear example: 1037170
-                elif re.match(r"^103\d{4,}$", pid):
-                    inferred_family = "bale_spear"
-                    params["balespear_choice_id"] = pid
-
-            if inferred_family:
-                params["family"] = inferred_family
-                # Also remove model in menu flows once we have a choice id/label
-                if inferred_family in MENU_FAMILIES:
-                    params.pop("model", None)
-
-            # Finally, if we still only have a generic label, try to map it
-            fam2prefix = FAMILY_PREFIX
-            for fam_name, prefix in fam2prefix.items():
-                choice_id_key = f"{prefix}_choice_id"
-                choice_label_key = f"{prefix}_choice"
-                if choice_label_key in params and "family" not in params:
-                    params["family"] = fam_name
-                    params.pop("model", None)
-                    break
-
-    except Exception as _e:
-        log.warning("menu-family normalization skipped: %s", _e)
 
     # -------- Disc Harrow: param normalization (surgical, safe) --------
     try:
@@ -632,7 +553,43 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as _e:
         log.warning("disc harrow normalization skipped: %s", _e)
 
-    # -------- Log request --------
+    # -------- Menu families: map part_id -> *_choice_id (pallet forks, bale spears) --------
+    try:
+        # Families where /quote expects a *_choice_id (not bare part_id)
+        MENU_FAMILIES = {
+            "pallet_fork": "pf_choice_id",
+            "bale_spear": "balespear_choice_id",
+        }
+
+        # If family is missing but user sent a part_id from a menu, infer family (heuristics from your logs)
+        if "family" not in params and "part_id" in params:
+            pid = str(params["part_id"]).strip()
+            if re.fullmatch(r"64\d{3}", pid):         # e.g., 640023 → Pallet Fork
+                params["family"] = "pallet_fork"
+            elif re.fullmatch(r"1037\d{3}", pid):     # e.g., 1037170 → Bale Spear
+                params["family"] = "bale_spear"
+
+        fam = params.get("family")
+        if fam in MENU_FAMILIES and "part_id" in params:
+            # Move part_id into the correct *_choice_id slot
+            key = MENU_FAMILIES[fam]
+            if key not in params:
+                params[key] = str(params["part_id"]).strip()
+            # Optional: carry the human label if present under an alt key (no harm if missing)
+            # e.g., pf_choice / balespear_choice might hold the long label the UI selected
+            # but the API only requires *_choice_id to produce the quote.
+            # Remove raw part_id so the upstream doesn't choke on an unknown param
+            params.pop("part_id", None)
+
+    except Exception as _e:
+        log.warning("menu-family normalization skipped: %s", _e)
+
+    # -------- Log request (AFTER NORMALIZE) --------
+    try:
+        log.debug("AFTER NORMALIZE params=%s", json.dumps(params, ensure_ascii=False))
+    except Exception:
+        log.debug("AFTER NORMALIZE params=<unserializable>")
+
     log.info("QUOTE CALL params=%s", json.dumps(params, ensure_ascii=False))
 
     # -------- HTTP call --------
@@ -690,6 +647,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         log.warning("Failed to inject _enforced_totals: %s", e)
 
     return {"ok": status == 200, "status": status, "url": used, "body": body}
+
 
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
     body, status, used = http_get("/health", {})
