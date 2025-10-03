@@ -512,18 +512,26 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     try:
         import re
 
+        # ===================== Disc Harrow =====================
         has_dh = any(k.startswith("dh_") for k in params.keys())
         if has_dh:
+            # Mid-flow: the API expects param questions, not a model guess
             params.pop("model", None)
             params.setdefault("family", "disc_harrow")
+
+            # Normalize width alias -> dh_width_in
             if "width" in params and "dh_width_in" not in params:
                 params["dh_width_in"] = str(params.pop("width")).strip()
+
+            # Spacing: move ID from alt keys to dh_spacing_id
             if "dh_spacing_id" not in params:
                 for alt in ("dh_choice", "dh_spacing", "dh_spacing_choice"):
                     val = params.get(alt)
                     if isinstance(val, str) and re.match(r"^\d{6,}[A-Z]?$", val.strip()):
                         params["dh_spacing_id"] = val.strip()
                         break
+
+            # Blade shorthand -> API label
             if "dh_blade" in params:
                 t = str(params["dh_blade"]).strip().lower()
                 if t in {"n", "notched"}:
@@ -531,18 +539,52 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                 elif t in {"c", "combo"}:
                     params["dh_blade"] = "Combo (C)"
 
+        # ===================== Bale Spear =====================
         has_bs_flow = (
             "balespear_choice" in params
             or ("model" in params and isinstance(params["model"], str) and params["model"].upper().startswith("BS"))
             or "part_id" in params
+            or params.get("family") == "bale_spear"
         )
         if has_bs_flow:
             params.setdefault("family", "bale_spear")
-            params.pop("model", None)
+            # Do not let a model short-circuit the question flow
+            mdl = params.pop("model", None)
+
+            # Ensure the answer is under the expected question field
             if "balespear_choice" not in params:
+                # Prefer a part ID if present (e.g., 1037171 / 1037798)
                 pid = params.get("part_id")
                 if isinstance(pid, str) and re.match(r"^\d{6,}[A-Z]?$", pid.strip()):
                     params["balespear_choice"] = pid.strip()
+                elif isinstance(mdl, str) and mdl.strip():
+                    # Some backends accept the model token as the choice value
+                    params["balespear_choice"] = mdl.strip().upper()
+                # (Optionally) drop part_id if your API is strict:
+                # params.pop("part_id", None)
+
+        # ===================== Pallet Fork =====================
+        has_pf_flow = (
+            "pf_choice" in params
+            or ("model" in params and isinstance(params["model"], str) and params["model"].upper().startswith(("PF", "PFW")))
+            or "part_id" in params
+            or params.get("family") == "pallet_fork"
+        )
+        if has_pf_flow:
+            params.setdefault("family", "pallet_fork")
+            mdl = params.pop("model", None)  # avoid model short-circuit mid-flow
+
+            if "pf_choice" not in params:
+                # Prefer a part ID if present (e.g., 1037171)
+                pid = params.get("part_id")
+                if isinstance(pid, str) and re.match(r"^\d{6,}[A-Z]?$", pid.strip()):
+                    params["pf_choice"] = pid.strip()
+                elif isinstance(mdl, str) and mdl.strip():
+                    # Fall back to the model token if given (common from LLM)
+                    params["pf_choice"] = mdl.strip().upper()
+                # (Optionally) drop part_id if your API is strict:
+                # params.pop("part_id", None)
+
     except Exception as _e:
         log.warning("param normalization skipped: %s", _e)
 
@@ -596,6 +638,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         log.warning("Failed to inject _enforced_totals: %s", e)
 
     return {"ok": status == 200, "status": status, "url": used, "body": body}
+
 
 def tool_woods_health(args: Dict[str, Any]) -> Dict[str, Any]:
     body, status, used = http_get("/health", {})
