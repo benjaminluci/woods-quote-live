@@ -187,6 +187,7 @@ Correction Enforcement
 - Do not calculate Final Net by subtracting dealer discount only.
 - Final Net must subtract both dealer discount AND cash discount.
 - Use the exact value from `_enforced_totals.final_net`. Never recalculate.
+- If the user asks to clear session, clear all data aside from dealer number and restart
 """
 
 # (Optional helper synopsis for the model; harmless to include)
