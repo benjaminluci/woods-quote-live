@@ -112,6 +112,7 @@ Quote Output Format
     • Line 1: primary description, quantity, and list price
     • Optional Line 2: start with an em dash (—) and add concise details (model options, notes, requirements)
   - Do not insert blank lines between items.
+  - Do no insert part numbers
 
 - Separator line (shorter):
   ------------------------------
@@ -369,6 +370,29 @@ def _disambiguate_bs(text: str) -> str | None:
     if "box" in t or "blade" in t:
         return "box_scraper"
     return None
+
+def _sanitize_outgoing_params(params: dict) -> dict:
+    # Make a shallow copy so we don't mutate the original
+    out = dict(params)
+
+    # ---- Batwing: tire qty MUST be 'bw_tire_qty' (numeric), never 'bw_tire_qty_id'
+    if str(out.get("family", "")).lower() == "batwing":
+        if "bw_tire_qty_id" in out and "bw_tire_qty" not in out:
+            # Convert "6" or label text to int if possible
+            v = out.get("bw_tire_qty_id")
+            try:
+                import re
+                m = re.search(r"\d+", str(v))
+                if m:
+                    out["bw_tire_qty"] = int(m.group(0))
+            except Exception:
+                # if parsing fails, just pass through; API will re-ask
+                pass
+            # Always remove the *_id so we don't loop
+            out.pop("bw_tire_qty_id", None)
+
+    return out
+
 
 
 def detect_family_slug(text: str) -> str | None:
