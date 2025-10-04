@@ -509,14 +509,13 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     Quote helper that:
       - Remembers all params for the active quote (per-session).
       - Sends the full merged parameter set on every turn.
-      - Normalizes Disc Harrow fields.
-      - Normalizes menu families (pallet_fork, bale_spear, quick_hitch) and promotes choice → *_choice_id,
-        including when the user provides the raw ID itself.
-      - Accepts common *_id inputs (e.g., bw_tire_qty_id, dh_width_in_id) and maps them to the exact fields the API expects,
-        then removes the *_id keys to avoid confusing the API.
+      - TARGETED FIXES ONLY:
+          • Disc Harrow: promote dh_choice → dh_spacing_id (ID-looking values), allow label/letter→ID.
+          • Pallet Fork / Bale Spear: promote to *_choice_id, accept part_id directly.
+          • Limit generic choice→*_id promotion ONLY to the three families above, and NEVER for *_qty.
       - On family change, drops keys from prior families (no cross-contamination).
       - Clears per-quote memory on completion (keeps dealer info).
-      - Enforces cash discount totals for UI.
+      - Enforces cash discount totals for UI (unchanged).
     """
     import re
     from flask import request as _flask_req
@@ -571,12 +570,13 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
             "tiller": "tiller",
         }.get((fam or "").lower())
 
-    # Choice key overrides (API expects these specific id field names)
+    # Choice key overrides — scoped ONLY to Disc Harrow
     CHOICE_ID_KEY_OVERRIDES = {
         "dh_choice": "dh_spacing_id",  # Disc Harrow
     }
 
     MENU_FAMILIES = {"pallet_fork", "bale_spear", "quick_hitch"}
+    GENERIC_PROMOTION_FAMILIES = {"disc_harrow"} | MENU_FAMILIES  # <- scope generic mapping
 
     # ---------------- build params ----------------
     turn_params = _clean_params(args or {})
@@ -585,7 +585,6 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         or (_flask_req.get_json(silent=True) or {}).get("session_id")
     )
     sess_entry = SESS.setdefault(sid, {}) if sid else {}
-    # quote_ctx: per-quote state for this session
     qc = sess_entry.setdefault("quote_ctx", {"family": None, "answers": {}, "choice_map": {}})
 
     # Decide family
@@ -604,14 +603,14 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     if dealer_number:
         merged["dealer_number"] = dealer_number
 
-    # If we're still on the same family, include remembered answers first
+    # If still same family, include remembered answers first
     if fam and old_fam == fam and isinstance(old_answers, dict):
         for k, v in old_answers.items():
             if k == "dealer_number":
                 continue
             merged[k] = v
 
-    # Overlay current turn params (newest wins)
+    # Overlay current turn params
     for k, v in turn_params.items():
         merged[k] = v
 
@@ -627,123 +626,105 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
 
     # ---------------- family-specific normalization ----------------
 
-    # Disc Harrow normalization
+    # Disc Harrow normalization (ONLY DH)
     try:
         has_dh = any(k.startswith("dh_") for k in merged.keys())
         if fam_lower == "disc_harrow" or has_dh:
             merged.setdefault("family", "disc_harrow")
-
-            # (A) Accept both width aliases and normalize to dh_width_in (drop *_id)
-            if "dh_width_in_id" in merged and "dh_width_in" not in merged:
-                val = str(merged.pop("dh_width_in_id")).strip()
-                merged["dh_width_in"] = val
+            # width alias
             if "width" in merged and "dh_width_in" not in merged:
                 merged["dh_width_in"] = str(merged.pop("width")).strip()
-
-            # (B) Blade shorthand → compact code (N/C)
+            # blade shorthand
             if "dh_blade" in merged:
                 t = str(merged["dh_blade"]).strip().lower()
                 if t in {"n", "notched"}:
                     merged["dh_blade"] = "N"
                 elif t in {"c", "combo", "combination"}:
                     merged["dh_blade"] = "C"
-
-            # (C) If dh_choice looks like an ID, promote to dh_spacing_id and also set generic choice_id
+            # promote dh_choice → dh_spacing_id when ID-like
             if "dh_choice" in merged and "dh_spacing_id" not in merged:
                 val = str(merged.get("dh_choice") or "").strip()
                 if re.match(r"^\d{6,}[A-Z]?$", val):
                     merged["dh_spacing_id"] = val
-                    merged.pop("dh_choice", None)
-            # If we have dh_spacing_id, mirror to choice_id to match backend context
-            if "dh_spacing_id" in merged and "choice_id" not in merged:
-                merged["choice_id"] = merged["dh_spacing_id"]
     except Exception as _e:
         log.warning("disc harrow normalization skipped: %s", _e)
 
-    # Menu family normalization (PF / Bale Spear / Quick Hitch)
+    # Menu families (ONLY Pallet Fork/Bale Spear/Quick Hitch)
     try:
         if fam_lower in MENU_FAMILIES:
             prefix = _family_prefix(fam_lower)  # 'pf', 'balespear', 'qh'
-            choice_field = f"{prefix}_choice"          # e.g., pf_choice
-            choice_id_field = f"{prefix}_choice_id"    # e.g., pf_choice_id
+            choice_field = f"{prefix}_choice"
+            choice_id_field = f"{prefix}_choice_id"
 
-            # Promote generic ids into the exact *_choice_id field
+            # Accept part_id/choice_id as *_choice_id
             if choice_id_field not in merged:
                 for alt in ("choice_id", "part_id", "part_no", f"{prefix}_id"):
                     if merged.get(alt):
                         merged[choice_id_field] = str(merged[alt]).strip()
                         break
 
-            # If the value under *_choice is an ID, promote it
+            # If user typed the value under the question key, treat ID-looking strings as IDs
             if choice_id_field not in merged and merged.get(choice_field):
                 raw = str(merged[choice_field]).strip()
                 if re.match(r"^\d{6,}[A-Z]?$", raw):
                     merged[choice_id_field] = raw
-                    merged.pop(choice_field, None)
 
-            # If we now have either id or label, suppress model mid-flow
+            # When we have a menu selection, don't send model
             if merged.get(choice_id_field) or merged.get(choice_field):
                 merged.pop("model", None)
     except Exception as _e:
         log.warning("menu-family normalization skipped: %s", _e)
 
-    # -------- id→value normalization for fields your API expects (DROP the *_id) --------
+    # ---------------- Generic choice→ID promotion (LIMITED SCOPE) ----------------
     try:
-        # 1) Batwing tire qty: always give the API bw_tire_qty (and remove *_id)
-        if "bw_tire_qty_id" in merged:
-            sval = str(merged.pop("bw_tire_qty_id")).strip()
-            if sval.isdigit() and "bw_tire_qty" not in merged:
-                merged["bw_tire_qty"] = int(sval)
+        # Only run for Disc Harrow and the two menu families (+ quick hitch)
+        if fam_lower in GENERIC_PROMOTION_FAMILIES:
+            cmap = choice_map or {}
+            for qname, maps in list(cmap.items()):
+                # Never fabricate *_qty_id fields; skip any quantity question
+                if qname.endswith("_qty"):
+                    continue
 
-        # 2) Generic tire qty (fallback)
-        if "tire_qty_id" in merged:
-            sval = str(merged.pop("tire_qty_id")).strip()
-            if sval.isdigit() and "tire_qty" not in merged:
-                merged["tire_qty"] = int(sval)
+                expected_id_key = CHOICE_ID_KEY_OVERRIDES.get(
+                    qname,
+                    (qname if qname.endswith("_id") else f"{qname}_id")
+                )
 
-        # 3) Disc harrow width handled above (dh_width_in_id → dh_width_in); ensure *_id removed
-        #    (already popped in Disc Harrow section)
-    except Exception as _e:
-        log.warning("id→value normalization skipped: %s", _e)
+                # Again, don't touch *_qty questions even if expected_id_key would be made
+                if expected_id_key.endswith("_qty_id"):
+                    continue
 
-    # ---------------- Generic choice→ID promotion using cached maps ----------------
-    try:
-        cmap = choice_map or {}
-        for qname, maps in list(cmap.items()):
-            expected_id_key = (
-                CHOICE_ID_KEY_OVERRIDES.get(qname) or
-                (qname if qname.endswith("_id") else f"{qname}_id")
-            )
-            if merged.get(expected_id_key):
-                continue
-            val = merged.get(qname)
-            if not val:
-                continue
-            sval = str(val).strip()
-            vlow = sval.lower()
+                if merged.get(expected_id_key):
+                    continue
 
-            # 1) If user already gave an ID-looking token, accept it directly
-            if re.match(r"^\d{6,}[A-Z]?$", sval):
-                merged[expected_id_key] = sval
-                if expected_id_key != qname:
-                    merged.pop(qname, None)
-                continue
+                val = merged.get(qname)
+                if not val:
+                    continue
+                sval = str(val).strip()
+                vlow = sval.lower()
 
-            # 2) Map letters/labels/model tokens via cached choices_with_ids
-            _id = (
-                (maps.get("by_letter") or {}).get(vlow)
-                or (maps.get("by_label") or {}).get(vlow)
-                or (maps.get("by_model") or {}).get(vlow)
-            )
-            if _id:
-                merged[expected_id_key] = _id
-                if expected_id_key != qname:
-                    merged.pop(qname, None)
+                # 1) If already an exact ID, accept it
+                if re.match(r"^\d{6,}[A-Z]?$", sval):
+                    merged[expected_id_key] = sval
+                    if expected_id_key != qname:
+                        merged.pop(qname, None)
+                    continue
+
+                # 2) Map letters/labels/model tokens via cached choices_with_ids
+                _id = (
+                    (maps.get("by_letter") or {}).get(vlow)
+                    or (maps.get("by_label") or {}).get(vlow)
+                    or (maps.get("by_model") or {}).get(vlow)
+                )
+                if _id:
+                    merged[expected_id_key] = _id
+                    if expected_id_key != qname:
+                        merged.pop(qname, None)
     except Exception as _e:
         log.warning("generic choice-id promotion skipped: %s", _e)
 
-    # ---------------- safety: don’t send model mid-questions ----------------
-    if fam_lower in {"pallet_fork", "bale_spear", "quick_hitch", "rear_finish", "disc_harrow", "batwing"}:
+    # ---------------- safety: don’t send model mid-questions for these families ----------------
+    if fam_lower in {"pallet_fork", "bale_spear", "quick_hitch", "disc_harrow"}:
         merged.pop("model", None)
 
     # ---------------- call API ----------------
@@ -1050,10 +1031,6 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
 # ---------------- HTTP Routes ----------------
 @app.post("/chat")
 def chat():
-    def _quote_sig(d: Dict[str, Any]) -> str:
-        # stable signature of quote args, excluding dealer_number
-        return json.dumps({k: d[k] for k in sorted(d.keys()) if k != "dealer_number"}, sort_keys=True)
-
     try:
         payload = request.get_json(silent=True) or {}
         user_message = str(payload.get("message") or "").strip()
@@ -1076,7 +1053,7 @@ def chat():
         convo: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         convo.extend(sess["messages"])
 
-        # ---------- Dealer detection from this message (safe shim) ----------
+        # ---------- Dealer detection from this message ----------
         dn_from_msg = _safe_extract_dealer(user_message)
         if dn_from_msg:
             res = tool_woods_dealer_discount({"dealer_number": dn_from_msg})
@@ -1134,41 +1111,36 @@ def chat():
                 log.info("Skip /quote: only dealer_number present (auto-trigger)")
             else:
                 args = _qc_merge_and_build_args(sess, base_args)
-                sig = _quote_sig(args)
-                if sig != sess.get("last_quote_sig"):
-                    res = tool_woods_quote(args)
-                    sess["last_quote_sig"] = sig
+                res = tool_woods_quote(args)
 
-                    if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
-                        sess["messages"] = []
-                        _qc_clear(sess)
-                        sess["err_count"] = 0
-                        dealer_badge = sess.get("dealer") or {}
-                        return jsonify({
-                            "reply": res["body"]["message"],
-                            "dealer": {
-                                "dealer_number": dealer_badge.get("dealer_number"),
-                                "dealer_name": dealer_badge.get("dealer_name"),
-                            }
-                        })
+                if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
+                    sess["messages"] = []
+                    _qc_clear(sess)
+                    sess["err_count"] = 0
+                    dealer_badge = sess.get("dealer") or {}
+                    return jsonify({
+                        "reply": res["body"]["message"],
+                        "dealer": {
+                            "dealer_number": dealer_badge.get("dealer_number"),
+                            "dealer_name": dealer_badge.get("dealer_name"),
+                        }
+                    })
 
-                    if "add_tool_exchange" in globals() and callable(globals()["add_tool_exchange"]):
-                        add_tool_exchange(convo, "woods_quote", args, res)
-                    else:
-                        convo.append({
-                            "role": "assistant",
-                            "content": "",
-                            "tool_calls": [{
-                                "id": f"auto_quote_{int(time.time()*1000)}",
-                                "type": "function",
-                                "function": {"name": "woods_quote", "arguments": json.dumps(args)}
-                            }]
-                        })
-                        convo.append({"role": "tool", "tool_call_id": convo[-1]["tool_calls"][0]["id"], "name": "woods_quote", "content": json.dumps(res)})
+                if "add_tool_exchange" in globals() and callable(globals()["add_tool_exchange"]):
+                    add_tool_exchange(convo, "woods_quote", args, res)
                 else:
-                    log.info("Skip /quote: same args signature as last call")
+                    convo.append({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": f"auto_quote_{int(time.time()*1000)}",
+                            "type": "function",
+                            "function": {"name": "woods_quote", "arguments": json.dumps(args)}
+                        }]
+                    })
+                    convo.append({"role": "tool", "tool_call_id": convo[-1]["tool_calls"][0]["id"], "name": "woods_quote", "content": json.dumps(res)})
 
-        # ---------- Follow-up (no new model/family in text) ----------
+        # ---------- Follow-up ----------
         elif dealer_num:
             base_args = {"dealer_number": dealer_num}
             qc = _qc_get(sess)
@@ -1179,39 +1151,34 @@ def chat():
                 log.info("Skip /quote: only dealer_number present (follow-up)")
             else:
                 args = _qc_merge_and_build_args(sess, base_args)
-                sig = _quote_sig(args)
-                if sig != sess.get("last_quote_sig"):
-                    res = tool_woods_quote(args)
-                    sess["last_quote_sig"] = sig
+                res = tool_woods_quote(args)
 
-                    if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
-                        sess["messages"] = []
-                        _qc_clear(sess)
-                        sess["err_count"] = 0
-                        dealer_badge = sess.get("dealer") or {}
-                        return jsonify({
-                            "reply": res["body"]["message"],
-                            "dealer": {
-                                "dealer_number": dealer_badge.get("dealer_number"),
-                                "dealer_name": dealer_badge.get("dealer_name"),
-                            }
-                        })
+                if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
+                    sess["messages"] = []
+                    _qc_clear(sess)
+                    sess["err_count"] = 0
+                    dealer_badge = sess.get("dealer") or {}
+                    return jsonify({
+                        "reply": res["body"]["message"],
+                        "dealer": {
+                            "dealer_number": dealer_badge.get("dealer_number"),
+                            "dealer_name": dealer_badge.get("dealer_name"),
+                        }
+                    })
 
-                    if "add_tool_exchange" in globals() and callable(globals()["add_tool_exchange"]):
-                        add_tool_exchange(convo, "woods_quote", args, res)
-                    else:
-                        convo.append({
-                            "role": "assistant",
-                            "content": "",
-                            "tool_calls": [{
-                                "id": f"auto_quote_{int(time.time()*1000)}",
-                                "type": "function",
-                                "function": {"name": "woods_quote", "arguments": json.dumps(args)}
-                            }]
-                        })
-                        convo.append({"role": "tool", "tool_call_id": convo[-1]["tool_calls"][0]["id"], "name": "woods_quote", "content": json.dumps(res)})
+                if "add_tool_exchange" in globals() and callable(globals()["add_tool_exchange"]):
+                    add_tool_exchange(convo, "woods_quote", args, res)
                 else:
-                    log.info("Skip /quote: same args signature as last call")
+                    convo.append({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": f"auto_quote_{int(time.time()*1000)}",
+                            "type": "function",
+                            "function": {"name": "woods_quote", "arguments": json.dumps(args)}
+                        }]
+                    })
+                    convo.append({"role": "tool", "tool_call_id": convo[-1]["tool_calls"][0]["id"], "name": "woods_quote", "content": json.dumps(res)})
 
         # ---------- Append user and run planner ----------
         convo.append({"role": "user", "content": user_message})
@@ -1232,8 +1199,6 @@ def chat():
                 body3 = payload3.get("body") or {}
                 if isinstance(body3, dict) and body3.get("mode") == "quote":
                     _qc_clear(sess)
-                    # also reset last quote signature so the next quote can start fresh
-                    sess.pop("last_quote_sig", None)
         except Exception:
             pass
 
