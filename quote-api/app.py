@@ -3482,6 +3482,19 @@ def _quote_disc_harrow(df):
     list_access = (request.args.get("list_accessories") or "").strip() not in ("", "0", "false", "False")
     acc_ids, acc_qty_map, acc_desc_terms = _read_accessory_params()
 
+    # ---- NEW: normalize blade input so "N"/"C" (or aliases) work everywhere ----
+    blade_raw = (str(dh_blade or "").strip().lower())
+    if blade_raw in {"n", "notched", "notch", "notched (n)"}:
+        dh_blade = "Notched (N)"
+    elif blade_raw in {"c", "combo", "combination", "combo (c)"}:
+        dh_blade = "Combo (C)"
+    else:
+        # also accept id-style params: dh_blade_id=N/C
+        blade_id = (str(getp("dh_blade_id") or "").strip().lower())
+        if not blade_raw and blade_id in {"n", "c"}:
+            dh_blade = "Notched (N)" if blade_id == "n" else "Combo (C)"
+    # ---- END normalize blade ----
+
     # ---- local helpers (self-contained) ----
     def _to_inches_str(val) -> str:
         s = str(val or "").strip().lower()
@@ -3735,7 +3748,7 @@ def _quote_disc_harrow(df):
         return jsonify({"found": False, "mode": "error",
                         "message": f"No {dh_duty} rows at {dh_width_in} in."}), 404
 
-    # blade stage (FIXED: no .str on Python string)
+    # blade stage
     if not dh_blade:
         return ask_blade(rows, dh_width_in)
 
