@@ -1729,6 +1729,39 @@ def _bw_duty_from_model(model: str, width_ft: str):
     }
     return mapping.get(suff, "")
 
+
+def _normalize_bw_duty_label(width_ft: str, duty_raw: str) -> str:
+    """
+    Map shorthand duty labels to the exact canonical strings your filter expects.
+    Only normalizes where multiple duty classes exist (e.g., 15 ft).
+    Leaves known canonical strings unchanged; otherwise returns the original.
+    """
+    if not duty_raw:
+        return duty_raw
+    duty_clean = duty_raw.strip().lower()
+
+    # Already canonical? Leave it.
+    if duty_raw in (
+        "Standard Duty (.52)",
+        "Heavy Duty (.72)",
+        "Standard Duty (.40)",
+        "Standard Duty (.51)",
+        "Medium Duty (.61)",
+        "Heavy Duty (.71)",
+    ):
+        return duty_raw
+
+    # Normalize by width (only where multiple classes exist)
+    if str(width_ft) == "15":
+        if duty_clean in {"standard", "std", "light", "standard duty"}:
+            return "Standard Duty (.52)"
+        if duty_clean in {"heavy", "hd", "heavy duty"}:
+            return "Heavy Duty (.72)"
+
+    # For widths with a single class (e.g., 12 ft .40) nothing to do.
+    return duty_raw
+
+
 def _bw_label(r, duty=None, driveline=None, deck_rings=None, shielding_rows=None):
     model = str(r[COL_MODEL]).strip()
     bits = []
@@ -1749,6 +1782,7 @@ def _bw_label(r, duty=None, driveline=None, deck_rings=None, shielding_rows=None
     if dsc:
         label += f" — {dsc}"
     return label
+
 
 def _quote_batwing(df):
     bw_base = _family_base(df, "Batwing", exclude_turf=True)
@@ -1771,7 +1805,8 @@ def _quote_batwing(df):
 
     tire_id = getp("tire_id")
     tire_choice = getp("tire_choice")
-    tire_qty_arg = getp("bw_tire_qty", "tire_qty")
+    # Accept either value or id to avoid loops when choices_with_ids is present
+    tire_qty_arg = getp("bw_tire_qty", "tire_qty") or getp("bw_tire_qty_id")
 
     wn = _ensure_width_norm_col(bw_base)
     rows = pd.DataFrame()
@@ -1810,6 +1845,10 @@ def _quote_batwing(df):
 
     rows = rows[rows[wn].astype(str) == width_ft]
     duties_avail = sorted({duty_of_row(r) for _, r in rows.iterrows() if duty_of_row(r)})
+
+    # Normalize any shorthand duty to exact canonical label for this width
+    if bw_duty:
+        bw_duty = _normalize_bw_duty_label(width_ft, bw_duty)
 
     if len(duties_avail) > 1 and not bw_duty:
         return jsonify({
@@ -2044,7 +2083,6 @@ def _quote_batwing(df):
                             ))
                             added_needs.add(need)
                             break
-
 
     list_access = (request.args.get("list_accessories") or "").strip() not in ("", "0", "false", "False")
     acc_ids2, acc_qty_map2, acc_desc_terms2 = _read_accessory_params()
