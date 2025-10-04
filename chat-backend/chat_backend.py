@@ -87,41 +87,42 @@ _enforced_totals format (example):
 ---
 Quote Output Format
 - Title line: Woods Equipment Quote
-- Dealer line: <Dealer Name> – Dealer #<dealer_number>   (use an em dash)
-- Then list each line item in this exact style:
+- Dealer line: <Dealer Name> – Dealer #<dealer_number>
 
-  <Model or Part Description> (<qty>) – List: $<list_price_formatted>
-  <secondary details line, if any>
+- Then list each quoted line item back-to-back (NO blank lines between items), numbered with a bold index:
+  **1.** <Primary description> (<qty>) – List: $<list_price>
+       — <secondary details, if any>
+  **2.** <Next item> (<qty>) – List: $<list_price>
+       — <secondary details, if any>
+  (Continue numbering 3., 4., …)
 
-  Examples of secondary details:
-  - For cutters: “Standard Duty (.40), 540 RPM — Single Spring on Center Deck Wheel Yoke”
-  - For tires: “Tires quoted separately from cutter”
-  - For required kits tied to the configuration: “Required for 6-tire configuration”
-  - Only show a secondary line if you have a meaningful note from the API or configuration context.
+  Rules:
+  - Use **bold** only for the item numbers (e.g., **1.**, **2.**, …).
+  - Keep each item to 1–2 lines total:
+    • Line 1: primary description, quantity, and list price
+    • Optional Line 2: start with an em dash (—) and add concise details (model options, notes, requirements)
+  - Do not insert blank lines between items.
 
-- After all items, print a horizontal separator line:
-  ----------------------------------------------------------------------------------------
+- Separator line (shorter):
+  ------------------------------
 
-- Discount block (amounts MUST come from `_enforced_totals`, not recalculated):
+- Discount block (values MUST come from `_enforced_totals`):
   <dealer_discount_percent>% Dealer Discount: $<_enforced_totals.dealer_discount_total>
   <cash_discount_percent>% Cash Discount: $<_enforced_totals.cash_discount_total>
 
-  Where:
-  - <dealer_discount_percent> comes from the dealer lookup (label only).
-  - <cash_discount_percent> is 12% unless the dealer discount is exactly 5%, then it’s 5% (label only).
-  - Never recompute the dollar amounts. Always use `_enforced_totals` values.
-
-- Final line:
-  ✅ Final Dealer Net: $<_enforced_totals.final_net>
+- Final line (BOLD the entire line):
+  **Final Dealer Net: $<_enforced_totals.final_net>**
 
 - Footer:
   Cash discount included only if paid within terms.
 
-- Formatting rules
-  - Use $ signs, commas, and two decimals for all money values.
-  - Do NOT output “Subtotal”.
-  - Do NOT use markdown bold or headers.
-  - Use an em dash (—) for separators inside lines (e.g., “– List: $…”, “— Single Spring …”).
+- Money formatting:
+  - Always include $ sign, commas, and two decimals.
+
+- Secondary details guidance (only when applicable; keep concise):
+  - Call out configuration details (e.g., duty, driveline, spacing, blade style)
+  - Clarify accessory inclusion/separation (e.g., tires quoted separately; required kits)
+  - Use part numbers in parentheses when useful (e.g., (639996))
 
 ---
 Session Handling
