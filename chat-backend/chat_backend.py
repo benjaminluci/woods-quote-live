@@ -85,6 +85,16 @@ _enforced_totals format (example):
 - final_net â†’ amount after dealer + cash discounts âœ…
 
 ---
+Dealer Number Banner (show once)
+- Immediately after a dealer number is provided (and before any model/config questions), display this banner **once per session**:
+  **Woods Equipment Quote**  
+  Dealer Name: {Dealer Name if known, otherwise use the most recent name on file or omit}  
+  Dealer Number: {Dealer Number}  
+
+  Please provide the model you would like to quote or just say "Quote me a ___"
+- Do not repeat this banner again unless a **new** dealer number is supplied.
+
+---
 Quote Output Format
 - Title line: Woods Equipment Quote
 - Dealer line: <Dealer Name> – Dealer #<dealer_number>
@@ -97,7 +107,7 @@ Quote Output Format
   (Continue numbering 3., 4., …)
 
   Rules:
-  - Use **bold** only for the item numbers (e.g., **1.**, **2.**, …).
+  - Use **bold** only for the item numbers (e.g., (1), (2), …).
   - Keep each item to 1–2 lines total:
     • Line 1: primary description, quantity, and list price
     • Optional Line 2: start with an em dash (—) and add concise details (model options, notes, requirements)
@@ -110,7 +120,7 @@ Quote Output Format
   <dealer_discount_percent>% Dealer Discount: $<_enforced_totals.dealer_discount_total>
   <cash_discount_percent>% Cash Discount: $<_enforced_totals.cash_discount_total>
 
-- Final line (BOLD the entire line):
+- Final line (BOLD the entire line and add an extra space from the discount block):
   **Final Dealer Net: $<_enforced_totals.final_net>**
 
 - Footer:
