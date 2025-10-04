@@ -512,6 +512,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
       - Normalizes Disc Harrow fields.
       - Normalizes menu families (pallet_fork, bale_spear, quick_hitch) and promotes choice → *_choice_id,
         including when the user provides the raw ID itself.
+      - Accepts *_qty_id and mirrors it to its *_qty numeric when needed.
       - On family change, drops keys from prior families (no cross-contamination).
       - Clears per-quote memory on completion (keeps dealer info).
       - Enforces cash discount totals for UI.
@@ -617,12 +618,10 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     if fam and old_fam and old_fam != fam:
         old_prefix = _family_prefix(old_fam)
         if old_prefix:
-            # remove any keys starting with "<oldprefix>_" or "dh_" etc.
             keys_to_drop = [k for k in list(merged.keys()) if k.startswith(old_prefix + "_")]
             for k in keys_to_drop:
                 if k not in ("dealer_number", "family"):
                     merged.pop(k, None)
-        # also drop the choice_map of the old family (avoid mismapping)
         choice_map = {}
 
     # ---------------- family-specific normalization ----------------
@@ -635,19 +634,18 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
             # Normalize width alias
             if "width" in merged and "dh_width_in" not in merged:
                 merged["dh_width_in"] = str(merged.pop("width")).strip()
-            # Blade shorthand → compact code (or change to long label if your API needs it)
+            # Blade shorthand → compact code (N/C)
             if "dh_blade" in merged:
                 t = str(merged["dh_blade"]).strip().lower()
                 if t in {"n", "notched"}:
-                    merged["dh_blade"] = "N"  # or "Notched (N)"
+                    merged["dh_blade"] = "N"
                 elif t in {"c", "combo", "combination"}:
-                    merged["dh_blade"] = "C"  # or "Combo (C)"
-            # If dh_choice already looks like an ID, promote to dh_spacing_id
+                    merged["dh_blade"] = "C"
+            # If dh_choice looks like an ID, promote to dh_spacing_id
             if "dh_choice" in merged and "dh_spacing_id" not in merged:
                 val = str(merged.get("dh_choice") or "").strip()
                 if re.match(r"^\d{6,}[A-Z]?$", val):
                     merged["dh_spacing_id"] = val
-                    # merged.pop("dh_choice", None)  # optional
     except Exception as _e:
         log.warning("disc harrow normalization skipped: %s", _e)
 
@@ -665,11 +663,9 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                         merged[choice_id_field] = str(merged[alt]).strip()
                         break
 
-            # If the user gave the choice value under the question name,
-            # promote it to *_choice_id when it's clearly an ID
+            # If the value under *_choice is an ID, promote it
             if choice_id_field not in merged and merged.get(choice_field):
                 raw = str(merged[choice_field]).strip()
-                # Treat pure ids as ids (digits or digits+suffix like 1039976F)
                 if re.match(r"^\d{6,}[A-Z]?$", raw):
                     merged[choice_id_field] = raw
 
@@ -679,13 +675,27 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as _e:
         log.warning("menu-family normalization skipped: %s", _e)
 
+    # -------- qty-id → qty mirroring (prevents tire/bale/pf stalls) --------
+    try:
+        # Common patterns we've seen from the API UI
+        qty_pairs = [
+            ("bw_tire_qty_id", "bw_tire_qty"),
+            ("tire_qty_id", "tire_qty"),
+        ]
+        for src, dst in qty_pairs:
+            if src in merged and dst not in merged:
+                sval = str(merged.get(src)).strip()
+                if sval.isdigit():
+                    merged[dst] = int(sval)
+    except Exception as _e:
+        log.warning("qty-id mirroring skipped: %s", _e)
+
     # ---------------- Generic choice→ID promotion using cached maps ----------------
     try:
         cmap = choice_map or {}
         for qname, maps in list(cmap.items()):
-            # Which ID key should this map to?
-            expected_id_key = CHOICE_ID_KEY_OVERRIDES.get(
-                qname,
+            expected_id_key = (
+                CHOICE_ID_KEY_OVERRIDES.get(qname) or
                 (qname if qname.endswith("_id") else f"{qname}_id")
             )
             if merged.get(expected_id_key):
@@ -696,7 +706,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
             sval = str(val).strip()
             vlow = sval.lower()
 
-            # 1) If the user already gave an exact ID-looking token, accept it directly
+            # 1) If user already gave an ID-looking token, accept it directly
             if re.match(r"^\d{6,}[A-Z]?$", sval):
                 merged[expected_id_key] = sval
                 if expected_id_key != qname:
@@ -766,7 +776,6 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                             continue
                         by_letter[chr(ord("a") + idx)] = _id
                         by_label[_label.lower()] = _id
-                        # first token before " —" is often the model
                         model_tok = _label.split(" —", 1)[0].split()[0].strip().lower()
                         if model_tok:
                             by_model[model_tok] = _id
@@ -986,7 +995,6 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
             # Ensure dealer_number is present when we can infer it
             if "dealer_number" not in args:
                 dn = None
-                # try dealer badge in session tool messages (present in history)
                 for m in reversed(history):
                     if m.get("role") == "tool" and m.get("name") == "woods_dealer_discount":
                         try:
@@ -1026,6 +1034,10 @@ def run_ai(messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
 # ---------------- HTTP Routes ----------------
 @app.post("/chat")
 def chat():
+    def _quote_sig(d: Dict[str, Any]) -> str:
+        # stable signature of quote args, excluding dealer_number
+        return json.dumps({k: d[k] for k in sorted(d.keys()) if k != "dealer_number"}, sort_keys=True)
+
     try:
         payload = request.get_json(silent=True) or {}
         user_message = str(payload.get("message") or "").strip()
@@ -1052,7 +1064,6 @@ def chat():
         dn_from_msg = _safe_extract_dealer(user_message)
         if dn_from_msg:
             res = tool_woods_dealer_discount({"dealer_number": dn_from_msg})
-            # helper existed in your file; keep using if present, else inline append
             if "add_tool_exchange" in globals() and callable(globals()["add_tool_exchange"]):
                 add_tool_exchange(convo, "woods_dealer_discount", {"dealer_number": dn_from_msg}, res)
             else:
@@ -1107,35 +1118,39 @@ def chat():
                 log.info("Skip /quote: only dealer_number present (auto-trigger)")
             else:
                 args = _qc_merge_and_build_args(sess, base_args)
-                res = tool_woods_quote(args)
+                sig = _quote_sig(args)
+                if sig != sess.get("last_quote_sig"):
+                    res = tool_woods_quote(args)
+                    sess["last_quote_sig"] = sig
 
-                # auto-reset support
-                if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
-                    sess["messages"] = []
-                    _qc_clear(sess)
-                    sess["err_count"] = 0
-                    dealer_badge = sess.get("dealer") or {}
-                    return jsonify({
-                        "reply": res["body"]["message"],
-                        "dealer": {
-                            "dealer_number": dealer_badge.get("dealer_number"),
-                            "dealer_name": dealer_badge.get("dealer_name"),
-                        }
-                    })
+                    if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
+                        sess["messages"] = []
+                        _qc_clear(sess)
+                        sess["err_count"] = 0
+                        dealer_badge = sess.get("dealer") or {}
+                        return jsonify({
+                            "reply": res["body"]["message"],
+                            "dealer": {
+                                "dealer_number": dealer_badge.get("dealer_number"),
+                                "dealer_name": dealer_badge.get("dealer_name"),
+                            }
+                        })
 
-                if "add_tool_exchange" in globals() and callable(globals()["add_tool_exchange"]):
-                    add_tool_exchange(convo, "woods_quote", args, res)
+                    if "add_tool_exchange" in globals() and callable(globals()["add_tool_exchange"]):
+                        add_tool_exchange(convo, "woods_quote", args, res)
+                    else:
+                        convo.append({
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": f"auto_quote_{int(time.time()*1000)}",
+                                "type": "function",
+                                "function": {"name": "woods_quote", "arguments": json.dumps(args)}
+                            }]
+                        })
+                        convo.append({"role": "tool", "tool_call_id": convo[-1]["tool_calls"][0]["id"], "name": "woods_quote", "content": json.dumps(res)})
                 else:
-                    convo.append({
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": f"auto_quote_{int(time.time()*1000)}",
-                            "type": "function",
-                            "function": {"name": "woods_quote", "arguments": json.dumps(args)}
-                        }]
-                    })
-                    convo.append({"role": "tool", "tool_call_id": convo[-1]["tool_calls"][0]["id"], "name": "woods_quote", "content": json.dumps(res)})
+                    log.info("Skip /quote: same args signature as last call")
 
         # ---------- Follow-up (no new model/family in text) ----------
         elif dealer_num:
@@ -1148,34 +1163,39 @@ def chat():
                 log.info("Skip /quote: only dealer_number present (follow-up)")
             else:
                 args = _qc_merge_and_build_args(sess, base_args)
-                res = tool_woods_quote(args)
+                sig = _quote_sig(args)
+                if sig != sess.get("last_quote_sig"):
+                    res = tool_woods_quote(args)
+                    sess["last_quote_sig"] = sig
 
-                if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
-                    sess["messages"] = []
-                    _qc_clear(sess)
-                    sess["err_count"] = 0
-                    dealer_badge = sess.get("dealer") or {}
-                    return jsonify({
-                        "reply": res["body"]["message"],
-                        "dealer": {
-                            "dealer_number": dealer_badge.get("dealer_number"),
-                            "dealer_name": dealer_badge.get("dealer_name"),
-                        }
-                    })
+                    if isinstance(res, dict) and isinstance(res.get("body"), dict) and res["body"].get("_auto_reset"):
+                        sess["messages"] = []
+                        _qc_clear(sess)
+                        sess["err_count"] = 0
+                        dealer_badge = sess.get("dealer") or {}
+                        return jsonify({
+                            "reply": res["body"]["message"],
+                            "dealer": {
+                                "dealer_number": dealer_badge.get("dealer_number"),
+                                "dealer_name": dealer_badge.get("dealer_name"),
+                            }
+                        })
 
-                if "add_tool_exchange" in globals() and callable(globals()["add_tool_exchange"]):
-                    add_tool_exchange(convo, "woods_quote", args, res)
+                    if "add_tool_exchange" in globals() and callable(globals()["add_tool_exchange"]):
+                        add_tool_exchange(convo, "woods_quote", args, res)
+                    else:
+                        convo.append({
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": f"auto_quote_{int(time.time()*1000)}",
+                                "type": "function",
+                                "function": {"name": "woods_quote", "arguments": json.dumps(args)}
+                            }]
+                        })
+                        convo.append({"role": "tool", "tool_call_id": convo[-1]["tool_calls"][0]["id"], "name": "woods_quote", "content": json.dumps(res)})
                 else:
-                    convo.append({
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": f"auto_quote_{int(time.time()*1000)}",
-                            "type": "function",
-                            "function": {"name": "woods_quote", "arguments": json.dumps(args)}
-                        }]
-                    })
-                    convo.append({"role": "tool", "tool_call_id": convo[-1]["tool_calls"][0]["id"], "name": "woods_quote", "content": json.dumps(res)})
+                    log.info("Skip /quote: same args signature as last call")
 
         # ---------- Append user and run planner ----------
         convo.append({"role": "user", "content": user_message})
@@ -1196,6 +1216,8 @@ def chat():
                 body3 = payload3.get("body") or {}
                 if isinstance(body3, dict) and body3.get("mode") == "quote":
                     _qc_clear(sess)
+                    # also reset last quote signature so the next quote can start fresh
+                    sess.pop("last_quote_sig", None)
         except Exception:
             pass
 
