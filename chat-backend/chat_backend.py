@@ -188,8 +188,8 @@ Correction Enforcement
 - Final Net must subtract both dealer discount AND cash discount.
 - Use the exact value from `_enforced_totals.final_net`. Never recalculate.
 - If the user asks to clear session, clear all data aside from dealer number and restart
-- For Batwings, always send back the exact label string you were shown (no paraphrasing)
-- For brushfighter, do not send a model unless it is an exact code returned by the API questions. If you only have width, omit model and let the backend ask bf_choice.
+- For Batwings, always send back the exact label string you were shown when asked a question (no paraphrasing)
+- For brushfighter, do not send a model unless it is an exact code returned by the API questions, and it only sends 1 code. If you only have width, let the backend ask bf_choice with the multiple options.
 """
 
 # (Optional helper synopsis for the model; harmless to include)
