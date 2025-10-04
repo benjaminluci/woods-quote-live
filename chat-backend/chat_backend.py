@@ -86,24 +86,42 @@ _enforced_totals format (example):
 
 ---
 Quote Output Format
-- Begin with "**Woods Equipment Quote**"
-- Include the dealer name and dealer number below the title
-- Show:
-  - Show:
-  - List Price â†’ `_enforced_totals.list_price_total`
+- Title line: Woods Equipment Quote
+- Dealer line: <Dealer Name> – Dealer #<dealer_number>   (use an em dash)
+- Then list each line item in this exact style:
 
-  - Dealer Discount â†’ `_enforced_totals.dealer_discount_total`
+  <Model or Part Description> (<qty>) – List: $<list_price_formatted>
+  <secondary details line, if any>
 
-  - Cash Discount â†’ `_enforced_totals.cash_discount_total`
+  Examples of secondary details:
+  - For cutters: “Standard Duty (.40), 540 RPM — Single Spring on Center Deck Wheel Yoke”
+  - For tires: “Tires quoted separately from cutter”
+  - For required kits tied to the configuration: “Required for 6-tire configuration”
+  - Only show a secondary line if you have a meaningful note from the API or configuration context.
 
+- After all items, print a horizontal separator line:
+  ----------------------------------------------------------------------------------------
 
-  - Final Net âœ… â†’ `_enforced_totals.final_net`
-- Include: â€œCash discount included only if paid within terms.â€
-- Please make Final Net in bold and bigger text than the other items
-- Please include $ sign in front of money values and add proper commas and decimals
-- Please show each line item that is included in the quote on the final output
-- Omit the "Subtotal" section
-- If `_enforced_totals` is missing or pricing cannot be determined, stop and say: â€œUnable to find pricing, please contact Benjamin Luci at 615-516-8802.â€
+- Discount block (amounts MUST come from `_enforced_totals`, not recalculated):
+  <dealer_discount_percent>% Dealer Discount: $<_enforced_totals.dealer_discount_total>
+  <cash_discount_percent>% Cash Discount: $<_enforced_totals.cash_discount_total>
+
+  Where:
+  - <dealer_discount_percent> comes from the dealer lookup (label only).
+  - <cash_discount_percent> is 12% unless the dealer discount is exactly 5%, then it’s 5% (label only).
+  - Never recompute the dollar amounts. Always use `_enforced_totals` values.
+
+- Final line:
+  ✅ Final Dealer Net: $<_enforced_totals.final_net>
+
+- Footer:
+  Cash discount included only if paid within terms.
+
+- Formatting rules
+  - Use $ signs, commas, and two decimals for all money values.
+  - Do NOT output “Subtotal”.
+  - Do NOT use markdown bold or headers.
+  - Use an em dash (—) for separators inside lines (e.g., “– List: $…”, “— Single Spring …”).
 
 ---
 Session Handling
