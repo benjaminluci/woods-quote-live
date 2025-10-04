@@ -99,7 +99,7 @@ Quote Output Format
 - Title line: Woods Equipment Quote
 - Dealer line: <Dealer Name> – Dealer #<dealer_number>
 
-- Then list each quoted line item back-to-back (NO blank lines between items), numbered with a bold index:
+- Then list each quoted line item back-to-back (NO blank lines between items), numbered with a bold index, and list price included at the end of each line:
   **1.** <Primary description> (<qty>) – List: $<list_price>
        — <secondary details, if any>
   **2.** <Next item> (<qty>) – List: $<list_price>
