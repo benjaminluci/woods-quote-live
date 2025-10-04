@@ -4457,6 +4457,17 @@ def _quote_stump_grinder(df):
 # shared small utilities
 # =========================
 def _select_by_id_or_label(rows, choice_id, choice_label, label_fn):
+    """
+    Select a single row from `rows` (a DataFrame) by either:
+      1) explicit ID (choice_id), or
+      2) label (choice_label) — BUT if the label looks like a part number
+         (e.g., '1037171', '640022', 'PFW4448S2'), also try matching it
+         against the PART_ID_COLS first.
+
+    This makes families like pallet_fork, bale_spear, disc_harrow robust when the
+    chat sends a part number in the '..._choice' label field instead of '..._choice_id'.
+    """
+    # 1) Try ID match using choice_id (preferred)
     if choice_id:
         cid = choice_id.strip().upper()
         for c in PART_ID_COLS:
@@ -4465,6 +4476,17 @@ def _select_by_id_or_label(rows, choice_id, choice_label, label_fn):
                 if not hit.empty:
                     return hit.iloc[[0]]
 
+    # 1a) If no choice_id matched/provided, but choice_label is present,
+    #     try treating the label as an ID too (common when UI passes part numbers in the label slot).
+    if choice_label:
+        cl_id = choice_label.strip().upper()
+        for c in PART_ID_COLS:
+            if c in rows.columns:
+                hit = rows[rows[c].astype(str).str.strip().str.upper() == cl_id]
+                if not hit.empty:
+                    return hit.iloc[[0]]
+
+    # 2) Fallback: use label_fn to compare human-readable labels
     if choice_label:
         cl = choice_label.strip().lower()
         # exact match
@@ -4476,9 +4498,11 @@ def _select_by_id_or_label(rows, choice_id, choice_label, label_fn):
             if cl in label_fn(r).lower():
                 return rows.loc[[idx]]
 
-    # if only one, return it
+    # 3) If only one possible row, pick it
     if len(rows.index) == 1:
         return rows.iloc[[0]]
+
+    # 4) No match
     return rows.iloc[0:0]
 
 # =========================
