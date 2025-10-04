@@ -512,7 +512,8 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
       - Normalizes Disc Harrow fields.
       - Normalizes menu families (pallet_fork, bale_spear, quick_hitch) and promotes choice → *_choice_id,
         including when the user provides the raw ID itself.
-      - Accepts *_qty_id and mirrors it to its *_qty numeric when needed.
+      - Accepts common *_id inputs (e.g., bw_tire_qty_id, dh_width_in_id) and maps them to the exact fields the API expects,
+        then removes the *_id keys to avoid confusing the API.
       - On family change, drops keys from prior families (no cross-contamination).
       - Clears per-quote memory on completion (keeps dealer info).
       - Enforces cash discount totals for UI.
@@ -631,21 +632,31 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         has_dh = any(k.startswith("dh_") for k in merged.keys())
         if fam_lower == "disc_harrow" or has_dh:
             merged.setdefault("family", "disc_harrow")
-            # Normalize width alias
+
+            # (A) Accept both width aliases and normalize to dh_width_in (drop *_id)
+            if "dh_width_in_id" in merged and "dh_width_in" not in merged:
+                val = str(merged.pop("dh_width_in_id")).strip()
+                merged["dh_width_in"] = val
             if "width" in merged and "dh_width_in" not in merged:
                 merged["dh_width_in"] = str(merged.pop("width")).strip()
-            # Blade shorthand → compact code (N/C)
+
+            # (B) Blade shorthand → compact code (N/C)
             if "dh_blade" in merged:
                 t = str(merged["dh_blade"]).strip().lower()
                 if t in {"n", "notched"}:
                     merged["dh_blade"] = "N"
                 elif t in {"c", "combo", "combination"}:
                     merged["dh_blade"] = "C"
-            # If dh_choice looks like an ID, promote to dh_spacing_id
+
+            # (C) If dh_choice looks like an ID, promote to dh_spacing_id and also set generic choice_id
             if "dh_choice" in merged and "dh_spacing_id" not in merged:
                 val = str(merged.get("dh_choice") or "").strip()
                 if re.match(r"^\d{6,}[A-Z]?$", val):
                     merged["dh_spacing_id"] = val
+                    merged.pop("dh_choice", None)
+            # If we have dh_spacing_id, mirror to choice_id to match backend context
+            if "dh_spacing_id" in merged and "choice_id" not in merged:
+                merged["choice_id"] = merged["dh_spacing_id"]
     except Exception as _e:
         log.warning("disc harrow normalization skipped: %s", _e)
 
@@ -668,6 +679,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                 raw = str(merged[choice_field]).strip()
                 if re.match(r"^\d{6,}[A-Z]?$", raw):
                     merged[choice_id_field] = raw
+                    merged.pop(choice_field, None)
 
             # If we now have either id or label, suppress model mid-flow
             if merged.get(choice_id_field) or merged.get(choice_field):
@@ -675,20 +687,24 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as _e:
         log.warning("menu-family normalization skipped: %s", _e)
 
-    # -------- qty-id → qty mirroring (prevents tire/bale/pf stalls) --------
+    # -------- id→value normalization for fields your API expects (DROP the *_id) --------
     try:
-        # Common patterns we've seen from the API UI
-        qty_pairs = [
-            ("bw_tire_qty_id", "bw_tire_qty"),
-            ("tire_qty_id", "tire_qty"),
-        ]
-        for src, dst in qty_pairs:
-            if src in merged and dst not in merged:
-                sval = str(merged.get(src)).strip()
-                if sval.isdigit():
-                    merged[dst] = int(sval)
+        # 1) Batwing tire qty: always give the API bw_tire_qty (and remove *_id)
+        if "bw_tire_qty_id" in merged:
+            sval = str(merged.pop("bw_tire_qty_id")).strip()
+            if sval.isdigit() and "bw_tire_qty" not in merged:
+                merged["bw_tire_qty"] = int(sval)
+
+        # 2) Generic tire qty (fallback)
+        if "tire_qty_id" in merged:
+            sval = str(merged.pop("tire_qty_id")).strip()
+            if sval.isdigit() and "tire_qty" not in merged:
+                merged["tire_qty"] = int(sval)
+
+        # 3) Disc harrow width handled above (dh_width_in_id → dh_width_in); ensure *_id removed
+        #    (already popped in Disc Harrow section)
     except Exception as _e:
-        log.warning("qty-id mirroring skipped: %s", _e)
+        log.warning("id→value normalization skipped: %s", _e)
 
     # ---------------- Generic choice→ID promotion using cached maps ----------------
     try:
