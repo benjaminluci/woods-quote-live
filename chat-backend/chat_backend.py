@@ -189,8 +189,8 @@ Pallet Fork and Bale Spear Organizaton
   - Keep behavior and parameter names the same; this only changes how options are displayed
   - Format prices with $ and commas; prefer whole numbers for weights/capacities when possible.
   - Be concise, make it easy to read
-  - For pallet forks visual display, only include the Model, description, lift capacity, fork tine size, and list price
-  - For bale spears, only include the model, description, max carry load, usable length, and list price
+  - Exclude (ISO 24410) and (ISO 23206) from options. 
+  - On bale spears, exclude "Qty. of Shanks / Scarifiers / Spears / Chains" and replace with just "Qty. of Spears"
 
 ---
 Correction Enforcement
