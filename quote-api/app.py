@@ -3484,6 +3484,43 @@ def _quote_rear_blade(df):
 # Disc Harrow (DHS / DHM)
 # =========================
 
+def _dh_primary_value(qname: str, picked_label: str) -> str:
+    """Normalize Disc Harrow labels into the exact values the backend expects."""
+    q = (qname or "").strip().lower()
+    label = (picked_label or "").strip()
+
+    # Width: keep just the number of inches
+    if q == "dh_width_in":
+        m = re.search(r"\d+(?:\.\d+)?", label)
+        return m.group(0) if m else label
+
+    # Blade: standardize to "Notched (N)" or "Combo (C)"
+    if q == "dh_blade":
+        l = label.lower()
+        if "notched" in l or l.endswith("(n)") or l.endswith(" n"):
+            return "Notched (N)"
+        if "combo" in l or l.endswith("(c)") or l.endswith(" c"):
+            return "Combo (C)"
+        return label
+
+    # Everything else: pass through as-is
+    return label
+
+
+def build_dh_answer_params(qname: str, picked_label: str, picked_id: str | None) -> dict:
+    """
+    For Disc Harrow only:
+      - Always send qname with a normalized value.
+      - If an ID exists, also send qname_id=<id>.
+    """
+    base = (qname or "").strip()
+    val = _dh_primary_value(base, picked_label or "")
+    params = {base: val}
+    if picked_id:
+        params[f"{base}_id"] = str(picked_id)
+    return params
+
+
 def _quote_disc_harrow(df):
     """
     Disc Harrow (DHS / DHM)
@@ -3514,13 +3551,24 @@ def _quote_disc_harrow(df):
     dh_width_in = getp("dh_width_in")
     dh_duty     = getp("dh_duty")
     dh_blade    = getp("dh_blade")
-    choice_id   = getp("dh_choice_id", "choice_id")
-    choice_lbl  = getp("dh_choice", "choice")
+
+    # Accept both correct and legacy spacing names  # <<< NEW
+    choice_id   = getp("dh_choice_id", "choice_id", "dh_spacing_id")  # <<< NEW
+    choice_lbl  = getp("dh_choice", "choice")                          # (label stays the same)
+
+    # If width missing, accept dh_width_in_id as value                    # <<< NEW
+    if not dh_width_in:
+        dh_width_in = getp("dh_width_in_id") or dh_width_in
+    # Normalize width to just digits                                      # <<< NEW
+    if dh_width_in:
+        m = re.search(r"\d+(?:\.\d+)?", str(dh_width_in))
+        if m:
+            dh_width_in = m.group(0)
 
     list_access = (request.args.get("list_accessories") or "").strip() not in ("", "0", "false", "False")
     acc_ids, acc_qty_map, acc_desc_terms = _read_accessory_params()
 
-    # ---- NEW: normalize blade input so "N"/"C" (or aliases) work everywhere ----
+    # ---- Normalize blade input so "N"/"C" (or aliases) work everywhere ----
     blade_raw = (str(dh_blade or "").strip().lower())
     if blade_raw in {"n", "notched", "notch", "notched (n)"}:
         dh_blade = "Notched (N)"
@@ -3707,7 +3755,7 @@ def _quote_disc_harrow(df):
         m = DH_MODEL_RE.search(model_raw)
         if m:
             model_code = m.group(1).upper().strip()
-            base_no_suffix = re.sub(r'[NC]$', '', model_code)
+            base_no_suffix = re.sub(r"[NC]$", "", model_code)
             rows = base[base[COL_MODEL].astype(str).str.upper().str.startswith(base_no_suffix)]
             if rows.empty:
                 return jsonify({"found": False, "mode": "error",
