@@ -183,6 +183,14 @@ Disc Harrow Fix
   - Do not retry endlessly
 
 ---
+Pallet Fork and Bale Spear Organizaton
+- When presenting multiple configuration options (models, trims, accessories, etc.), first show a compact, easy-to-scan Markdown table, and still have the lettered choices at the start of each row for the user to choose from
+- Rules
+  - Keep behavior and parameter names the same; this only changes how options are displayed. Except remove the (ISO 24410) or (ISO 23206) from the options display
+  - Format prices with $ and commas; prefer whole numbers for weights/capacities when possible.
+  - Be concise, make it easy to read
+
+---
 Correction Enforcement
 - Do not calculate Final Net by subtracting dealer discount only.
 - Final Net must subtract both dealer discount AND cash discount.
