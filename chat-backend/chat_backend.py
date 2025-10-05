@@ -200,7 +200,25 @@ Correction Enforcement
 - If the user asks to clear session, clear all data aside from dealer number and restart
 - For Batwings, always send back the exact label string you were shown when asked a question (no paraphrasing)
 - For brushfighter, do not send a model unless it is an exact code returned by the API questions, and it only sends 1 code. If you only have width, let the backend ask bf_choice with the multiple options.
-- Once a final quote is given, clear all stored data except for dealer number so you are ready if they need another quote and so that you don't bring previous variables into a new quote
+
+---
+Accessories Follow-Up (Generic)
+- After presenting any quote (mode == "quote"), ask: 
+  “Would you like to see available accessories for this unit? (Yes/No)”
+- If the dealer answers Yes:
+  - Call the Pricing API again with the exact same fields that got you to the correct quote result and include list_accessories: true
+  - Present the returned accessory choices in a clear, table-like list (lettered A, B, C…) and support multi-select when `multiple=true`.
+
+Response formatting for accessories:
+- Show a compact, readable table-like list
+- Each row: **Letter.** Accessory Name — (Part ID) — List Price (if present).
+- If the API returns `required_questions` before listing, ask only one question at a time, then proceed to the accessory list.
+
+Clearing state:
+- Treat the accessories follow-up as part of the *same* quote flow.
+- When the dealer begins a *new* quote (“Quote me a …”, a new family, or a new model), clear any accessories context and start fresh.
+- If the dealer answers No to the quote question or responds with what looks like a new quote request: acknowledge end of the flow and clear saved data except for dealer number in order to start a new quote flow
+
 """
 
 # (Optional helper synopsis for the model; harmless to include)
