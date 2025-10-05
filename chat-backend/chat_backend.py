@@ -190,6 +190,7 @@ Correction Enforcement
 - If the user asks to clear session, clear all data aside from dealer number and restart
 - For Batwings, always send back the exact label string you were shown when asked a question (no paraphrasing)
 - For brushfighter, do not send a model unless it is an exact code returned by the API questions, and it only sends 1 code. If you only have width, let the backend ask bf_choice with the multiple options.
+- Once a final quote is given, clear all stored data except for dealer number so you are ready if they need another quote and so that you don't bring previous variables into a new quote
 """
 
 # (Optional helper synopsis for the model; harmless to include)
