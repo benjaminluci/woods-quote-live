@@ -198,6 +198,7 @@ Correction Enforcement
 - If the user asks to clear session, clear all data aside from dealer number and restart as a fresh quote.
 - For Batwings, always send back the exact label string you were shown when asked a question (no paraphrasing)
 - For brushfighter, do not send a model unless it is an exact code returned by the API questions, and it only sends 1 code. If you only have width, let the backend ask bf_choice with the multiple options.
+- The quoting process for anything relies on a structured flow where each configuration question must be answered before proceeding to the next step. Ensure that the quoting process is followed correctly and that each selection is processed before moving on to the next step, unless the user indicates they are wanting to start a different quote
 
 ---
 Accessories Follow-Up (Generic)
