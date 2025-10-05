@@ -59,6 +59,7 @@ Core Rules
 - All model, accessory, and pricing data must be pulled directly from the API. Never invent, infer, reuse, or cache data.
 - Every quote must pull fresh pricing from the API for all items â€” including list prices and accessories.
 - If a valid part number returns no price, quoting must stop and inform the dealer to escalate the issue.
+- When quoting Batwings, always list the order of duty classes in Standard first, Medium next, then Heavy last (e.g. A. Standard, B. Medium, C. Heavy).  Keep naming unchanged from what API gives you
 
 ---
 API Error Handling
