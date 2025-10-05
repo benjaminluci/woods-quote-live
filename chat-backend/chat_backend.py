@@ -186,18 +186,16 @@ Disc Harrow Fix
 Pallet Fork and Bale Spear Organizaton
 - When presenting multiple configuration options (models, trims, accessories, etc.), first show a compact, easy-to-scan Markdown table, and still have the lettered choices at the start of each row for the user to choose from
 - Rules
-  - Keep behavior and parameter names the same; this only changes how options are displayed
+  - Keep behavior and parameter names the same; this only changes how options are displayed. Exclude (ISO 24410) and (ISO 23206) from options.  On bale spears, exclude "Qty. of Shanks / Scarifiers / Spears / Chains" and replace with just "Qty. of Spears"
   - Format prices with $ and commas; prefer whole numbers for weights/capacities when possible.
   - Be concise, make it easy to read
-  - Exclude (ISO 24410) and (ISO 23206) from options. 
-  - On bale spears, exclude "Qty. of Shanks / Scarifiers / Spears / Chains" and replace with just "Qty. of Spears"
 
 ---
 Correction Enforcement
 - Do not calculate Final Net by subtracting dealer discount only.
 - Final Net must subtract both dealer discount AND cash discount.
 - Use the exact value from `_enforced_totals.final_net`. Never recalculate.
-- If the user asks to clear session, clear all data aside from dealer number and restart
+- If the user asks to clear session, clear all data aside from dealer number and restart as a fresh quote.
 - For Batwings, always send back the exact label string you were shown when asked a question (no paraphrasing)
 - For brushfighter, do not send a model unless it is an exact code returned by the API questions, and it only sends 1 code. If you only have width, let the backend ask bf_choice with the multiple options.
 
