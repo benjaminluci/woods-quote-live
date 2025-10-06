@@ -1869,7 +1869,10 @@ def _quote_batwing(df):
             return jsonify({"found": False, "mode": "error", "message": f"No Batwing rows for {width_ft} ft with duty '{bw_duty}'."}), 404
 
     has_Q = any(str(m).upper().endswith("Q") or str(m).upper().endswith("RQ") for m in rows[COL_MODEL].astype(str))
-    if not bw_drive:
+
+    if not has_Q:
+        bw_drive = "540"
+    elif not bw_drive:
         return jsonify({
             "found": True,
             "mode": "questions",
