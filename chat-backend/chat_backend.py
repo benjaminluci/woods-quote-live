@@ -60,6 +60,7 @@ Core Rules
 - Every quote must pull fresh pricing from the API for all items â€” including list prices and accessories.
 - If a valid part number returns no price, quoting must stop and inform the dealer to escalate the issue.
 - Always present multiple-choice options from smallest to largest: parse any numeric spec in the label (e.g., .52, 12-ft, 72″) and sort ascending; for duty classes use the precedence Light < Standard < Medium < Heavy; if both a class and a number appear, sort by the number; after sorting, assign letters A, B, C… in display order
+- If the user asks to reset/start over, include reset_quote: 1 in the next tool call.
 
 ---
 API Error Handling
@@ -186,7 +187,6 @@ Correction Enforcement
 - Do not calculate Final Net by subtracting dealer discount only.
 - Final Net must subtract both dealer discount AND cash discount.
 - Use the exact value from `_enforced_totals.final_net`. Never recalculate.
-- If the user asks to clear session, clear all data aside from dealer number and restart as a fresh quote.
 - For Batwings, always send back the exact label string you were shown when asked a question (no paraphrasing)
 - For brushfighter, do not send a model unless it is an exact code returned by the API questions, and it only sends 1 code. If you only have width, let the backend ask bf_choice with the multiple options.
 - The quoting process for anything relies on a structured flow where each configuration question must be answered before proceeding to the next step. Ensure that the quoting process is followed correctly and that each selection is processed before moving on to the next step, unless the user indicates they are wanting to start a different quote
@@ -504,9 +504,17 @@ def detect_family_slug(text: str) -> str | None:
     # 3) No alias/prefix found
     return None
 
-# ---------------- Conversation Helpers -----------------
-
-
+def reset_session_quote(sid: str, *, keep_dealer: bool = True) -> None:
+    if not sid:
+        return
+    se = SESS.setdefault(sid, {})
+    dealer = se.get("dealer") if keep_dealer else None
+    se["quote_ctx"] = {"family": None, "answers": {}, "choice_map": {}}
+    se["err_count"] = 0
+    if keep_dealer and dealer:
+        se["dealer"] = dealer
+    else:
+        se.pop("dealer", None)
 
 
 # ---------------- Tools (function schemas) ----------------
@@ -740,6 +748,23 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     # quote_ctx: per-quote state for this session
     qc = sess_entry.setdefault("quote_ctx", {"family": None, "answers": {}, "choice_map": {}})
 
+    # >>> NEW: explicit reset gate (works even mid-flow)
+    reset_flag = str(turn_params.get("reset_quote") or "").lower()
+    if reset_flag in ("1", "true", "yes", "y"):
+        # Use helper if available; else inline reset (keep dealer)
+        if "reset_session_quote" in globals() and callable(globals()["reset_session_quote"]):
+            reset_session_quote(sid, keep_dealer=True)
+        else:
+            dealer = sess_entry.get("dealer")
+            sess_entry["quote_ctx"] = {"family": None, "answers": {}, "choice_map": {}}
+            sess_entry["err_count"] = 0
+            if dealer:
+                sess_entry["dealer"] = dealer
+            else:
+                sess_entry.pop("dealer", None)
+        # refresh local qc reference after reset
+        qc = sess_entry.setdefault("quote_ctx", {"family": None, "answers": {}, "choice_map": {}})
+
     # Decide family (normalize spaces/dashes to underscores)
     fam = (turn_params.get("family") or qc.get("family") or _infer_family_from_keys(turn_params))
     if fam:
@@ -880,7 +905,6 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         fam_norm = (merged.get("family") or "").lower().replace("-", "_").replace(" ", "_")
         model_tok = (merged.get("model") or "").strip().upper()
         if fam_norm in ("dual_spindle", "ds", "mds", "dso") or model_tok.startswith(("DSO", "DS", "MDS")):
-            # If you added sanitize_dual_spindle_params at module-level, this will be available.
             # Optional: pass raw user text if you keep it (utterance/query) for width inference.
             user_text = str(merged.get("utterance") or merged.get("query") or "")
             merged = sanitize_dual_spindle_params(merged, user_text)
@@ -1210,6 +1234,32 @@ def chat():
         sess["updated_at"] = now
         _qc_get(sess)  # ensure quote_ctx exists
         sess.setdefault("err_count", 0)
+
+        # ---------- Hard reset detection (NL or explicit flag) ----------
+        import re as _re
+        try:
+            _RESET_MATCHER = RESET_INTENT  # use global if you added it
+        except NameError:
+            _RESET_MATCHER = _re.compile(r"\b(reset|start over|start fresh|new quote|clear quote|restart)\b", _re.I)
+
+        reset_flag = str(payload.get("reset_quote") or "").lower() in {"1", "true", "yes", "y"}
+        if reset_flag or _RESET_MATCHER.search(user_message):
+            # Prefer helper if present; else inline reset (keep dealer)
+            if "reset_session_quote" in globals() and callable(globals()["reset_session_quote"]):
+                reset_session_quote(sid, keep_dealer=True)
+            else:
+                dealer = sess.get("dealer")
+                sess["quote_ctx"] = {"family": None, "answers": {}, "choice_map": {}}
+                sess["err_count"] = 0
+                if dealer:
+                    sess["dealer"] = dealer
+                else:
+                    sess.pop("dealer", None)
+            return jsonify({
+                "ok": True,
+                "mode": "system",
+                "message": "Quote context cleared. What would you like to quote?"
+            })
 
         # ---------- Build conversation ----------
         convo: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
