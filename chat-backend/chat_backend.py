@@ -748,7 +748,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     # quote_ctx: per-quote state for this session
     qc = sess_entry.setdefault("quote_ctx", {"family": None, "answers": {}, "choice_map": {}})
 
-    # >>> NEW: explicit reset gate (works even mid-flow)
+    # >>> explicit reset gate (works even mid-flow)
     reset_flag = str(turn_params.get("reset_quote") or "").lower()
     if reset_flag in ("1", "true", "yes", "y"):
         # Use helper if available; else inline reset (keep dealer)
@@ -764,6 +764,18 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
                 sess_entry.pop("dealer", None)
         # refresh local qc reference after reset
         qc = sess_entry.setdefault("quote_ctx", {"family": None, "answers": {}, "choice_map": {}})
+
+        # NEW: if the caller only asked to reset (i.e., nothing meaningful to quote yet),
+        # short-circuit with a synthetic system response your /chat already knows how to handle.
+        tparams_wo_reset = {k: v for k, v in turn_params.items() if k not in ("reset_quote",)}
+        # If after removing reset flag there's no model/family and no other spec keys, bail early.
+        if not any(k in tparams_wo_reset for k in ("model", "family", "width_ft", "bw_width_ft", "ds_mount", "ds_offset", "ds_duty", "ds_driveline", "ds_shielding", "dh_width_in")):
+            body = {
+                "_auto_reset": True,
+                "mode": "system",
+                "message": "Quote context cleared. What would you like to quote?"
+            }
+            return {"ok": True, "status": 200, "url": "/quote(reset)", "body": body}
 
     # Decide family (normalize spaces/dashes to underscores)
     fam = (turn_params.get("family") or qc.get("family") or _infer_family_from_keys(turn_params))
@@ -1255,10 +1267,14 @@ def chat():
                     sess["dealer"] = dealer
                 else:
                     sess.pop("dealer", None)
+            # --- Return in the same shape your UI expects ---
+            dealer_badge = sess.get("dealer") or {}
             return jsonify({
-                "ok": True,
-                "mode": "system",
-                "message": "Quote context cleared. What would you like to quote?"
+                "reply": "Quote context cleared. What would you like to quote?",
+                "dealer": {
+                    "dealer_number": dealer_badge.get("dealer_number"),
+                    "dealer_name": dealer_badge.get("dealer_name"),
+                }
             })
 
         # ---------- Build conversation ----------
