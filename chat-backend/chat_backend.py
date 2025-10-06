@@ -54,7 +54,7 @@ You are a quoting assistant for Woods Equipment dealership staff. Your primary j
 
 ---
 Core Rules
-- A dealer number is required before quoting. Use the Pricing API to look up the dealerâ€™s discount. Do not begin quotes or give pricing without it.  If a user does not give a valid dealer number at the start then respond with "That is not a valid dealer number, please retry or go to the dealer portal at woodsequipment.com to find your dealer number"
+- A dealer number is required before quoting. Use the Pricing API to look up the dealerâ€™s discount. Do not begin quotes or give pricing without it.  If a user does not give a valid dealer number when it appears they have attempted to then respond with "That is not a valid dealer number, please retry or go to the dealer portal at woodsequipment.com to find your dealer number"
 - Dealer numbers may be remembered within a session and across multiple quotes for the same user unless the dealer provides a new number.
 - All model, accessory, and pricing data must be pulled directly from the API. Never invent, infer, reuse, or cache data.
 - Every quote must pull fresh pricing from the API for all items â€” including list prices and accessories.
@@ -217,7 +217,7 @@ Guide (only if /quote does not already ask):
 - BrushFighter: bf_choice, bf_choice_id, drive.
 - BrushBull: bb_shielding, bb_tailwheel (sometimes).
 - Batwing: bw_duty, bw_driveline (540/1000), shielding_rows, deck_rings, bw_tire_qty.
-- Dual Spindle (DS/MDS): ds_mount, ds_shielding, ds_driveline (540/1000), tire_id, tire_qty.
+- Dual Spindle (DS/MDS/DSO): width_ft (8/10), ds_offset (yes/no), ds_mount, ds_duty, ds_shielding, ds_driveline (540/1000), tire_id/tire_choice, tire_qty.
 - Turf Batwing (TBW): width_ft (12/15/17), tbw_duty, front_rollers, chains.
 - Finish Mowers: finish_choice (tk/tkp/rd990x), rollers, chains.
 - Box Scraper: bs_width_in (48/60/72/84), bs_duty, bs_choice_id.
@@ -341,8 +341,8 @@ FAMILY_CATALOG = [
     },
     {
         "family": "dual_spindle",
-        "aliases": ["dual spindle", "ds", "mds"],
-        "model_prefixes": ["DS", "MDS"],
+        "aliases": ["dual spindle", "ds", "mds", "dso", "offset cutter", "multi spindle"],
+        "model_prefixes": ["DS", "MDS", "DSO"],
     },
 ]
 
@@ -511,12 +511,18 @@ TOOLS = [
                     "front_rollers": {"type": "string"},
                     "chains": {"type": "string"},
 
-                    # -------- DUAL SPINDLE (DS/MDS) --------
+                    # -------- DUAL SPINDLE (DS/MDS/DSO) --------
+                    "width_ft": {"type": "string", "description": "Cutting width in feet", "enum": ["8", "10"]},
+                    "ds_offset": {"type": "string", "description": "Offset cutter?", "enum": ["yes", "no"]},
+                    "ds_duty": {"type": "string", "description": "Duty class label, e.g. 'Standard Duty (.30/.40)' or 'Heavy Duty (.50)'"},
+
                     "ds_mount": {"type": "string"},
                     "ds_shielding": {"type": "string"},
                     "ds_driveline": {"type": "string", "description": "540 or 1000"},
                     "tire_id": {"type": "string"},
                     "tire_qty": {"type": "integer"},
+                    # (optional but handy if user answers by name instead of ID)
+                    "tire_choice": {"type": "string"},
 
                     # -------- DISC HARROW (DHS/DHM) --------
                     "dh_width_in": {"type": "string"},
