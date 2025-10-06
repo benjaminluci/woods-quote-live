@@ -350,6 +350,10 @@ FAMILY_CATALOG = [
 # Model detectors
 MODEL_DOT_RE = re.compile(r"\b([A-Za-z]{2,4}\d{1,2}\.\d{2})\b", re.IGNORECASE)   # e.g., BB72.30
 MODEL_SERIES_RE = re.compile(r"\b([A-Za-z]{2,4}\d{2,3})\b", re.IGNORECASE)       # e.g., DHS64, BW12, DS8
+EXPLICIT_DS_MODEL = re.compile(r'^(?:DSO|DS|MDS)\d{1,2}\.(?:30|40|50)(?:Q)?$', re.IGNORECASE)
+SERIES_TOKEN = re.compile(r'^(DSO|DS|MDS)\s*([0-9]{1,2})$', re.IGNORECASE)
+WIDTH_TOKEN = re.compile(r'(?<!\d)(8|10)(?!\d)')
+
 
 # Some APIs label the spacing question inconsistently.
 # No matter which one comes back, we must send `dh_spacing_id` with the ID value.
@@ -415,6 +419,58 @@ def _sanitize_outgoing_params(params: dict) -> dict:
 
     return out
 
+def sanitize_dual_spindle_params(params: dict, user_text: str = "") -> dict:
+    """
+    Only pass an explicit dotted model (DS8.30 / MDS10.50Q / DSO8.50).
+    If we see series-only tokens (DS8 / MDS10 / DSO10), convert to width_ft and (optionally) ds_offset.
+    Never auto-default to a model.
+    """
+    out = dict(params or {})
+    fam = (out.get("family") or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if fam not in ("dual_spindle", "ds", "mds", "dso"):
+        return out  # not our family
+
+    # --- Normalize/guard model ---
+    model = (out.get("model") or "").strip()
+    if model:
+        # If it's explicit (dotted), keep (uppercase); app will infer offset from prefix.
+        if EXPLICIT_DS_MODEL.match(model):
+            out["model"] = model.upper()
+            return out
+
+        # If it's series-only like DS8 / MDS10 / DSO10 → convert to width_ft, drop model
+        m = SERIES_TOKEN.match(model.replace(".", ""))  # tolerate accidental dot with no duty
+        if m:
+            series_prefix, width_num = m.group(1).upper(), m.group(2)
+            if width_num in ("8", "10"):
+                out["width_ft"] = width_num
+                # Only pre-set offset if user literally said DSO*; otherwise let app ask
+                if series_prefix == "DSO":
+                    out["ds_offset"] = "yes"
+                # Do NOT set ds_offset for DS/MDS; app will ask
+            out.pop("model", None)  # remove non-explicit model
+        else:
+            # Not a valid code → drop it so app can ask width/offset/mount properly
+            out.pop("model", None)
+
+    # --- If no model, try to infer width from user text (optional but helpful) ---
+    if "width_ft" not in out or out["width_ft"] not in ("8", "10"):
+        txt = f'{user_text or ""} {(params.get("utterance") or "")}'.strip()
+        m = WIDTH_TOKEN.search((txt or ""))
+        if m:
+            out["width_ft"] = m.group(1)
+
+    # --- Normalize ds_offset if provided loosely (y/yes/true → "yes", etc.) ---
+    off = (out.get("ds_offset") or "").strip().lower()
+    if off:
+        if off in ("y", "yes", "true", "1"):
+            out["ds_offset"] = "yes"
+        elif off in ("n", "no", "false", "0"):
+            out["ds_offset"] = "no"
+        else:
+            out.pop("ds_offset", None)  # unknown → let app ask
+
+    return out
 
 
 def detect_family_slug(text: str) -> str | None:
@@ -614,7 +670,21 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         return out
 
     def _infer_family_from_keys(p: Dict[str, Any]) -> Optional[str]:
+        # NOTE: recognize dual-spindle FIRST, then other families, then the legacy width_ft=>batwing fallback.
         keys = {k.lower() for k in p.keys()}
+
+        # Dual Spindle cues (params or model token)
+        if (
+            {"ds_mount", "ds_shielding", "ds_driveline", "ds_offset", "ds_duty"} & keys
+            or any(k.startswith(("ds_", "mds_", "dso_")) for k in keys)
+            or (
+                "model" in p
+                and isinstance(p.get("model"), str)
+                and p["model"].strip().upper().startswith(("DSO", "DS", "MDS"))
+            )
+        ):
+            return "dual_spindle"
+
         pref = {
             "pallet_fork": "pf_",
             "bale_spear": "balespear_",
@@ -631,6 +701,8 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         for fam, pfx in pref.items():
             if any(k.startswith(pfx) for k in keys):
                 return fam
+
+        # LAST RESORT (legacy): width_ft alone → batwing. Dual Spindle sanitizer will correct later if needed.
         if "width_ft" in keys:
             return "batwing"
         return None
@@ -648,6 +720,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
             "grading_scraper": "gs",
             "post_hole_digger": "pd",
             "tiller": "tiller",
+            # (dual_spindle intentionally omitted; we don't mass-drop ds_* keys elsewhere)
         }.get((fam or "").lower())
 
     # Choice key overrides (API expects these specific id field names)
@@ -667,9 +740,10 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     # quote_ctx: per-quote state for this session
     qc = sess_entry.setdefault("quote_ctx", {"family": None, "answers": {}, "choice_map": {}})
 
-    # Decide family
+    # Decide family (normalize spaces/dashes to underscores)
     fam = (turn_params.get("family") or qc.get("family") or _infer_family_from_keys(turn_params))
     if fam:
+        fam = str(fam).lower().replace("-", "_").replace(" ", "_")
         turn_params["family"] = fam
     fam_lower = (fam or "").lower()
 
@@ -684,7 +758,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         merged["dealer_number"] = dealer_number
 
     # If we're still on the same family, include remembered answers first
-    if fam and old_fam == fam and isinstance(old_answers, dict):
+    if fam and old_fam and old_fam.lower().replace("-", "_").replace(" ", "_") == fam and isinstance(old_answers, dict):
         for k, v in old_answers.items():
             if k == "dealer_number":
                 continue
@@ -695,7 +769,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
         merged[k] = v
 
     # ------------- if family changed, drop keys from the previous family -------------
-    if fam and old_fam and old_fam != fam:
+    if fam and old_fam and old_fam.lower().replace("-", "_").replace(" ", "_") != fam:
         old_prefix = _family_prefix(old_fam)
         if old_prefix:
             # remove any keys starting with "<oldprefix>_" or "dh_" etc.
@@ -800,6 +874,18 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
     # ---------------- safety: don’t send model mid-questions ----------------
     if fam_lower in {"pallet_fork", "bale_spear", "quick_hitch", "rear_finish", "disc_harrow", "batwing"}:
         merged.pop("model", None)
+
+    # ---------------- dual spindle sanitizer (final gate before HTTP) ----------------
+    try:
+        fam_norm = (merged.get("family") or "").lower().replace("-", "_").replace(" ", "_")
+        model_tok = (merged.get("model") or "").strip().upper()
+        if fam_norm in ("dual_spindle", "ds", "mds", "dso") or model_tok.startswith(("DSO", "DS", "MDS")):
+            # If you added sanitize_dual_spindle_params at module-level, this will be available.
+            # Optional: pass raw user text if you keep it (utterance/query) for width inference.
+            user_text = str(merged.get("utterance") or merged.get("query") or "")
+            merged = sanitize_dual_spindle_params(merged, user_text)
+    except Exception as _e:
+        log.warning("dual spindle sanitize skipped: %s", _e)
 
     # ---------------- call API ----------------
     log.info("QUOTE CALL params=%s", json.dumps(merged, ensure_ascii=False))
@@ -1187,6 +1273,10 @@ def chat():
             if set(base_args.keys()) == {"dealer_number"}:
                 log.info("Skip /quote: only dealer_number present (auto-trigger)")
             else:
+
+                fam_norm = (base_args.get("family") or "").lower().replace("-", "_").replace(" ", "_")
+                if fam_norm in ("dual_spindle", "dual spindle", "ds", "mds", "dso") or (base_args.get("model") or "").upper().startswith(("DSO", "DS", "MDS")):
+                    base_args = sanitize_dual_spindle_params(base_args, user_message)
                 args = _qc_merge_and_build_args(sess, base_args)
                 res = tool_woods_quote(args)
 
