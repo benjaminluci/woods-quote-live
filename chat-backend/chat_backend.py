@@ -773,7 +773,7 @@ def tool_woods_quote(args: Dict[str, Any]) -> Dict[str, Any]:
             body = {
                 "_auto_reset": True,
                 "mode": "system",
-                "message": "Quote context cleared. What would you like to quote?"
+                "message": "Quote context cleared. What would you like to quote next?"
             }
             return {"ok": True, "status": 200, "url": "/quote(reset)", "body": body}
 
@@ -1270,7 +1270,7 @@ def chat():
             # --- Return in the same shape your UI expects ---
             dealer_badge = sess.get("dealer") or {}
             return jsonify({
-                "reply": "Quote context cleared. What would you like to quote?",
+                "reply": "Quote context cleared. What would you like to quote next?",
                 "dealer": {
                     "dealer_number": dealer_badge.get("dealer_number"),
                     "dealer_name": dealer_badge.get("dealer_name"),
