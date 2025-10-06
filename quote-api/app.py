@@ -1844,7 +1844,18 @@ def _quote_batwing(df):
         return _bw_duty_from_model(str(rr[COL_MODEL]), width_ft)
 
     rows = rows[rows[wn].astype(str) == width_ft]
-    duties_avail = sorted({duty_of_row(r) for _, r in rows.iterrows() if duty_of_row(r)})
+
+    _NUM_RE = re.compile(r'(\d+(?:\.\d+)?|\.\d+)')             # matches 72, 12.5, .52, etc.
+    _DUTY_PRECEDENCE = {"standard": 0, "medium": 1, "heavy": 2}
+
+    duties_avail = sorted(
+        {duty_of_row(r) for _, r in rows.iterrows() if duty_of_row(r)},
+        key=lambda s: (
+            (0, float(_NUM_RE.search(s).group(1)))            # if a number exists, sort numerically
+            if _NUM_RE.search(s) else
+            (1, next((rank for k, rank in _DUTY_PRECEDENCE.items() if k in s.lower()), 99), s.lower())
+        )
+    )
 
     # Normalize any shorthand duty to exact canonical label for this width
     if bw_duty:
