@@ -1514,13 +1514,14 @@ def _quote_brushbull(df):
         dealer_meta,
     )
 # =========================
-# Dual Spindle (MDS / DS)
+# Dual Spindle (MDS / DS / DSO)
 # =========================
 def _quote_dual_spindle(df):
     ds_base = _family_base(df, "Dual", exclude_turf=False)
     if ds_base.empty:
         return jsonify({"found": False, "mode": "error", "message": "No Dual Spindle base rows found."}), 404
 
+    # Dealer context
     dealer_number = getp("dealer_number")
     dealer_meta, dealer_rate_override = None, None
     if dealer_number and dealer_number in DEALER_DISCOUNTS:
@@ -1528,24 +1529,120 @@ def _quote_dual_spindle(df):
         dealer_meta = {"dealer_number": dealer_number, "dealer_name": name, "applied_discount": rate}
         dealer_rate_override = rate
 
+    # Inputs
     model_code = _extract_ds_code(getp("model"))
-    width_txt = getp("width_ft")
-    ds_mount = getp("ds_mount").lower()  # "mounted" / "pull" (or synonyms)
-    shielding = getp("ds_shielding")
-    ds_drive = getp("ds_driveline")  # "540" or "1000" (Q suffix)
+    width_txt = (getp("width_ft") or "").strip()
+    ds_offset = (getp("ds_offset") or "").strip().lower()  # "yes" / "no"
+    ds_mount = (getp("ds_mount") or "").strip().lower()    # "mounted" / "pull"
+    ds_duty = (getp("ds_duty") or "").strip()
+    shielding = (getp("ds_shielding") or "").strip()
+    ds_drive = (getp("ds_driveline") or "").strip()        # "540" / "1000"
     tire_id = getp("tire_id")
     tire_choice = getp("tire_choice")
 
     wn = _ensure_width_norm_col(ds_base)
 
-    # Ask mount type early unless explicit
-    if not ds_mount:
-        # Even if model provided, ask to confirm mounted vs pull-type
+    # --- WIDTH FIRST ---------------------------------------------------------
+    # If user gave a model, try to infer width from data after filtering by model.
+    inferred_width = ""
+    if model_code.startswith(("DSO", "MDS", "DS")):
+        rows_model_only = ds_base[ds_base[COL_MODEL].astype(str).str.upper().str.startswith(model_code[:3].upper())]
+        if not rows_model_only.empty:
+            # try to get width for any exact model match; fallback to first width for that family code
+            mo = ds_base[ds_base[COL_MODEL].astype(str).str.upper().eq(model_code.upper())]
+            widths_here = (mo if not mo.empty else rows_model_only)[wn].astype(str)
+            if not widths_here.empty:
+                inferred_width = widths_here.iloc[0].strip()
+
+    width_val = (width_txt or inferred_width).strip()
+    if not width_val:
+        widths_avail = sorted({str(v).strip() for v in ds_base[wn].astype(str) if str(v).strip()})
+        # If multiple widths exist and none provided -> ask width (8 or 10)
+        if len(widths_avail) > 1:
+            return jsonify({
+                "found": True,
+                "mode": "questions",
+                "category": "Dual Spindle",
+                "model": model_code or "Dual Spindle",
+                "required_questions": [{
+                    "name": "width_ft",
+                    "question": "What cutting width?",
+                    "choices": widths_avail
+                }]
+            })
+        elif widths_avail:
+            width_val = widths_avail[0]  # single width present in data
+
+    # Normalize width to canonical form used in sheet
+    if width_val:
+        width_val = _normalize_width_ft_input(width_val)
+
+    # --- OFFSET CHECK (after width known) -----------------------------------
+    # If model explicitly starts with DSO, treat as offset "yes"
+    if model_code.startswith("DSO"):
+        ds_offset = "yes"
+
+    if ds_offset not in ("yes", "no", ""):
+        ds_offset = "yes" if ds_offset in ("y", "true", "1") else "no"
+
+    if ds_offset == "":
+        # Ask only when not provided
         return jsonify({
             "found": True,
             "mode": "questions",
             "category": "Dual Spindle",
-            "model": model_code or (width_txt and f"{width_txt} Dual Spindle") or "",
+            "model": (width_val and f"{width_val} ft Dual Spindle") or (model_code or "Dual Spindle"),
+            "required_questions": [{
+                "name": "ds_offset",
+                "question": "Is this an offset cutter?",
+                "choices": ["Yes", "No"]
+            }]
+        })
+
+    # If offset => select DSO<width>.* and quote immediately (comes standard with 2 laminated tires)
+    if ds_offset == "yes":
+        rows = ds_base[
+            ds_base[COL_MODEL].astype(str).str.upper().str.startswith("DSO")
+            & (ds_base[wn].astype(str) == width_val)
+        ]
+        if rows.empty:
+            return jsonify({"found": False, "mode": "error", "message": f"No Offset (DSO) rows found for {width_val} ft."}), 404
+
+        # Pick the row (there's typically a single DSO per width)
+        r, err = pick_one_or_400(rows, "Dual Spindle Offset final selection", {"width_ft": width_val, "offset": "yes"})
+        if err:
+            return err
+
+        model = str(r[COL_MODEL]).strip()
+        pid = _first_part_id(r)
+        label = f"{model} — Offset Cutter (includes 2 laminated tires)" + (f" ({pid})" if pid else "")
+        lines = [_make_line(label, 1, _price_number(r.get(COL_LIST_PRICE)), part_id=pid)]
+
+        # Accessories optional
+        acc_df = accessories_for_model(df, model)
+        list_access = (request.args.get("list_accessories") or "").strip() not in ("", "0", "false", "False")
+        acc_ids, acc_qty_map, acc_desc_terms = _read_accessory_params()
+        if list_access and not acc_ids and not acc_desc_terms:
+            return accessory_choices_payload(acc_df, "Dual Spindle (Offset)", model)
+        lines += accessory_lines_from_selection(acc_df, acc_ids, acc_qty_map, acc_desc_terms)
+
+        return _totals_payload(
+            lines,
+            ["Offset model includes 2 laminated tires (no tire selection required)."],
+            "Dual Spindle (Offset)",
+            model,
+            dealer_rate_override,
+            dealer_meta,
+        )
+
+    # --- NON-OFFSET PATH (standard DS/MDS) ----------------------------------
+    # Ask mount type unless explicit
+    if not ds_mount:
+        return jsonify({
+            "found": True,
+            "mode": "questions",
+            "category": "Dual Spindle",
+            "model": f"{width_val} ft Dual Spindle",
             "required_questions": [{
                 "name": "ds_mount",
                 "question": "Mounted (MDS) or Pull-type (DS)?",
@@ -1553,36 +1650,95 @@ def _quote_dual_spindle(df):
             }]
         })
 
-    mount_is_mds = "mds" in ds_mount or "mount" in ds_mount
-    mount_is_ds = "ds" in ds_mount and "mds" not in ds_mount or "pull" in ds_mount
+    mount_is_mds = ("mds" in ds_mount) or ("mount" in ds_mount)
+    mount_is_ds = (("ds" in ds_mount) and ("mds" not in ds_mount)) or ("pull" in ds_mount)
 
-    # filter by family
+    # Filter by mount and width
     if mount_is_mds:
         rows = ds_base[ds_base[COL_MODEL].astype(str).str.upper().str.startswith("MDS")]
     else:
-        rows = ds_base[ds_base[COL_MODEL].astype(str).str.upper().str.startswith("DS")]
+        rows = ds_base[ds_base[COL_MODEL].astype(str).str.upper().str.startswith("DS") & ~ds_base[COL_MODEL].astype(str).str.upper().str.startswith("DSO")]
+    rows = rows[_ensure_width_norm_col(rows).astype(str) == width_val]
 
-    # Width-first if width provided and not model
-    if not model_code.startswith(("MDS", "DS")) and width_txt:
-        norm_ft = _normalize_width_ft_input(width_txt)
-        rows = rows[_ensure_width_norm_col(rows).astype(str) == norm_ft]
-
-    # If no rows yet and model provided, filter by model token (support Q suffix)
-    if model_code.startswith(("MDS", "DS")):
+    # If a specific model was provided (MDS/DS), narrow to it (including Q suffix)
+    if model_code.startswith(("MDS", "DS")) and not model_code.startswith("DSO"):
         base_noQ = re.sub(r'Q$', '', model_code.upper())
         rows = rows[rows[COL_MODEL].astype(str).str.upper().isin([base_noQ, base_noQ + "Q"])]
 
     if rows.empty:
-        return jsonify({"found": False, "mode": "error", "message": "No Dual Spindle rows match mount/model/width."}), 404
+        return jsonify({"found": False, "mode": "error", "message": f"No Dual Spindle rows match width {width_val} ft and mount {('MDS' if mount_is_mds else 'DS')}."}), 404
 
-    # Shielding (Belt/Chain) if both present
+    # --- DUTY CLASS by width -------------------------------------------------
+    # 8 ft: .30 Standard, .50 Heavy
+    # 10 ft: .40 Standard, .50 Heavy
+    duty_choices = []
+    if width_val == "8":
+        duty_choices = ["Standard Duty (.30)", "Heavy Duty (.50)"]
+    elif width_val == "10":
+        duty_choices = ["Standard Duty (.40)", "Heavy Duty (.50)"]
+
+    if duty_choices:
+        if not ds_duty:
+            return jsonify({
+                "found": True,
+                "mode": "questions",
+                "category": "Dual Spindle",
+                "model": f"{width_val} ft Dual Spindle — {'MDS' if mount_is_mds else 'DS'}",
+                "required_questions": [{
+                    "name": "ds_duty",
+                    "question": "Which duty class?",
+                    "choices": duty_choices  # already smallest → largest
+                }]
+            })
+        # Filter rows by selected duty suffix
+        chosen = ds_duty.lower()
+        # Map to numeric token in model code
+        duty_token = None
+        if ".30" in chosen: duty_token = "30"
+        elif ".40" in chosen: duty_token = "40"
+        elif ".50" in chosen: duty_token = "50"
+        if duty_token:
+            rows = rows[rows[COL_MODEL].astype(str).str.contains(rf"\.{duty_token}(?:Q)?$", regex=True)]
+        if rows.empty:
+            return jsonify({"found": False, "mode": "error", "message": f"No Dual Spindle rows match duty '{ds_duty}'."}), 404
+
+    # --- DRIVELINE (540/1000) only if real choice ---------------------------
+    drive_opts = []
+    if any(str(m).upper().endswith("Q") for m in rows[COL_MODEL].astype(str)):
+        # Both 540 and 1000 exist for this narrowed set
+        drive_opts = ["540", "1000"]
+
+    if not drive_opts:
+        ds_drive = "540"  # only one valid option → don't ask
+    elif not ds_drive:
+        return jsonify({
+            "found": True,
+            "mode": "questions",
+            "category": "Dual Spindle",
+            "model": f"{width_val} ft Dual Spindle — {'MDS' if mount_is_mds else 'DS'}",
+            "required_questions": [{
+                "name": "ds_driveline",
+                "question": "Which driveline?",
+                "choices": drive_opts
+            }]
+        })
+
+    if ds_drive.strip() == "1000":
+        rows = rows[rows[COL_MODEL].astype(str).str.upper().str.endswith("Q")]
+    else:
+        rows = rows[~rows[COL_MODEL].astype(str).str.upper().str.endswith("Q")]
+
+    if rows.empty:
+        return jsonify({"found": False, "mode": "error", "message": "No Dual Spindle rows after driveline selection."}), 404
+
+    # --- SHIELDING (Belt/Chain) only if real choice --------------------------
     sh_set = sorted({str(v).strip() for v in rows[COL_SHIELDING].astype(str).tolist() if v})
     if len(sh_set) > 1 and not shielding:
         return jsonify({
             "found": True,
             "mode": "questions",
             "category": "Dual Spindle",
-            "model": model_code or (width_txt and f"{width_txt} Dual Spindle") or "",
+            "model": f"{width_val} ft Dual Spindle — {'MDS' if mount_is_mds else 'DS'}",
             "required_questions": [{
                 "name": "ds_shielding",
                 "question": "Belt or Chain shielding?",
@@ -1594,56 +1750,43 @@ def _quote_dual_spindle(df):
         if rows.empty:
             return jsonify({"found": False, "mode": "error", "message": f"No Dual Spindle rows with shielding '{shielding}'."}), 404
 
-    # Driveline (540/1000) — label-only select; supports Q suffix
-    drive_opts = []
-    if any(str(m).upper().endswith("Q") for m in rows[COL_MODEL].astype(str)):
-        drive_opts = ["540", "1000"]
-    if not ds_drive:
-        return jsonify({
-            "found": True,
-            "mode": "questions",
-            "category": "Dual Spindle",
-            "model": model_code or (width_txt and f"{width_txt} Dual Spindle") or "",
-            "required_questions": [{
-                "name": "ds_driveline",
-                "question": "Which driveline?",
-                "choices": drive_opts
-            }]
-        })
-    if ds_drive.strip() == "1000":
-        rows = rows[rows[COL_MODEL].astype(str).str.upper().str.endswith("Q")]
-    else:
-        rows = rows[~rows[COL_MODEL].astype(str).str.upper().str.endswith("Q")]
-
-    # Choose one
-    r, err = pick_one_or_400(rows, "Dual Spindle final selection", {"ds_mount": ds_mount, "shielding": shielding, "driveline": ds_drive})
+    # --- PICK THE UNIT -------------------------------------------------------
+    r, err = pick_one_or_400(
+        rows,
+        "Dual Spindle final selection",
+        {
+            "width_ft": width_val,
+            "offset": "no",
+            "ds_mount": ("MDS" if mount_is_mds else "DS"),
+            "shielding": shielding or (sh_set[0] if len(sh_set) == 1 else ""),
+            "driveline": ds_drive or "540",
+            "duty": ds_duty,
+        }
+    )
     if err:
         return err
 
     model = str(r[COL_MODEL]).strip()
     pid = _first_part_id(r)
     label_bits = [model]
+    if ds_duty:
+        label_bits.append(ds_duty)
     if shielding:
         label_bits.append(f"Shielding: {shielding}")
     if ds_drive:
         label_bits.append(f"{ds_drive} RPM")
-    label = " — ".join(label_bits) + (f" ({pid})" if pid else "")
+    label = " — ".join([b for b in label_bits if b]) + (f" ({pid})" if pid else "")
 
     lines = [_make_line(label, 1, _price_number(r.get(COL_LIST_PRICE)), part_id=pid)]
 
-    # Tires: MDS = none; DS = must allow adding two tires (as accessories) or skip if none chosen.
-    acc_df = accessories_for_model(df, model)
-
-    # Mounted: skip tires prompt if mount_is_ds
-    if mount_is_ds:
-        # Require a tire choice; but tires are quoted as accessories (qty 2)
+    # --- TIRES ---------------------------------------------------------------
+    # MDS (mounted) and DSO (offset) include 2 laminated tires → DO NOT ASK.
+    # DS (pull-type) requires tire selection (quoted as accessories, qty 2).
+    if not mount_is_mds:  # i.e., DS pull-type
+        acc_df = accessories_for_model(df, model)
         tire_opts = acc_df[acc_df[COL_CATEGORY].astype(str).str.contains("Tire", case=False, na=False)]
-        if tire_opts.empty:
-            # No tire items configured -> just return unit; dealer can add later
-            pass
-        else:
+        if not (tire_opts is None or tire_opts.empty):
             if not (tire_id or tire_choice):
-                # ask and require
                 choices = []
                 choices_with_ids = []
                 for _, tr in tire_opts.iterrows():
@@ -1666,35 +1809,39 @@ def _quote_dual_spindle(df):
                         "required": True
                     }]
                 })
+            # add selected tires (qty 2)
+            tire_sel = None
+            if tire_id:
+                tire_sel = _find_by_part_id(tire_opts, tire_id)
+            if tire_sel is None or tire_sel.empty:
+                if tire_choice:
+                    tire_sel = tire_opts[tire_opts[COL_DESC].astype(str).str.contains(tire_choice, case=False, na=False)]
+            if tire_sel is not None and not tire_sel.empty:
+                tr = tire_sel.iloc[0]
+                tpid = _first_part_id(tr)
+                tdesc = (tr.get(COL_DESC) or "").strip() or "Tires"
+                lines.append(_make_line(f"{tdesc} ({tpid})", 2, _price_number(tr.get(COL_LIST_PRICE)), part_id=tpid))
 
-        # add selected tires (qty 2)
-        tire_sel = None
-        if tire_id:
-            tire_sel = _find_by_part_id(tire_opts, tire_id)
-        if tire_sel is None or tire_sel.empty:
-            if tire_choice:
-                tire_sel = tire_opts[tire_opts[COL_DESC].astype(str).str.contains(tire_choice, case=False, na=False)]
-        if tire_sel is not None and not tire_sel.empty:
-            tr = tire_sel.iloc[0]
-            tpid = _first_part_id(tr)
-            tdesc = (tr.get(COL_DESC) or "").strip() or "Tires"
-            lines.append(_make_line(f"{tdesc} ({tpid})", 2, _price_number(tr.get(COL_LIST_PRICE)), part_id=tpid))
-
-    # Optional accessories (generic)
+    # --- ACCESSORIES (optional) ----------------------------------------------
+    acc_df = accessories_for_model(df, model)
     list_access = (request.args.get("list_accessories") or "").strip() not in ("", "0", "false", "False")
     acc_ids, acc_qty_map, acc_desc_terms = _read_accessory_params()
     if list_access and not acc_ids and not acc_desc_terms:
         return accessory_choices_payload(acc_df, "Dual Spindle", model)
     lines += accessory_lines_from_selection(acc_df, acc_ids, acc_qty_map, acc_desc_terms)
 
+    # --- TOTALS --------------------------------------------------------------
     return _totals_payload(
         lines,
-        ["Mounted (MDS) includes wheels by default; Pull-type (DS) requires tires as accessories."],
+        [
+            "Mounted (MDS) and Offset (DSO) include 2 laminated tires; Pull-type (DS) requires tires (quoted as accessories, qty 2)."
+        ],
         "Dual Spindle",
         model,
         dealer_rate_override,
         dealer_meta,
     )
+
 # =========================
 # Batwing
 # =========================
