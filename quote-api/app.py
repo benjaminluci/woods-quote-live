@@ -567,39 +567,31 @@ def _used_on_exact_mask(series, model_code: str):
     return series.astype(str).str.upper().str.contains(pat, regex=True, na=False)
 
 def accessories_for_model(df, model_code):
-    """Return accessories/tires whose 'Category' mentions Accessories/Tire
-    and whose 'Used On' matches the model (with a safe DH fallback)."""
     if not model_code:
         return df.iloc[0:0]
 
-    # 1) Only Accessories/Tires rows
     cat_mask = df[COL_CATEGORY].astype(str).str.contains(ACC_TIRE_PATTERN, na=False)
 
-    code = str(model_code).upper().strip()
-    used_on_upper = df[COL_USED_ON].astype(str).str.upper()
+    used_on = df[COL_USED_ON].astype(str)
+    code = str(model_code).strip()
 
-    # Old behavior: exact match, word-bounded to avoid over-matching
-    exact_mask = used_on_upper.str.contains(rf"\b{re.escape(code)}\b", na=False)
+    # NEW first try: exact token match (handles commas/spacing/punctuation)
+    exact_mask = _used_on_exact_mask(used_on, code)
     acc = df[cat_mask & exact_mask].copy()
 
-    # 2) Fallback only if nothing matched AND it looks like a Disc Harrow code (DH…)
-    if acc.empty and re.match(r"^DH[A-Z0-9]+$", code):
-        base = re.sub(r"[NC]$", "", code)  # e.g., DHM80N -> DHM80
-        if base != code:
-            base_mask = used_on_upper.str.contains(rf"\b{re.escape(base)}\b", na=False)
-            acc = df[cat_mask & base_mask].copy()
+    # FALLBACK to old behavior if exact finds nothing
+    if acc.empty:
+        loose_mask = used_on.str.upper().str.contains(code.upper(), na=False)
+        acc = df[cat_mask & loose_mask].copy()
 
-    # Keep only rows with at least one part ID present
-    has_id_mask = None
+    # Keep only rows that have at least one part id (unchanged behavior)
+    has_id = None
     for c in PART_ID_COLS:
         if c in acc.columns:
-            acc[c] = acc[c].astype(str).str.strip()
-            m = acc[c].astype(bool)
-            has_id_mask = m if has_id_mask is None else (has_id_mask | m)
+            m = acc[c].astype(str).str.strip().astype(bool)
+            has_id = m if has_id is None else (has_id | m)
+    return acc if has_id is None else acc[has_id]
 
-    if has_id_mask is None:
-        return acc
-    return acc[has_id_mask]
 
 def accessory_choices_payload(acc_df, family_label, model_label,
                               multi=True, required=False, name="accessory_ids",
