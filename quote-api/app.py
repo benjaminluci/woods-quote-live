@@ -3702,22 +3702,6 @@ def _dh_primary_value(qname: str, picked_label: str) -> str:
     # Everything else: pass through as-is
     return label
 
-def _normalize_dh_duty(val: str) -> str:
-    """Normalize Disc Harrow duty input so filters always apply."""
-    s = (str(val or "").strip().lower())
-    if not s:
-        return ""
-    std_aliases = {"dhs", "standard", "std", "std.", "standard duty", "standard (dhs)"}
-    hd_aliases  = {"dhm", "heavy", "heavy-duty", "heavy duty", "hd",
-                   "heavy duty (dhm)", "heavy-duty (dhm)"}
-    if s in std_aliases:
-        return "Standard (DHS)"
-    if s in hd_aliases:
-        return "Heavy Duty (DHM)"
-    # leave untouched if it's already in the final label form
-    return val
-
-
 
 def build_dh_answer_params(qname: str, picked_label: str, picked_id: str | None) -> dict:
     """
@@ -3761,8 +3745,7 @@ def _quote_disc_harrow(df):
     # ---- Params ----
     model_raw   = getp("model")
     dh_width_in = getp("dh_width_in")
-    dh_duty_raw = getp("dh_duty")
-    dh_duty = _normalize_dh_duty(getp("dh_duty_raw"))
+    dh_duty = getp("dh_duty")
     dh_blade    = getp("dh_blade")
 
     # Accept both correct and legacy spacing names  # <<< NEW
