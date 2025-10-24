@@ -1967,10 +1967,6 @@ def _bw_label(r, duty=None, driveline=None, deck_rings=None, shielding_rows=None
 
 
 def _quote_batwing(df):
-
-    model = model_code or (getp("model") or "").strip()
-    list_access = (request.args.get("list_accessories") or "").strip() not in ("", "0", "false", "False")
-    acc_ids2, acc_qty_map2, acc_desc_terms2 = _read_accessory_params()
     bw_base = _family_base(df, "Batwing", exclude_turf=True)
     if bw_base.empty:
         return jsonify({"found": False, "mode": "error", "message": "No Batwing base rows found."}), 404
@@ -2286,23 +2282,10 @@ def _quote_batwing(df):
 
     list_access = (request.args.get("list_accessories") or "").strip() not in ("", "0", "false", "False")
     acc_ids2, acc_qty_map2, acc_desc_terms2 = _read_accessory_params()
-
-    # ✅ Return a choices payload when the UI is *pulling* Batwing accessories
-    non_tire_acc = acc_df[~acc_df[COL_CATEGORY].astype(str).str.contains("Tire", case=False, na=False)]
-    if list_access and not (acc_ids2 or acc_desc_terms2 or any(acc_qty_map2.values())):
-        return accessory_choices_payload(
-            non_tire_acc,
-            "Batwing",
-            model,
-            multi=True,
-            required=False
-        )
-
     lines += accessory_lines_from_selection(
-        non_tire_acc,
+        acc_df[~acc_df[COL_CATEGORY].astype(str).str.contains("Tire", case=False, na=False)],
         acc_ids2, acc_qty_map2, acc_desc_terms2
     )
-
 
     return _totals_payload(
         lines,
