@@ -1967,6 +1967,10 @@ def _bw_label(r, duty=None, driveline=None, deck_rings=None, shielding_rows=None
 
 
 def _quote_batwing(df):
+
+    model = model_code or (getp("model") or "").strip()
+    list_access = (request.args.get("list_accessories") or "").strip() not in ("", "0", "false", "False")
+    acc_ids2, acc_qty_map2, acc_desc_terms2 = _read_accessory_params()
     bw_base = _family_base(df, "Batwing", exclude_turf=True)
     if bw_base.empty:
         return jsonify({"found": False, "mode": "error", "message": "No Batwing base rows found."}), 404
