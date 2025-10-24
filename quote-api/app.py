@@ -2282,10 +2282,23 @@ def _quote_batwing(df):
 
     list_access = (request.args.get("list_accessories") or "").strip() not in ("", "0", "false", "False")
     acc_ids2, acc_qty_map2, acc_desc_terms2 = _read_accessory_params()
+
+    # ✅ Return a choices payload when the UI is *pulling* Batwing accessories
+    non_tire_acc = acc_df[~acc_df[COL_CATEGORY].astype(str).str.contains("Tire", case=False, na=False)]
+    if list_access and not (acc_ids2 or acc_desc_terms2 or any(acc_qty_map2.values())):
+        return accessory_choices_payload(
+            non_tire_acc,
+            "Batwing",
+            model,
+            multi=True,
+            required=False
+        )
+
     lines += accessory_lines_from_selection(
-        acc_df[~acc_df[COL_CATEGORY].astype(str).str.contains("Tire", case=False, na=False)],
+        non_tire_acc,
         acc_ids2, acc_qty_map2, acc_desc_terms2
     )
+
 
     return _totals_payload(
         lines,
